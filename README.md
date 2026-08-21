@@ -18,6 +18,9 @@ python3 "$A" heartbeat <task-id> --owner hermes --note "Running verification"
 python3 "$A" receipt <task-id> --kind verification --payload '{"tests":"pass","health":200}'
 python3 "$A" update <task-id> --status waiting_for_user --next-action "Leo review"
 python3 "$A" complete <task-id> --owner hermes --note "tests pass"  # requires live lease
+python3 "$A" release <task-id> --owner hermes       # live-lease holder only
+python3 "$A" renew <task-id> --owner hermes --minutes 45   # extend a live lease
+python3 "$A" leases [--all] [--owner hermes]        # fleet-wide lease view
 python3 "$A" cancel <task-id> --owner leo --reason "obsolete"       # rejected on foreign leases
 python3 "$A" show <task-id>          # task detail + receipts + audit trail + dependencies
 python3 "$A" search "deploy"         # substring search over task text fields
@@ -59,6 +62,36 @@ python3 "$A" release <task-id> --owner hermes   # live-lease holder only
 
 Only the current holder of a live lease may release; foreign, expired, and
 terminal states are rejected. The transition is audited as `lease_released`.
+
+## Lease renewal & fleet view
+
+A holder can extend its lease without changing task status (unlike heartbeat,
+which forces `running` and a fixed 15-minute window) — useful for long-running
+work that outlives the original claim window:
+
+```bash
+python3 "$A" renew <task-id> --owner hermes --minutes 45   # extend from now
+python3 "$A" renew <task-id> --owner hermes --epoch 1      # fenced renewal
+```
+
+`renew` keeps the task's current status and preserves the fencing epoch, so a
+renewal never invalidates a holder's token; a superseded holder passing a stale
+`--epoch` is still rejected. Only the holder of a *live* lease may renew;
+foreign or expired leases are rejected. The transition is audited as
+`lease_renewed`.
+
+Operators can see every held lease at a glance:
+
+```bash
+python3 "$A" leases                 # live leases, soonest expiry first
+python3 "$A" leases --all           # include expired-but-still-held (recovery candidates)
+python3 "$A" leases --owner hermes  # filter by holder
+```
+
+Each entry carries `task_id`, `project`, `title`, `status`, `priority`,
+`owner`, `lease_expires_at`, `lease_epoch`, a `live` flag, and
+`seconds_remaining`. Default output hides expired-held leases so it answers
+"what is active right now"; `--all` answers "what will `recover` sweep".
 
 ## Shared memory (task notes)
 

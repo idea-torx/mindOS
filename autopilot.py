@@ -691,6 +691,70 @@ def release(args):
         audit(db, "task", args.id, "lease_released", {"owner": args.owner})
         json_out(dict(task_row(db, args.id)))
 
+def renew(args):
+    """Extend a live lease from now without changing status or the fencing epoch.
+
+    Unlike heartbeat (which forces status='running' and a fixed 15-minute
+    window), renew keeps the task's current status and lets the holder pick the
+    extension. The epoch is preserved so fencing tokens stay stable across a
+    renewal; a superseded holder is still rejected by --epoch.
+    """
+    if args.minutes <= 0:
+        raise SystemExit("--minutes must be positive")
+    with conn() as db:
+        row = task_row(db, args.id)
+        _require_epoch(row, getattr(args, "epoch", None), "renewing")
+        t = now()
+        exp = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + args.minutes * 60, timezone.utc).replace(microsecond=0).isoformat()
+        cur = db.execute(
+            "UPDATE tasks SET lease_expires_at=?, updated_at=? "
+            "WHERE id=? AND lease_owner=? AND lease_expires_at!='' AND lease_expires_at>?",
+            (exp, t, args.id, args.owner, t))
+        if cur.rowcount != 1:
+            if row["lease_owner"] and row["lease_owner"] != args.owner:
+                raise SystemExit(f"lease owned by {row['lease_owner']}")
+            raise SystemExit("no live lease to renew; claim before renewing")
+        audit(db, "task", args.id, "lease_renewed", {"owner": args.owner, "minutes": args.minutes, "lease_expires_at": exp})
+        json_out({"ok": True, "task_id": args.id, "status": row["status"], "owner": args.owner,
+                  "lease_expires_at": exp, "lease_epoch": row["lease_epoch"]})
+
+def leases(args):
+    """Fleet-wide lease observability: who holds what, until when, live or stale.
+
+    Default lists only live leases sorted by soonest expiry so an operator sees
+    what is about to free up first; --all includes expired-but-still-held
+    leases (the recovery candidates), tagged with live=false.
+    """
+    t = now()
+    with conn() as db:
+        q = ("SELECT id, project, title, status, priority, lease_owner, lease_expires_at, lease_epoch "
+             "FROM tasks WHERE lease_owner!='' AND lease_expires_at!=''")
+        vals = []
+        if not getattr(args, "all", False):
+            q += " AND lease_expires_at>?"
+            vals.append(t)
+        if getattr(args, "owner", ""):
+            q += " AND lease_owner=?"
+            vals.append(args.owner)
+        rows = db.execute(q + " ORDER BY lease_expires_at", vals).fetchall()
+    now_ts = datetime.now(timezone.utc).timestamp()
+    out = []
+    for r in rows:
+        exp = r["lease_expires_at"]
+        try:
+            remaining = int(datetime.fromisoformat(exp).timestamp() - now_ts)
+        except ValueError:
+            remaining = None
+        out.append({
+            "task_id": r["id"], "project": r["project"], "title": r["title"],
+            "status": r["status"], "priority": r["priority"], "owner": r["lease_owner"],
+            "lease_expires_at": exp, "lease_epoch": r["lease_epoch"],
+            "live": exp > t,
+            "seconds_remaining": max(remaining, 0) if remaining is not None else None,
+        })
+    json_out({"generated_at": t, "count": len(out),
+              "live_count": sum(1 for l in out if l["live"]), "leases": out})
+
 def _acquire(db, task_id: str, owner: str, minutes: int, max_active: int = 0):
     """Atomically acquire/renew a lease; returns (acquired, expires_at, epoch).
 
@@ -1236,6 +1300,8 @@ def main():
     p=sub.add_parser("handoffs"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_handoffs)
     p=sub.add_parser("handoff-current"); p.add_argument("task_id"); p.set_defaults(fn=current_handoff)
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)
+    p=sub.add_parser("renew"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=renew)
+    p=sub.add_parser("leases"); p.add_argument("--owner"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=leases)
     args=ap.parse_args(); args.fn(args)
 
 if __name__ == "__main__": main()

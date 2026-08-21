@@ -26,6 +26,18 @@ with tempfile.TemporaryDirectory() as td:
     assert beat['status'] == 'running' and beat['lease_expires_at']
     # A non-holder must not be able to renew someone else's lease.
     run_fail('heartbeat','verify-1','--owner','intruder')
+    # renew: extends a live lease from now, keeps status and fencing epoch stable.
+    r1 = run('renew','verify-1','--owner','tester','--minutes','45')
+    assert r1['ok'] is True and r1['status'] == beat['status'] == 'running' and r1['lease_epoch'] == beat['lease_epoch']
+    row = next(r for r in run('list') if r['id'] == 'verify-1')
+    assert row['lease_expires_at'] == r1['lease_expires_at']
+    run_fail('renew','verify-1','--owner','intruder','--minutes','10')      # foreign holder
+    run_fail('renew','verify-1','--owner','tester','--minutes','0')        # invalid window
+    err = run_fail('renew','verify-1','--owner','tester','--minutes','5','--epoch','999')
+    assert 'lease superseded' in err                                        # fenced renewal
+    # leases: fleet-wide view, live-only by default, soonest expiry first.
+    assert any(l['task_id'] == 'verify-1' for l in run('leases','--owner','tester')['leases'])
+    assert run('leases','--owner','nobody')['count'] == 0
     rec = run('receipt','verify-1','--kind','verification','--payload','{"result":"pass"}')
     assert len(rec['sha256']) == 64 and (Path(td) / 'receipts' / (rec['receipt_id'] + '.json')).stat().st_mode & 0o077 == 0
     rows = run('list'); assert rows[0]['last_receipt'] == rec['receipt_id']
@@ -59,6 +71,20 @@ with tempfile.TemporaryDirectory() as td:
     detail = run('show','rec-1')
     assert detail['status'] == 'failed' and detail['blocked_reason'] == 'max lease retries exceeded'
     assert any(e['action'] == 'lease_failed' for e in detail['audit'])
+    # leases: fleet-wide view hides expired-held leases by default; --all surfaces them.
+    run('create','--project','Verify','--title','stale holder','--id','lst-1')
+    run('claim','lst-1','--owner','ghost','--minutes','0')                  # expires immediately
+    lv = run('leases')
+    ids = [l['task_id'] for l in lv['leases']]
+    assert 'lst-1' not in ids and 'verify-1' in ids, ('expired lease must be hidden by default', lv)
+    assert lv['count'] == lv['live_count'] and all(l['live'] for l in lv['leases'])
+    lva = run('leases','--all')
+    stale = [l for l in lva['leases'] if l['task_id'] == 'lst-1']
+    assert len(stale) == 1 and stale[0]['live'] is False and stale[0]['owner'] == 'ghost'
+    expiries = [l['lease_expires_at'] for l in lva['leases']]
+    assert expiries == sorted(expiries), 'leases must sort by soonest expiry'
+    out = ops('recover','--max-retries','3')   # sweep the stale holder before metrics checks
+    assert 'lst-1' in out['recovered']
     # Observability: metrics reflect the exercised state.
     m = run('metrics')
     assert m['tasks_by_status'].get('failed') == 1
