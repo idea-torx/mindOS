@@ -15,7 +15,7 @@ import sys
 import uuid
 import hashlib
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(os.environ.get("HERMES_AUTOPILOT_HOME", Path.home() / ".hermes" / "autopilot"))
@@ -92,7 +92,8 @@ CREATE TABLE IF NOT EXISTS notes (
   content_hash TEXT NOT NULL,
    created_at TEXT NOT NULL,
    superseded_by TEXT NOT NULL DEFAULT '',
-   pinned INTEGER NOT NULL DEFAULT 0
+   pinned INTEGER NOT NULL DEFAULT 0,
+   expires_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_notes_task ON notes(task_id);
 CREATE INDEX IF NOT EXISTS idx_notes_hash ON notes(task_id, content_hash);
@@ -223,6 +224,8 @@ def _migrate(db) -> None:
     note_cols = {r[1] for r in db.execute("PRAGMA table_info(notes)")}
     if "pinned" not in note_cols:
         db.execute("ALTER TABLE notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+    if "expires_at" not in note_cols:
+        db.execute("ALTER TABLE notes ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''")
     task_cols = {r[1] for r in db.execute("PRAGMA table_info(tasks)")}
     if "lease_epoch" not in task_cols:
         db.execute("ALTER TABLE tasks ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0")
@@ -423,6 +426,37 @@ def live_note(db, task_id: str, content_hash: str):
         "SELECT * FROM notes WHERE task_id=? AND content_hash=? AND superseded_by='' ORDER BY created_at DESC LIMIT 1",
         (task_id, content_hash)).fetchone()
 
+def _ttl_hours(value) -> float:
+    """Validate a --ttl-hours argument; None/absent means no expiry."""
+    if value is None:
+        return 0.0
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise SystemExit("--ttl-hours must be a positive number")
+    if v <= 0:
+        raise SystemExit("--ttl-hours must be a positive number")
+    return v
+
+def _expires_at(hours: float) -> str:
+    if hours <= 0:
+        return ""
+    dt = datetime.now(timezone.utc) + timedelta(hours=hours)
+    return dt.replace(microsecond=0).isoformat()
+
+def _ttl_past(r, t: str) -> bool:
+    """Pure time check: the note's expiry instant has passed."""
+    return bool(r["expires_at"]) and r["expires_at"] <= t
+
+def _note_retired(r, t: str) -> bool:
+    """Effective expiry: an unpinned note past its TTL retires from packs/retrieval.
+
+    Pinned facts are immortal by design — they are critical constraints, and
+    silently dropping one because time passed is exactly the failure mode TTL
+    must not introduce. Retire a pinned fact explicitly via supersede-note.
+    """
+    return _ttl_past(r, t) and not r["pinned"]
+
 def add_note(args):
     """Attach a provenance-tagged fact to a task; exact duplicates are deduplicated."""
     if args.kind not in NOTE_KINDS:
@@ -433,6 +467,7 @@ def add_note(args):
     nid = uuid.uuid4().hex
     t = now()
     pinned = 1 if getattr(args, "pinned", False) else 0
+    expires_at = _expires_at(_ttl_hours(getattr(args, "ttl_hours", None)))
     with conn() as db:
         task_row(db, args.task_id)
         h = _note_hash(args.task_id, content)
@@ -442,28 +477,56 @@ def add_note(args):
                 # A duplicate add can promote an existing note to pinned.
                 db.execute("UPDATE notes SET pinned=1 WHERE id=?", (existing["id"],))
                 audit(db, "task", args.task_id, "note_pinned", {"note_id": existing["id"]})
-            audit(db, "task", args.task_id, "note_deduplicated", {"note_id": existing["id"], "kind": args.kind})
-            json_out({"ok": True, "id": existing["id"], "task_id": args.task_id,
-                      "deduplicated": True, "created_at": existing["created_at"]})
+            # TTL refresh/revival: a duplicate add restates the fact, so it also
+            # restates the fact's lifetime. Without this, re-adding an expired
+            # note would dedup straight into invisibility.
+            revived = _note_retired(existing, t)
+            if expires_at != (existing["expires_at"] or ""):
+                db.execute("UPDATE notes SET expires_at=? WHERE id=?", (expires_at, existing["id"]))
+                audit(db, "task", args.task_id, "note_ttl_refreshed",
+                      {"note_id": existing["id"], "expires_at": expires_at,
+                       "previous_expires_at": existing["expires_at"], "revived": revived})
+            audit(db, "task", args.task_id, "note_deduplicated",
+                  {"note_id": existing["id"], "kind": args.kind, **({"revived": True} if revived else {})})
+            out = {"ok": True, "id": existing["id"], "task_id": args.task_id,
+                   "deduplicated": True, "created_at": existing["created_at"]}
+            if revived:
+                out["revived"] = True
+            if expires_at:
+                out["expires_at"] = expires_at
+            json_out(out)
             return
         similar = _near_duplicates(db, args.task_id, content)
-        db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at,pinned) VALUES(?,?,?,?,?,?,?,?)",
-                   (nid, args.task_id, args.kind, content, args.source, h, t, pinned))
-        audit(db, "task", args.task_id, "note_added",
-              {"note_id": nid, "kind": args.kind, "source": args.source, "pinned": bool(pinned),
-               "similar_notes": [s["note_id"] for s in similar]})
-    json_out({"ok": True, "id": nid, "task_id": args.task_id, "deduplicated": False,
-              "similar_to": similar, "created_at": t})
+        db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at,pinned,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                   (nid, args.task_id, args.kind, content, args.source, h, t, pinned, expires_at))
+        payload = {"note_id": nid, "kind": args.kind, "source": args.source, "pinned": bool(pinned),
+                   "similar_notes": [s["note_id"] for s in similar]}
+        if expires_at:
+            payload["expires_at"] = expires_at
+        audit(db, "task", args.task_id, "note_added", payload)
+    out = {"ok": True, "id": nid, "task_id": args.task_id, "deduplicated": False,
+           "similar_to": similar, "created_at": t}
+    if expires_at:
+        out["expires_at"] = expires_at
+    json_out(out)
 
 def list_notes(args):
+    t = now()
     with conn() as db:
         task_row(db, args.task_id)
-        q = ("SELECT n.id,n.kind,n.content,n.source,n.created_at,n.superseded_by,n.pinned FROM notes n "
+        q = ("SELECT n.id,n.kind,n.content,n.source,n.created_at,n.superseded_by,n.pinned,n.expires_at FROM notes n "
              "WHERE n.task_id=?")
         if not getattr(args, "all", False):
             q += " AND n.superseded_by=''"
         q += " ORDER BY n.rowid ASC"
-        rows = [dict(r) for r in db.execute(q, (args.task_id,)).fetchall()]
+        rows = []
+        for r in db.execute(q, (args.task_id,)).fetchall():
+            d = dict(r)
+            if d["expires_at"]:
+                # Pure time flag: a pinned note past its TTL still shows expired
+                # so the operator can see it needs an explicit supersede.
+                d["expired"] = _ttl_past(d, t)
+            rows.append(d)
     json_out(rows)
 
 def supersede_note(args):
@@ -493,11 +556,18 @@ def supersede_note(args):
         cur = db.execute("UPDATE notes SET superseded_by=? WHERE id=? AND superseded_by=''", (new_id, old_id))
         if cur.rowcount != 1:
             raise SystemExit("note was concurrently superseded; retry")
-        db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at,superseded_by,pinned) VALUES(?,?,?,?,?,?,?,'',?)",
-                   (new_id, old["task_id"], kind, new_content, source, h, t, old["pinned"]))
+        # A superseding fact is fresh: without an explicit --ttl-hours it carries
+        # no expiry, even when the retired predecessor did.
+        new_expires = _expires_at(_ttl_hours(getattr(args, "ttl_hours", None)))
+        db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at,superseded_by,pinned,expires_at) VALUES(?,?,?,?,?,?,?,'',?,?)",
+                   (new_id, old["task_id"], kind, new_content, source, h, t, old["pinned"], new_expires))
         audit(db, "task", old["task_id"], "note_superseded",
-              {"old_note_id": old_id, "new_note_id": new_id, "kind": kind})
-    json_out({"ok": True, "old_note_id": old_id, "new_note_id": new_id, "task_id": old["task_id"]})
+              {"old_note_id": old_id, "new_note_id": new_id, "kind": kind,
+               **({"expires_at": new_expires} if new_expires else {})})
+    out = {"ok": True, "old_note_id": old_id, "new_note_id": new_id, "task_id": old["task_id"]}
+    if new_expires:
+        out["expires_at"] = new_expires
+    json_out(out)
 
 def note_history(args):
     """Walk a temporal fact chain: oldest predecessor → newest live successor."""
@@ -818,21 +888,25 @@ def _related_note_candidates(db, task_id: str, text: str, limit: int, scope: str
     if scope != "global":
         scope_sql = " AND t.project=(SELECT project FROM tasks WHERE id=?)"
         scope_vals = [task_id]
+    # Retired (expired unpinned) notes are stale facts — exactly what cross-task
+    # RAG must not surface; pinned candidates are exempt like everywhere else.
+    live_sql = " AND (n.expires_at='' OR n.expires_at>? OR n.pinned=1)"
+    live_val = [now()]
     cols = ("SELECT n.id,n.kind,n.content,n.source,n.created_at,n.pinned,n.task_id,"
             "t.title AS via_task_title")
     if _fts_ready(db):
         match = " OR ".join('"%s"' % t for t in toks)
         sql = (cols + ",bm25(notes_fts) AS score "
                "FROM notes_fts f JOIN notes n ON n.rowid=f.rowid JOIN tasks t ON t.id=n.task_id "
-               "WHERE notes_fts MATCH ? AND n.superseded_by='' AND n.task_id!=?" + scope_sql +
+               "WHERE notes_fts MATCH ? AND n.superseded_by='' AND n.task_id!=?" + scope_sql + live_sql +
                " ORDER BY score LIMIT ?")
-        vals = [match, task_id, *scope_vals, limit]
+        vals = [match, task_id, *scope_vals, *live_val, limit]
     else:
         likes = " OR ".join("n.content LIKE ?" for _ in toks)
         sql = (cols + " FROM notes n JOIN tasks t ON t.id=n.task_id "
-               "WHERE (" + likes + ") AND n.superseded_by='' AND n.task_id!=?" + scope_sql +
+               "WHERE (" + likes + ") AND n.superseded_by='' AND n.task_id!=?" + scope_sql + live_sql +
                " ORDER BY n.created_at DESC LIMIT ?")
-        vals = [*( "%" + t + "%" for t in toks), task_id, *scope_vals, limit]
+        vals = [*( "%" + t + "%" for t in toks), task_id, *scope_vals, *live_val, limit]
     rows = [dict(r) for r in db.execute(sql, vals).fetchall()]
     if rerank:
         rows = _rerank_notes(rows, recency_half_life_hours, pinned_boost)
@@ -856,10 +930,17 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
     row = task_row(db, task_id)
     summary = {k: row[k] for k in ("id", "project", "title", "status", "priority", "next_action", "blocked_reason", "due_at")}
     pending = unsatisfied_deps(db, task_id)
+    t = now()
     rows = [dict(r) for r in db.execute(
-        "SELECT id,kind,content,source,created_at,pinned FROM notes "
+        "SELECT id,kind,content,source,created_at,pinned,expires_at FROM notes "
         "WHERE task_id=? AND superseded_by='' ORDER BY rowid ASC",
         (task_id,)).fetchall()]
+    # Temporal facts: unpinned notes past their TTL retire from the pack; the
+    # count is reported only when nonzero so packs without TTL notes stay
+    # byte-identical (and digest-compatible) to the legacy shape.
+    retired = [r for r in rows if _note_retired(r, t)]
+    if retired:
+        rows = [r for r in rows if not _note_retired(r, t)]
     related = _related_note_candidates(
         db, task_id,
         " ".join(filter(None, (row["title"], row["description"], row["next_action"]))),
@@ -886,6 +967,10 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
         if used + cost > budget:
             truncated = True
             continue
+        if _ttl_past(r, t):
+            # A pinned note past its TTL still packs (pinned facts are immortal)
+            # but carries the flag so the agent knows it needs a fresh supersede.
+            r = {**r, "expired": True}
         packed.append(r); used += cost
         if r["pinned"]:
             pinned_packed += 1
@@ -908,6 +993,8 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
             "related_requested": rel_limit, "related_matched": len(related),
             "related_packed": related_packed,
             "notes": packed}
+    if retired:
+        out["notes_expired_excluded"] = len(retired)
     if rerank:
         # Reported only when enabled so packs built without rerank stay
         # byte-identical to the legacy shape (and digest-compatible).
@@ -1122,7 +1209,13 @@ def search_notes(args):
     do_rerank = bool(getattr(args, "rerank", False))
     half_life = getattr(args, "recency_half_life_hours", 168.0)
     boost = getattr(args, "pinned_boost", 0.5)
+    include_expired = bool(getattr(args, "include_expired", False))
+    t = now()
     with conn() as db:
+        # Retired (expired unpinned) notes are hidden by default; pinned notes
+        # are exempt everywhere per the TTL immutability rule.
+        live_sql = "" if include_expired else " AND (n.expires_at='' OR n.expires_at>? OR n.pinned=1)"
+        live_val = () if include_expired else (t,)
         if ranked and _fts_ready(db):
             match = _fts_query(args.query)
             if not match:
@@ -1142,8 +1235,8 @@ def search_notes(args):
                 "SELECT n.id,n.task_id,t.project,n.kind,n.content,n.source,n.created_at,"
                 "n.pinned,bm25(notes_fts) AS score FROM notes_fts f "
                 "JOIN notes n ON n.rowid=f.rowid JOIN tasks t ON t.id=n.task_id "
-                "WHERE " + " AND ".join(clauses) +
-                " ORDER BY score LIMIT ?", (*vals, args.limit)).fetchall()]
+                "WHERE " + " AND ".join(clauses) + live_sql +
+                " ORDER BY score LIMIT ?", (*vals, *live_val, args.limit)).fetchall()]
             json_out(_rerank_notes(rows, half_life, boost) if do_rerank else rows)
             return
         pat = "%" + args.query + "%"
@@ -1160,7 +1253,8 @@ def search_notes(args):
         rows = [dict(r) for r in db.execute(
             "SELECT n.id,n.task_id,t.project,n.kind,n.content,n.source,n.created_at,n.pinned "
             "FROM notes n JOIN tasks t ON t.id=n.task_id WHERE n.superseded_by='' AND " +
-            " AND ".join(clauses) + " ORDER BY n.created_at DESC LIMIT ?", (*vals, args.limit)).fetchall()]
+            " AND ".join(clauses) + live_sql + " ORDER BY n.created_at DESC LIMIT ?",
+            (*vals, *live_val, args.limit)).fetchall()]
     json_out(_rerank_notes(rows, half_life, boost) if do_rerank else rows)
 
 def release(args):
@@ -1796,7 +1890,9 @@ def metrics(args):
             "SELECT COUNT(*) n FROM tasks WHERE due_at!='' AND due_at>? AND due_at<=? AND status NOT IN ('completed','failed','cancelled')",
             (t, horizon)).fetchone()["n"]
         notes = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded, "
-                           "SUM(CASE WHEN pinned!=0 AND superseded_by='' THEN 1 ELSE 0 END) pinned FROM notes").fetchone()
+                           "SUM(CASE WHEN pinned!=0 AND superseded_by='' THEN 1 ELSE 0 END) pinned, "
+                           "SUM(CASE WHEN superseded_by='' AND pinned=0 AND expires_at!='' AND expires_at<=? THEN 1 ELSE 0 END) expired "
+                           "FROM notes", (t,)).fetchone()
         handoffs = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded, "
                               "SUM(CASE WHEN recall_digest!='' THEN 1 ELSE 0 END) proven, "
                               "SUM(CASE WHEN acked_by!='' THEN 1 ELSE 0 END) acked FROM handoffs").fetchone()
@@ -1819,6 +1915,7 @@ def metrics(args):
         "notes_total": notes["total"] or 0,
         "notes_superseded": notes["superseded"] or 0,
         "notes_pinned_live": notes["pinned"] or 0,
+        "notes_expired_live": notes["expired"] or 0,
         "handoffs_total": handoffs["total"] or 0,
         "handoffs_superseded": handoffs["superseded"] or 0,
         "handoffs_with_recall_proof": handoffs["proven"] or 0,
@@ -2013,13 +2110,13 @@ def main():
     p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
     p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_tasks)
-    p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.set_defaults(fn=add_note)
+    p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
-    p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.set_defaults(fn=supersede_note)
+    p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); p.set_defaults(fn=supersede_note)
     p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
     p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
     p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
-    p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); _add_rerank_flags(p); p.set_defaults(fn=search_notes)
+    p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--include-expired",dest="include_expired",action="store_true"); _add_rerank_flags(p); p.set_defaults(fn=search_notes)
     p=sub.add_parser("note-history"); p.add_argument("note_id"); p.set_defaults(fn=note_history)
     p=sub.add_parser("handoff-history"); p.add_argument("handoff_id"); p.set_defaults(fn=handoff_history)
     p=sub.add_parser("handoff"); p.add_argument("task_id"); p.add_argument("--from-agent",required=True); p.add_argument("--to-agent",default=""); p.add_argument("--status",default=""); p.add_argument("--objective",default=""); p.add_argument("--evidence",action="append",default=[]); p.add_argument("--constraint",dest="constraints",action="append",default=[]); p.add_argument("--decision",dest="decisions",action="append",default=[]); p.add_argument("--file",dest="files",action="append",default=[]); p.add_argument("--commit",dest="commit_ref",default=""); p.add_argument("--next-action",dest="next_actions",action="append",default=[]); p.add_argument("--risk",dest="risks",action="append",default=[]); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.set_defaults(fn=add_handoff)

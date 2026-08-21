@@ -167,6 +167,20 @@ Design properties:
 - **Temporal facts**: `supersede-note` atomically retires an old note and links
   it to its replacement (`superseded_by`); superseded notes are hidden from
   default views but retained for audit.
+- **TTL (note lifetimes)**: `--ttl-hours N` gives a fact a lifetime. Past its
+  `expires_at`, an *unpinned* note retires: it is excluded from context packs,
+  recall bundles, related-note candidates, and `search-notes` (counted in the
+  pack as `notes_expired_excluded` rather than dropped silently; search can
+  surface retirees with `--include-expired`). *Pinned* notes are immortal by
+  design — an expired pin still packs but carries `expired: true` so the agent
+  knows a fresh supersede is due; silently dropping a critical constraint is
+  exactly the failure mode TTL must not introduce. Re-adding a retired note's
+  exact content revives it (`revived: true`, audited as `note_ttl_refreshed`)
+  and restates its lifetime — omitting `--ttl-hours` makes it immortal again.
+  A superseding note is fresh: it inherits no expiry unless `--ttl-hours` is
+  passed explicitly. `metrics` reports `notes_expired_live` and
+  `ops.py notes-expired` lists every expired live note fleet-wide with the
+  action it needs (`revive` for retirees, `supersede` for expired pins).
 - **Context budgets**: `context` packs a task summary header, unsatisfied
   dependencies, then live notes pinned-first (oldest→newest within each group)
   within a character budget. It reports `used_chars`, `truncated`, pack counts,
@@ -181,8 +195,9 @@ Design properties:
   the full sequence oldest → newest, showing how the handoff (owner, objective,
   evidence) evolved across agents.
 
-`metrics` reports `notes_total`, `notes_superseded`, and `notes_pinned_live`;
-`ops.py doctor` checks for orphaned notes and dangling supersession links.
+`metrics` reports `notes_total`, `notes_superseded`, `notes_pinned_live`, and
+`notes_expired_live`; `ops.py doctor` checks for orphaned notes and dangling
+supersession links.
 
 ## Agent handoff protocol (provider-neutral)
 
@@ -671,6 +686,7 @@ python3 "$O" archive --before "2026-09-01T00:00:00Z"           # seal + remove t
 python3 "$O" archive --before "..." --dry-run                  # preview without mutating
 python3 "$O" archive-check <file>      # verify an archive's integrity hash
 python3 "$O" archive-restore <file> [--force]  # re-import archived tasks
+python3 "$O" notes-expired             # list live notes past their TTL (read-only)
 ```
 
 `snapshot` writes an atomic, `autopilot-snapshot-v1` JSON document (default

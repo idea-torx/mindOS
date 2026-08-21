@@ -723,6 +723,37 @@ def recall_stale(args=None):
     print(json.dumps({'ok': True, 'generated_at': t, 'checked': len(items),
                       'states': counts, 'items': items}, sort_keys=True))
 
+def notes_expired(args=None):
+    """Fleet-wide memory-hygiene sweep: live notes past their TTL.
+
+    Complements `metrics`'s `notes_expired_live` count with the actual rows so
+    an operator can see *which* facts aged out of packs and retrieval:
+
+    - unpinned expired notes are retired: hidden from context packs, recall
+      bundles, and search by the runtime itself — listed here for review;
+    - pinned expired notes stay packed (pinned facts are immortal by design)
+      but carry `expired: true`; they need an explicit supersede-note, so they
+      are flagged `action: supersede` while retired ones get `action: revive`
+      (re-adding the content revives them) or explicit retirement.
+
+    Read-only: reports, never mutates.
+    """
+    t = utc()
+    items = []
+    with db() as c:
+        rows = c.execute(
+            "SELECT n.id,n.task_id,t.project,n.kind,n.content,n.source,n.created_at,"
+            "n.pinned,n.expires_at FROM notes n JOIN tasks t ON t.id=n.task_id "
+            "WHERE n.superseded_by='' AND n.expires_at!='' AND n.expires_at<=? "
+            "ORDER BY n.expires_at,n.id", (t,)).fetchall()
+        for r in rows:
+            items.append({**dict(r), 'expired': True,
+                          'retired': not r['pinned'],
+                          'action': 'supersede' if r['pinned'] else 'revive'})
+    print(json.dumps({'ok': True, 'generated_at': t, 'count': len(items),
+                      'pinned_expired': sum(1 for i in items if i['pinned']),
+                      'items': items}, sort_keys=True))
+
 def policy(args):
     path=Path.home()/'.hermes/autopilot/policies'/f'{args.project.lower()}.yaml'
     if not path.exists(): print(json.dumps({'allowed':False,'reason':'no project policy'})); return
@@ -736,6 +767,7 @@ for name,fn in [('processes',processes),('github',github),('sentry',sentry),('mo
  x=s.add_parser(name); x.set_defaults(fn=fn)
 x=s.add_parser('handoff-check'); x.add_argument('--task',default=''); x.add_argument('--ack-sla-hours',dest='ack_sla_hours',type=float,default=24); x.set_defaults(fn=handoff_check)
 x=s.add_parser('recall-stale'); x.set_defaults(fn=recall_stale)
+x=s.add_parser('notes-expired'); x.set_defaults(fn=notes_expired)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--backoff-base',type=int,default=60); x.add_argument('--backoff-cap',type=int,default=3600); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('escalate'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=escalate)
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)

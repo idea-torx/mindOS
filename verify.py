@@ -1173,6 +1173,65 @@ with tempfile.TemporaryDirectory() as td:
     plain_next = run('next','--project','DispatchRecall')
     assert plain_next['task']['id'] == 'dr-2' and 'recall' not in plain_next \
         and 'recall_digest' not in plain_next, plain_next
+    # Note TTL: temporal facts can carry a lifetime; past it, unpinned notes
+    # retire from packs and retrieval while pinned facts are immortal (flagged,
+    # never silently dropped). A duplicate add restates the lifetime.
+    run('create','--project','TTLTest','--title','ttl host','--id','ttl-1')
+    err = run_fail('note','ttl-1','--content','x','--ttl-hours','0')
+    assert '--ttl-hours must be a positive number' in err
+    err = run_fail('note','ttl-1','--content','x','--ttl-hours','-3')
+    assert '--ttl-hours must be a positive number' in err
+    err = run_fail('note','ttl-1','--content','x','--ttl-hours','soon')
+    assert 'invalid float value' in err
+    fresh = run('note','ttl-1','--kind','fact','--content','ttl fresh fact marker','--source','verify','--ttl-hours','48')
+    assert fresh['expires_at'] and not fresh['deduplicated'], fresh
+    stale = run('note','ttl-1','--kind','fact','--content','ttl stale fact marker','--source','verify','--ttl-hours','0.000001')
+    assert stale['expires_at'], stale
+    # Retired notes drop out of context packs — counted, not silent.
+    ctx = run('context','ttl-1','--budget','4000')
+    ids = [n['id'] for n in ctx['notes']]
+    assert stale['id'] not in ids and fresh['id'] in ids and ctx['notes_expired_excluded'] == 1, ctx
+    # ...out of search by default (--include-expired surfaces them)...
+    hits = run('search-notes','marker','--project','TTLTest')
+    assert {h['id'] for h in hits} == {fresh['id']}, hits
+    hits = run('search-notes','marker','--project','TTLTest','--include-expired')
+    assert {h['id'] for h in hits} == {stale['id'], fresh['id']}, hits
+    # ...and out of cross-task related-note candidates.
+    run('create','--project','TTLTest','--title','marker neighbor','--id','ttl-2')
+    rel = run('context','ttl-2','--related','5','--related-scope','project','--budget','4000')
+    rel_ids = [n['id'] for n in rel.get('notes', []) if n.get('related')]
+    assert stale['id'] not in rel_ids and fresh['id'] in rel_ids, rel
+    # Pinned + TTL: an expired pinned note still packs but carries the flag;
+    # `notes` shows it so the operator knows a supersede is due.
+    pin = run('note','ttl-1','--kind','constraint','--content','MUST rotate ttl keys weekly','--source','leo',
+              '--pinned','--ttl-hours','0.000001')
+    ctx = run('context','ttl-1','--budget','4000')
+    pn = next(n for n in ctx['notes'] if n['id'] == pin['id'])
+    assert pn['expired'] is True and ctx['notes_expired_excluded'] == 1, ctx
+    rows = run('notes','ttl-1')
+    assert next(n for n in rows if n['id'] == pin['id'])['expired'] is True
+    m = run('metrics'); assert m['notes_expired_live'] >= 1, m
+    ne = ops('notes-expired')
+    item = next(i for i in ne['items'] if i['id'] == stale['id'])
+    assert item['retired'] is True and item['action'] == 'revive', item
+    pitem = next(i for i in ne['items'] if i['id'] == pin['id'])
+    assert pitem['retired'] is False and pitem['action'] == 'supersede', pitem
+    # Revival: re-adding a retired note's exact content refreshes its lifetime
+    # (no --ttl-hours means immortal again) instead of deduping into invisibility.
+    rev = run('note','ttl-1','--kind','fact','--content','ttl stale fact marker','--source','verify')
+    assert rev['deduplicated'] is True and rev['id'] == stale['id'] and rev.get('revived') is True, rev
+    evs = run('events','--entity-id','ttl-1','--action','note_ttl_refreshed')['events']
+    assert any(e['payload']['revived'] is True for e in evs), evs
+    ctx = run('context','ttl-1','--budget','4000')
+    assert 'notes_expired_excluded' not in ctx, 'revived note must be packed again'
+    assert any(n['id'] == stale['id'] and 'expired' not in n for n in ctx['notes']), ctx
+    # Superseding an expired pinned fact yields a fresh note with no expiry
+    # unless one is requested explicitly.
+    sup3 = run('supersede-note',pin['id'],'--content','MUST rotate ttl keys daily','--source','leo')
+    assert 'expires_at' not in sup3, sup3
+    nn = next(n for n in run('notes','ttl-1') if n['id'] == sup3['new_note_id'])
+    assert nn['pinned'] == 1 and 'expired' not in nn, nn
+    doc = ops('doctor'); assert doc['ok'] is True and doc['problems'] == [], doc
     # Audit chain checkpoints: pin the head so tail truncation becomes detectable.
     cp = ops('checkpoint')
     assert cp['ok'] is True and cp['last_event_id'] > 0 and len(cp['sha256']) == 64, cp
