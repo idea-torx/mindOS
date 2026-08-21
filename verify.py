@@ -76,6 +76,8 @@ with tempfile.TemporaryDirectory() as td:
     got = run('next','--claim','--owner','tester','--minutes','5')
     assert got['claimed'] is True and got['task']['id'] == 'dep-a' and got['lease_expires_at']
     run('update','dep-a','--status','completed')
+    row = next(r for r in run('list') if r['id'] == 'dep-a')
+    assert row['status'] == 'completed' and row['lease_owner'] == '', 'terminal update must release lease'
     got = run('next','--claim','--owner','tester','--minutes','5')
     assert got['task']['id'] == 'dep-b'
     detail = run('show','dep-b')
@@ -97,4 +99,41 @@ with tempfile.TemporaryDirectory() as td:
     # Dispatch with no eligible work returns a null task.
     empty = run('next','--project','NoSuchProject')
     assert empty['task'] is None
+    # Lifecycle guardrails: only the live lease holder may complete a task.
+    run('create','--project','Verify','--title','finish me','--id','fin-1')
+    err = run_fail('complete','fin-1','--owner','someone')
+    assert 'no active lease' in err
+    run('claim','fin-1','--owner','worker-a','--minutes','5')
+    err = run_fail('complete','fin-1','--owner','worker-b')
+    assert 'lease owned by worker-a' in err
+    done = run('complete','fin-1','--owner','worker-a','--note','tests pass')
+    assert done['status'] == 'completed' and done['lease_owner'] == ''
+    run_fail('complete','fin-1','--owner','worker-a')
+    detail = run('show','fin-1')
+    assert any(e['action'] == 'completed' for e in detail['audit'])
+    # Cancel: terminal transition records reason; cancelled tasks cannot be claimed.
+    run('create','--project','Verify','--title','drop me','--id','can-1')
+    run('cancel','can-1','--owner','leo','--reason','obsolete approach')
+    row = next(r for r in run('list') if r['id'] == 'can-1')
+    assert row['status'] == 'cancelled' and row['blocked_reason'] == 'obsolete approach'
+    err = run_fail('claim','can-1','--owner','tester','--minutes','5')
+    assert 'terminal task' in err
+    # Cancel must not override a foreign live lease.
+    run('create','--project','Verify','--title','held','--id','can-2')
+    run('claim','can-2','--owner','holder','--minutes','5')
+    err = run_fail('cancel','can-2','--owner','leo','--reason','x')
+    assert 'lease owned by holder' in err
+    # Audit chain integrity: chain verifies on a healthy database.
+    chain = run('verify-chain')
+    assert chain['ok'] is True and chain['events'] >= 8 and chain['problems'] == []
+    # Doctor: consistency sweep is clean on this exercised environment.
+    doc = ops('doctor')
+    assert doc['ok'] is True and doc['problems'] == [], doc
+    # Tamper evidence: mutating a historical audit event breaks the chain.
+    import sqlite3
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        db.execute("UPDATE audit_events SET action='tampered' WHERE id=(SELECT MIN(id) FROM audit_events)")
+    chain = run('verify-chain')
+    assert chain['ok'] is False
+    assert any(p['kind'] == 'hash_mismatch' for p in chain['problems'])
 print('autopilot verification: PASS')

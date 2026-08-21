@@ -65,7 +65,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
   entity_id TEXT NOT NULL,
   action TEXT NOT NULL,
   payload_json TEXT NOT NULL DEFAULT '{}',
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  prev_hash TEXT NOT NULL DEFAULT '',
+  hash TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id, created_at);
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -88,6 +90,43 @@ def ensure() -> None:
     POLICIES.mkdir(exist_ok=True)
     with sqlite3.connect(DB) as db:
         db.executescript(SCHEMA)
+        _migrate(db)
+
+def _migrate(db) -> None:
+    """Add hash-chain columns to pre-existing audit_events tables and backfill."""
+    cols = {r[1] for r in db.execute("PRAGMA table_info(audit_events)")}
+    if "prev_hash" not in cols:
+        db.execute("ALTER TABLE audit_events ADD COLUMN prev_hash TEXT NOT NULL DEFAULT ''")
+    if "hash" not in cols:
+        db.execute("ALTER TABLE audit_events ADD COLUMN hash TEXT NOT NULL DEFAULT ''")
+    prev = ""
+    for row in db.execute("SELECT id,prev_hash,hash FROM audit_events ORDER BY id").fetchall():
+        if row[2]:
+            prev = row[2]
+            continue
+        full = db.execute("SELECT entity_type,entity_id,action,payload_json,created_at FROM audit_events WHERE id=?", (row[0],)).fetchone()
+        h = _chain_hash(prev, *full)
+        db.execute("UPDATE audit_events SET prev_hash=?,hash=? WHERE id=?", (prev, h, row[0]))
+        prev = h
+
+def _chain_hash(prev: str, entity_type: str, entity_id: str, action: str, payload_json: str, created_at: str) -> str:
+    material = "|".join((prev, entity_type, entity_id, action, payload_json, created_at))
+    return hashlib.sha256(material.encode()).hexdigest()
+
+def audit_chain_problems(db) -> list:
+    """Recompute the audit hash chain; returns a list of break descriptions."""
+    problems = []
+    prev = ""
+    for r in db.execute(
+        "SELECT id,entity_type,entity_id,action,payload_json,created_at,prev_hash,hash FROM audit_events ORDER BY id"
+    ).fetchall():
+        expected = _chain_hash(prev, r[1], r[2], r[3], r[4], r[5])
+        if r[6] != prev:
+            problems.append({"event_id": r[0], "kind": "broken_link", "expected_prev": prev, "actual_prev": r[6]})
+        if r[7] != expected:
+            problems.append({"event_id": r[0], "kind": "hash_mismatch", "expected": expected, "actual": r[7]})
+        prev = r[7]
+    return problems
 
 def conn() -> sqlite3.Connection:
     ensure()
@@ -99,9 +138,14 @@ def json_out(value) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
 
 def audit(db, entity_type: str, entity_id: str, action: str, payload=None) -> None:
-    """Append an immutable local audit event; never include credentials in payloads."""
-    db.execute("INSERT INTO audit_events(entity_type,entity_id,action,payload_json,created_at) VALUES(?,?,?,?,?)",
-               (entity_type, entity_id, action, json.dumps(payload or {}, sort_keys=True), now()))
+    """Append an immutable, hash-chained local audit event; never include credentials in payloads."""
+    payload_json = json.dumps(payload or {}, sort_keys=True)
+    created = now()
+    prev = db.execute("SELECT hash FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
+    prev_hash = prev[0] if prev else ""
+    h = _chain_hash(prev_hash, entity_type, entity_id, action, payload_json, created)
+    db.execute("INSERT INTO audit_events(entity_type,entity_id,action,payload_json,created_at,prev_hash,hash) VALUES(?,?,?,?,?,?,?)",
+               (entity_type, entity_id, action, payload_json, created, prev_hash, h))
 
 def task_row(db, task_id: str):
     row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -162,6 +206,10 @@ def update(args):
             fields[key] = value
     if "status" in fields and fields["status"] not in STATUSES:
         raise SystemExit(f"invalid status: {fields['status']}")
+    if fields.get("status") in {"completed", "failed", "cancelled"}:
+        # Terminal transitions release any held lease so the task cannot look active.
+        fields["lease_owner"] = ""
+        fields["lease_expires_at"] = ""
     if not fields:
         raise SystemExit("no updates supplied")
     fields["updated_at"] = now()
@@ -170,6 +218,50 @@ def update(args):
         db.execute(f"UPDATE tasks SET {', '.join(k+'=?' for k in fields)} WHERE id=?", (*fields.values(), args.id))
         audit(db, "task", args.id, "updated", {k: v for k, v in fields.items() if k != "updated_at"})
         json_out(dict(task_row(db, args.id)))
+
+def _require_live_lease(row, owner: str, verb: str) -> None:
+    """Strict guard: only the current holder of a live lease may proceed."""
+    if not row["lease_owner"]:
+        raise SystemExit("no active lease; claim before " + verb)
+    if row["lease_owner"] != owner:
+        raise SystemExit(f"lease owned by {row['lease_owner']}")
+    if row["lease_expires_at"] and row["lease_expires_at"] <= now():
+        raise SystemExit("lease expired; reclaim before " + verb)
+
+def _require_not_foreign_lease(row, owner: str, verb: str) -> None:
+    """Lenient guard for operator transitions: reject foreign or expired leases only."""
+    if row["lease_owner"] and row["lease_owner"] != owner:
+        raise SystemExit(f"lease owned by {row['lease_owner']}")
+    if row["lease_owner"] and row["lease_expires_at"] and row["lease_expires_at"] <= now():
+        raise SystemExit("lease expired; reclaim before " + verb)
+
+def complete(args):
+    with conn() as db:
+        row = task_row(db, args.id)
+        if row["status"] in {"completed", "cancelled"}:
+            raise SystemExit(f"cannot complete terminal task: {row['status']}")
+        _require_live_lease(row, args.owner, "completing")
+        t = now()
+        db.execute("UPDATE tasks SET status='completed',lease_owner='',lease_expires_at='',blocked_reason='',updated_at=? WHERE id=?", (t, args.id))
+        audit(db, "task", args.id, "completed", {"owner": args.owner, "note": args.note})
+        json_out(dict(task_row(db, args.id)))
+
+def cancel(args):
+    with conn() as db:
+        row = task_row(db, args.id)
+        if row["status"] in {"completed", "cancelled"}:
+            raise SystemExit(f"cannot cancel terminal task: {row['status']}")
+        _require_not_foreign_lease(row, args.owner, "cancelling")
+        t = now()
+        db.execute("UPDATE tasks SET status='cancelled',lease_owner='',lease_expires_at='',blocked_reason=?,updated_at=? WHERE id=?", (args.reason or 'cancelled by operator', t, args.id))
+        audit(db, "task", args.id, "cancelled", {"owner": args.owner, "reason": args.reason})
+        json_out(dict(task_row(db, args.id)))
+
+def verify_chain(args):
+    with conn() as db:
+        problems = audit_chain_problems(db)
+        total = db.execute("SELECT COUNT(*) n FROM audit_events").fetchone()["n"]
+    json_out({"ok": not problems, "events": total, "problems": problems})
 
 def claim(args):
     with conn() as db:
@@ -346,6 +438,9 @@ def main():
     p=sub.add_parser("init"); p.set_defaults(fn=lambda a: (ensure(), json_out({"ok":True,"db":str(DB)})))
     p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.set_defaults(fn=create)
     p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.set_defaults(fn=update)
+    p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.set_defaults(fn=complete)
+    p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
+    p=sub.add_parser("verify-chain"); p.set_defaults(fn=verify_chain)
     p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.set_defaults(fn=claim)
     p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.set_defaults(fn=heartbeat)
     p=sub.add_parser("receipt"); p.add_argument("task_id"); p.add_argument("--kind",required=True); p.add_argument("--payload",default="{}"); p.set_defaults(fn=receipt)

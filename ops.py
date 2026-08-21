@@ -94,6 +94,37 @@ def morning(args=None):
     autopilot.dashboard(argparse.Namespace())
     print('\nSAFE AUTOMATION: read-only reconciliation, no deploy/merge/external submission.')
 
+def doctor(args=None):
+    """Read-only consistency sweep: orphan deps, receipt index/files, audit chain, stale leases."""
+    problems = []
+    with db() as c:
+        for r in c.execute(
+            "SELECT d.task_id,d.depends_on FROM task_deps d "
+            "LEFT JOIN tasks a ON a.id=d.task_id LEFT JOIN tasks b ON b.id=d.depends_on "
+            "WHERE a.id IS NULL OR b.id IS NULL"):
+            problems.append({'kind': 'orphan_dependency', 'task_id': r['task_id'], 'depends_on': r['depends_on']})
+        indexed = set()
+        for r in c.execute("SELECT id FROM receipts"):
+            indexed.add(r['id'])
+            if not (autopilot.RECEIPTS / f"{r['id']}.json").exists():
+                problems.append({'kind': 'receipt_file_missing', 'receipt_id': r['id']})
+        if autopilot.RECEIPTS.exists():
+            for p in autopilot.RECEIPTS.glob('*.json'):
+                if p.stem not in indexed:
+                    problems.append({'kind': 'receipt_row_missing', 'path': p.name})
+        problems.extend(autopilot.audit_chain_problems(c))
+        stale = c.execute(
+            "SELECT id FROM tasks WHERE lease_expires_at!='' AND lease_expires_at<=? "
+            "AND status IN ('claimed','running','waiting_for_agent')", (utc(),)).fetchall()
+        for r in stale:
+            problems.append({'kind': 'stale_lease', 'task_id': r['id']})
+        dangling = c.execute(
+            "SELECT t.id FROM tasks t WHERE t.last_receipt!='' AND NOT EXISTS("
+            "SELECT 1 FROM receipts r WHERE r.id=t.last_receipt)").fetchall()
+        for r in dangling:
+            problems.append({'kind': 'last_receipt_dangling', 'task_id': r['id']})
+    print(json.dumps({'ok': not problems, 'problems': problems, 'count': len(problems)}, sort_keys=True))
+
 def policy(args):
     path=Path.home()/'.hermes/autopilot/policies'/f'{args.project.lower()}.yaml'
     if not path.exists(): print(json.dumps({'allowed':False,'reason':'no project policy'})); return
@@ -103,7 +134,7 @@ def policy(args):
 
 import argparse
 p=argparse.ArgumentParser(); s=p.add_subparsers(dest='cmd',required=True)
-for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning)]:
+for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning),('doctor',doctor)]:
  x=s.add_parser(name); x.set_defaults(fn=fn)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.set_defaults(fn=recover)
 x=s.add_parser('approval'); x.add_argument('action',choices=['approve','reject','block']); x.add_argument('id'); x.add_argument('--by',default='leo'); x.add_argument('--reason',default=''); x.add_argument('--next-action',default=''); x.set_defaults(fn=approval)
