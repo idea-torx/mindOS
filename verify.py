@@ -774,6 +774,79 @@ with tempfile.TemporaryDirectory() as td:
     assert 'terminal task' in err
     doc = ops('doctor')
     assert doc['ok'] is True and doc['problems'] == [], doc
+    # Handoff inbox: fleet-wide inbound view of live handoffs addressed to an agent.
+    run('create','--project','Inbox','--title','inbound one','--id','ibx-1')
+    run('create','--project','Inbox','--title','inbound two','--id','ibx-2')
+    run('create','--project','OtherBox','--title','inbound three','--id','ibx-3')
+    h_i1 = run('handoff','ibx-1','--from-agent','codex','--to-agent','claude-code',
+               '--objective','first objective','--commit','def5678')
+    h_i2 = run('handoff','ibx-2','--from-agent','hermes','--to-agent','claude-code',
+               '--objective','second objective')
+    run('claim','ibx-1','--owner','worker-i','--minutes','5')
+    inbox = run('handoff-inbox','--agent','claude-code')
+    assert inbox['ok'] is True and inbox['agent'] == 'claude-code', inbox
+    by_task = {i['task_id']: i for i in inbox['items']}
+    assert {'ibx-1','ibx-2'} <= set(by_task), inbox
+    assert by_task['ibx-1']['handoff_id'] == h_i1['id']
+    assert by_task['ibx-1']['objective'] == 'first objective'
+    assert by_task['ibx-1']['from_agent'] == 'codex' and by_task['ibx-1']['commit_ref'] == 'def5678'
+    assert by_task['ibx-1']['task_title'] == 'inbound one' and by_task['ibx-1']['task_status'] == 'claimed'
+    assert by_task['ibx-1']['lease']['owner'] == 'worker-i' and by_task['ibx-1']['lease']['live'] is True
+    assert by_task['ibx-2']['lease']['owner'] == '' and by_task['ibx-2']['lease']['live'] is False
+    # Supersession-awareness: readdressing ibx-2 to opencode removes it from claude-code's inbox.
+    h_i2b = run('handoff','ibx-2','--from-agent','hermes','--to-agent','opencode',
+                '--objective','readdressed objective')
+    assert h_i2b['superseded'] == h_i2['id']
+    inbox = run('handoff-inbox','--agent','claude-code')
+    assert 'ibx-2' not in {i['task_id'] for i in inbox['items']}, inbox
+    other = run('handoff-inbox','--agent','opencode')
+    assert [i['task_id'] for i in other['items']] == ['ibx-2'], other
+    assert other['items'][0]['objective'] == 'readdressed objective'
+    # Project filter and empty result shape.
+    scoped = run('handoff-inbox','--agent','claude-code','--project','Inbox')
+    assert {i['task_id'] for i in scoped['items']} == {'ibx-1'}, scoped
+    assert run('handoff-inbox','--agent','nobody')['count'] == 0
+    err = run_fail('handoff-inbox','--agent','')
+    assert '--agent is required' in err
+    # Deadline escalation: overdue non-terminal tasks climb one priority level per pass.
+    run('create','--project','Sla','--title','overdue p3','--id','sla-1','--priority','P3',
+        '--due-at','2020-01-01T00:00:00Z')
+    run('create','--project','Sla','--title','overdue p0','--id','sla-2','--priority','P0',
+        '--due-at','2020-01-01T00:00:00Z')
+    run('create','--project','Sla','--title','future p3','--id','sla-3','--priority','P3',
+        '--due-at','2030-01-01T00:00:00Z')
+    dryesc = ops('escalate','--dry-run')
+    assert dryesc['dry_run'] is True, dryesc
+    assert any(c['task_id'] == 'sla-1' and c['from_priority'] == 'P3' and c['to_priority'] == 'P2'
+               for c in dryesc['escalated']), dryesc
+    assert 'sla-2' in dryesc['already_p0'], 'overdue P0 must be reported, not escalated'
+    assert all(c['task_id'] != 'sla-3' for c in dryesc['escalated']), 'future deadline must not escalate'
+    row = next(r for r in run('list') if r['id'] == 'sla-1')
+    assert row['priority'] == 'P3', 'dry-run must not mutate'
+    esc = ops('escalate')
+    assert esc['dry_run'] is False and esc['count'] >= 1, esc
+    bumped = {c['task_id']: c['to_priority'] for c in esc['escalated']}
+    assert bumped.get('sla-1') == 'P2' and 'sla-2' not in bumped and 'sla-3' not in bumped, esc
+    row = next(r for r in run('list') if r['id'] == 'sla-1')
+    assert row['priority'] == 'P2', row
+    detail = run('show','sla-1')
+    last = detail['audit'][0]
+    assert last['action'] == 'priority_escalated', last
+    assert last['payload']['from_priority'] == 'P3' and last['payload']['to_priority'] == 'P2'
+    assert last['payload']['reason'] == 'overdue'
+    # Repeated passes converge: P2 -> P1 on the next sweep.
+    esc2 = ops('escalate')
+    assert any(c['task_id'] == 'sla-1' and c['to_priority'] == 'P1' for c in esc2['escalated']), esc2
+    row = next(r for r in run('list') if r['id'] == 'sla-1')
+    assert row['priority'] == 'P1', row
+    # Terminal tasks are never escalated even when overdue.
+    run('create','--project','Sla','--title','done overdue','--id','sla-4','--priority','P3',
+        '--due-at','2020-01-01T00:00:00Z')
+    run('cancel','sla-4','--owner','leo','--reason','obsolete before deadline sweep')
+    esc3 = ops('escalate')
+    assert all(c['task_id'] != 'sla-4' for c in esc3['escalated']), esc3
+    chain = run('verify-chain')
+    assert chain['ok'] is True, 'escalation audits must keep the chain intact'
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

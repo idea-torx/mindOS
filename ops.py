@@ -65,6 +65,47 @@ def recover(args=None):
                       'backoff':{r['id']:ra for kind,r,_,ra in plan if kind=='recovered' and ra},
                       'count':len(recovered)+len(failed)}))
 
+ESCALATION_ORDER = ['P3', 'P2', 'P1', 'P0']
+
+def escalate(args=None):
+    """Deadline SLA sweep: overdue non-terminal tasks climb one priority level.
+
+    Dispatch already orders by priority then earliest deadline, but a stale P3
+    task that misses its deadline keeps losing dispatch races to fresh P2 work
+    forever. Each `escalate` pass moves every non-terminal task whose due_at has
+    passed up exactly one priority level (P3→P2→P1→P0); tasks already at P0 are
+    reported as `already_p0` instead of being silently stuck. Repeated passes
+    therefore converge an ignored overdue task toward the front of the queue,
+    and every bump is audited as `priority_escalated` with the deadline as
+    provenance. `--dry-run` previews without mutating.
+    """
+    dry = bool(getattr(args, 'dry_run', False))
+    t = utc()
+    changed = []
+    already_p0 = []
+    with db() as c:
+        rows = c.execute(
+            "SELECT id,priority,due_at FROM tasks "
+            "WHERE due_at!='' AND due_at<=? AND status NOT IN ('completed','failed','cancelled') "
+            "ORDER BY due_at", (t,)).fetchall()
+        for r in rows:
+            idx = ESCALATION_ORDER.index(r['priority']) if r['priority'] in ESCALATION_ORDER else -1
+            if idx < 0 or idx == len(ESCALATION_ORDER) - 1:
+                already_p0.append(r['id'])
+                continue
+            changed.append({'task_id': r['id'], 'from_priority': r['priority'],
+                            'to_priority': ESCALATION_ORDER[idx + 1], 'due_at': r['due_at']})
+        if not dry:
+            for ch in changed:
+                c.execute("UPDATE tasks SET priority=?,updated_at=? WHERE id=?",
+                          (ch['to_priority'], t, ch['task_id']))
+                autopilot.audit(c, 'task', ch['task_id'], 'priority_escalated',
+                                {'from_priority': ch['from_priority'], 'to_priority': ch['to_priority'],
+                                 'due_at': ch['due_at'], 'reason': 'overdue'})
+    print(json.dumps({'ok': True, 'dry_run': dry, 'generated_at': t,
+                      'escalated': changed, 'already_p0': already_p0,
+                      'count': len(changed)}, sort_keys=True))
+
 def approval(args):
     status={'approve':'waiting_for_review','reject':'blocked','block':'blocked'}[args.action]
     reason=args.reason or ('approval rejected' if args.action=='reject' else '')
@@ -456,6 +497,7 @@ p=argparse.ArgumentParser(); s=p.add_subparsers(dest='cmd',required=True)
 for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning),('doctor',doctor)]:
  x=s.add_parser(name); x.set_defaults(fn=fn)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--backoff-base',type=int,default=60); x.add_argument('--backoff-cap',type=int,default=3600); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
+x=s.add_parser('escalate'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=escalate)
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)
 x=s.add_parser('snapshot-check'); x.add_argument('path'); x.set_defaults(fn=snapshot_check)
 x=s.add_parser('snapshot-restore'); x.add_argument('path'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=snapshot_restore)

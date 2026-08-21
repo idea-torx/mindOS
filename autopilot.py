@@ -542,6 +542,51 @@ def current_handoff(args):
         row = _live_handoff(db, args.task_id)
     json_out(_handoff_parsed(row, include_meta=True) if row else None)
 
+def handoff_inbox(args):
+    """Fleet-wide inbound view: every live handoff addressed to an agent.
+
+    The per-task commands (`handoffs`, `handoff-current`) answer "what is the
+    state of this task"; the inbox answers the complementary question an
+    incoming agent actually starts from: "what work was handed to me across
+    the whole fleet?" Only *live* (non-superseded) handoffs whose to_agent
+    matches are listed — when a handoff is superseded by one addressed to
+    someone else, the task leaves the previous recipient's inbox automatically.
+    Each item joins the task's live state (title, status, priority, lease) so
+    the agent can triage without a follow-up `show` per task.
+    """
+    agent = (args.agent or "").strip()
+    if not agent:
+        raise SystemExit("--agent is required")
+    clauses = ["h.superseded_by=''", "h.to_agent=?"]
+    vals = [agent]
+    if getattr(args, "project", ""):
+        clauses.append("t.project=?")
+        vals.append(args.project)
+    limit = max(0, args.limit)
+    t = now()
+    with conn() as db:
+        rows = db.execute(
+            "SELECT h.id,h.task_id,h.from_agent,h.status,h.objective,h.commit_ref,"
+            "h.recall_digest,h.created_at,t.project,t.title AS task_title,"
+            "t.status AS task_status,t.priority,t.lease_owner,t.lease_expires_at "
+            "FROM handoffs h JOIN tasks t ON t.id=h.task_id "
+            "WHERE " + " AND ".join(clauses) +
+            " ORDER BY h.created_at DESC, h.rowid DESC LIMIT ?", (*vals, limit)).fetchall()
+    items = []
+    for r in rows:
+        items.append({
+            "handoff_id": r["id"], "task_id": r["task_id"], "project": r["project"],
+            "task_title": r["task_title"], "task_status": r["task_status"],
+            "priority": r["priority"],
+            "lease": {"owner": r["lease_owner"],
+                      "live": bool(r["lease_owner"]) and r["lease_expires_at"] > t},
+            "from_agent": r["from_agent"], "status": r["status"],
+            "objective": r["objective"], "commit_ref": r["commit_ref"],
+            "recall_digest": r["recall_digest"], "created_at": r["created_at"],
+        })
+    json_out({"ok": True, "agent": agent, "generated_at": t,
+              "count": len(items), "items": items})
+
 def _related_note_candidates(db, task_id: str, text: str, limit: int, scope: str) -> list:
     """Cross-task retrieval: live notes on *other* tasks matching this task's text.
 
@@ -1510,6 +1555,7 @@ def main():
     p=sub.add_parser("handoff"); p.add_argument("task_id"); p.add_argument("--from-agent",required=True); p.add_argument("--to-agent",default=""); p.add_argument("--status",default=""); p.add_argument("--objective",default=""); p.add_argument("--evidence",action="append",default=[]); p.add_argument("--constraint",dest="constraints",action="append",default=[]); p.add_argument("--decision",dest="decisions",action="append",default=[]); p.add_argument("--file",dest="files",action="append",default=[]); p.add_argument("--commit",dest="commit_ref",default=""); p.add_argument("--next-action",dest="next_actions",action="append",default=[]); p.add_argument("--risk",dest="risks",action="append",default=[]); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.set_defaults(fn=add_handoff)
     p=sub.add_parser("handoffs"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_handoffs)
     p=sub.add_parser("handoff-current"); p.add_argument("task_id"); p.set_defaults(fn=current_handoff)
+    p=sub.add_parser("handoff-inbox"); p.add_argument("--agent",required=True); p.add_argument("--project"); p.add_argument("--limit",type=int,default=50); p.set_defaults(fn=handoff_inbox)
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)
     p=sub.add_parser("renew"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=renew)
     p=sub.add_parser("transfer"); p.add_argument("id"); p.add_argument("--from-owner",required=True,dest="from_owner"); p.add_argument("--to-owner",required=True,dest="to_owner"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=transfer)

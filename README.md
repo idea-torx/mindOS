@@ -222,6 +222,25 @@ Design properties:
   supersession links, and invariant violations (more than one live handoff per
   task); snapshots and archives carry the `handoffs` table.
 
+## Handoff inbox (fleet-wide inbound view)
+
+Per-task commands answer "what is the state of this task"; `handoff-inbox`
+answers the question an incoming agent actually starts from — "what work was
+handed to me across the whole fleet?":
+
+```bash
+python3 "$A" handoff-inbox --agent claude-code
+python3 "$A" handoff-inbox --agent claude-code --project Trove --limit 10
+```
+
+Only *live* (non-superseded) handoffs whose `to_agent` matches are listed, so
+when a handoff is superseded by one addressed to someone else, the task leaves
+the previous recipient's inbox automatically. Each item joins the task's live
+state — title, status, priority, lease owner/liveness — plus the handoff's
+`from_agent`, objective, commit, recall digest, and timestamp, so an agent can
+triage its inbound work without a follow-up `show` per task. The natural loop
+is: `handoff-inbox` → `resume <task-id> --agent me` → act → publish a receipt.
+
 ## Retrieval-augmented context packs
 
 `context --related N` turns the pack into cross-task RAG: up to N live notes
@@ -492,6 +511,29 @@ Design properties:
 - **Audited**: the `lease_recovered` audit event records the applied
   `recover_after`.
 - **Observable**: `metrics` reports `tasks_in_backoff`.
+
+## Deadline escalation (SLA sweep)
+
+Dispatch orders by priority then earliest deadline, but a stale P3 task that
+misses its deadline keeps losing dispatch races to fresh P2 work forever.
+`ops.py escalate` is the SLA sweep: every non-terminal task whose `due_at` has
+passed climbs exactly one priority level per pass (P3→P2→P1→P0), so repeated
+passes converge an ignored overdue task toward the front of the queue:
+
+```bash
+python3 "$O" escalate            # bump all overdue non-terminal tasks one level
+python3 "$O" escalate --dry-run  # preview the bumps without mutating
+```
+
+Design properties:
+
+- **Convergent, not jumpy**: one level per pass keeps operator intent visible
+  in the audit trail instead of slamming everything to P0 at once; tasks
+  already at P0 are reported as `already_p0` rather than being silently stuck.
+- **Terminal-safe**: completed/failed/cancelled tasks are never escalated even
+  when overdue.
+- **Audited**: each bump records a `priority_escalated` event with the old and
+  new priority, the deadline, and `reason: overdue` in the hash chain.
 
 ## Archival & retention
 
