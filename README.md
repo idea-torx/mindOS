@@ -890,6 +890,39 @@ LIKE filter and stable as CLI flags. Every task output exposes `tags` as a
 JSON array, and tagging is audited (`task_tagged`/`task_untagged`) like all
 state changes.
 
+## Project dispatch policy (required tags & WIP caps)
+
+Task tags put dispatch policy on the tasks; project policies put it on the
+projects. The same `policies/<project>.yaml` files that gate merge/deploy
+readiness can now also gate dispatch itself, so a project's rules hold no
+matter which agent claims the work:
+
+```yaml
+# policies/client-trove.yaml
+dispatch_requires_tag: client:trove   # only tagged work is dispatchable here
+max_wip_per_owner: 2                  # an owner holds at most 2 live leases here
+```
+
+- `dispatch_requires_tag` — `next` skips the project's untagged tasks
+  (`policy_missing_tag`, with the required tag, under `--explain`) and a
+  direct `claim` refuses until the task is tagged. `--force` is the
+  deliberate override; the override is recorded in the `claimed` audit event
+  as `policy_overrides`, so forced past-the-gate claims leave provenance.
+- `max_wip_per_owner` — counts an owner's live leases *within that project*
+  (the global `--max-active` cap stays independent). At cap, `next --claim`
+  skips the project's candidates (`policy_wip_cap`, with the held ids) and
+  picks the best task elsewhere instead of failing after the pick — a
+  multi-project dispatcher is steered toward work it may actually take. A
+  direct `claim` at cap refuses with the held ids; `--force` overrides.
+
+Both gates run before the lease is acquired, refusals are audited as
+`claim_refused_policy` on their own connection (gate kind + held ids, never
+resurrected by the rolled-back transaction), and `metrics` reports
+`claims_refused_by_policy` fleet-wide. Policy-less projects behave exactly as
+before; deleting a policy file reopens dispatch immediately. Like the seam
+guard, `plan` remains a read-only simulation — policy enforcement happens at
+dispatch/claim time against live state.
+
 ## Dependency priority inheritance (urgency flows upstream)
 
 A P0 task is useless if its P3 prerequisite never gets dispatched. `next`

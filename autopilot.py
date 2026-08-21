@@ -1994,15 +1994,18 @@ def _seam_message(conflicts: list) -> str:
                        for c in conflicts)
     return f"seam conflict: {detail}; complete/release the holder first or pass --force"
 
-def _audit_seam_refusal(task_id: str, owner: str, conflicts: list) -> None:
-    """Record a seam refusal in the audit chain on its own connection.
+def _audit_claim_refusal(task_id: str, owner: str, action: str, detail: dict) -> None:
+    """Record a claim refusal in the audit chain on its own connection.
 
     The caller's transaction is rolled back (the just-acquired lease must not
     survive), so the refusal is committed separately to keep the audit trail
     complete without resurrecting the lease.
     """
     with conn() as db:
-        audit(db, "task", task_id, "claim_refused_seam", {"owner": owner, "conflicts": conflicts})
+        audit(db, "task", task_id, action, {"owner": owner, **detail})
+
+def _audit_seam_refusal(task_id: str, owner: str, conflicts: list) -> None:
+    _audit_claim_refusal(task_id, owner, "claim_refused_seam", {"conflicts": conflicts})
 
 def create(args):
     task_id = args.id or f"{args.project.lower().replace(' ', '-')}-{uuid.uuid4().hex[:8]}"
@@ -2054,17 +2057,58 @@ def similar_tasks(args):
 # convention ops.py policy reports on).
 _GATED_STATUS_ACTIONS = {"ready_to_merge": "merge", "ready_to_deploy": "deploy"}
 
+def _project_policy(project: str) -> dict:
+    """Parse a project's policy file (policies/<project>.yaml) into a dict.
+
+    The policy files are flat YAML ("key: value" lines), so a tiny
+    dependency-free parser covers every key the runtime acts on; unknown
+    keys are preserved verbatim for reporting. Booleans become bool,
+    digit-only values int, everything else stays a string. A missing or
+    unreadable file yields {} so policy-less fleets keep today's behavior.
+    """
+    try:
+        text = (POLICIES / f"{project.lower()}.yaml").read_text()
+    except OSError:
+        return {}
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k, v = k.strip(), v.strip()
+        if v.lower() in ("true", "false"):
+            out[k] = v.lower() == "true"
+        elif v.isdigit():
+            out[k] = int(v)
+        else:
+            out[k] = v
+    return out
+
 def _policy_requires_user(project: str, action: str) -> bool:
     """True when the project's policy demands user approval for `action`.
 
     Mirrors ops.py policy semantics. A missing or unreadable policy file
     allows the transition so fleets without policies keep today's behavior.
     """
-    try:
-        text = (POLICIES / f"{project.lower()}.yaml").read_text()
-    except OSError:
-        return False
-    return f"{action}_requires_user: true" in text
+    return bool(_project_policy(project).get(f"{action}_requires_user"))
+
+def _dispatch_required_tag(policy: dict) -> str:
+    """The capability tag a project's policy requires on dispatchable work ('' = none)."""
+    tag = policy.get("dispatch_requires_tag")
+    return tag.strip() if isinstance(tag, str) else ""
+
+def _wip_cap(policy: dict) -> int:
+    """Per-owner live-lease cap inside one project (0 = uncapped)."""
+    v = policy.get("max_wip_per_owner")
+    return v if isinstance(v, int) and v > 0 else 0
+
+def _owner_project_leases(db, owner: str, project: str, exclude_task: str = "") -> list:
+    """Ids of the owner's live leases within one project (same liveness rule as `leases`)."""
+    t = now()
+    return [r["id"] for r in db.execute(
+        "SELECT id FROM tasks WHERE lease_owner=? AND project=? AND id!=? "
+        "AND lease_expires_at!='' AND lease_expires_at>?", (owner, project, exclude_task, t))]
 
 def update(args):
     fields = {}
@@ -2614,13 +2658,42 @@ def claim(args):
             if conflicts:
                 _audit_seam_refusal(args.id, args.owner, conflicts)
                 raise SystemExit(_seam_message(conflicts))
+        # Dispatch policy gates (policies/<project>.yaml): a project may
+        # require a capability tag on its work and cap how many live leases
+        # one owner holds inside it. --force is the deliberate override; the
+        # override is recorded in the claimed event so provenance survives.
+        policy = _project_policy(row["project"])
+        overrides = []
+        required_tag = _dispatch_required_tag(policy)
+        if required_tag and required_tag not in _task_tags(row):
+            if getattr(args, "force", False):
+                overrides.append({"gate": "dispatch_requires_tag", "required_tag": required_tag})
+            else:
+                _audit_claim_refusal(args.id, args.owner, "claim_refused_policy",
+                                     {"gate": "dispatch_requires_tag", "required_tag": required_tag})
+                raise SystemExit(
+                    f"project policy requires tag {required_tag!r} before dispatch; "
+                    f"tag the task or pass --force")
+        cap = _wip_cap(policy)
+        if cap:
+            held = _owner_project_leases(db, args.owner, row["project"], args.id)
+            if len(held) >= cap:
+                if getattr(args, "force", False):
+                    overrides.append({"gate": "max_wip_per_owner", "cap": cap, "held": held})
+                else:
+                    _audit_claim_refusal(args.id, args.owner, "claim_refused_policy",
+                                         {"gate": "max_wip_per_owner", "cap": cap, "held": held})
+                    raise SystemExit(
+                        f"project policy caps owner '{args.owner}' at {cap} live leases in "
+                        f"{row['project']} (held: {', '.join(held)}); complete/release first or pass --force")
         # Atomic acquire: the WHERE guard makes the lease check-and-set a single
         # statement so concurrent claimers cannot both win the same lease.
         acquired, exp, epoch = _acquire(db, args.id, args.owner, args.minutes, resolve_max_active(args))
         if not acquired:
             raise SystemExit(_explain_acquire_failure(db, args.id, args.owner, resolve_max_active(args)))
         db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"claimed",now(),"lease claimed"))
-        audit(db, "task", args.id, "claimed", {"owner": args.owner, "lease_expires_at": exp, "lease_epoch": epoch})
+        audit(db, "task", args.id, "claimed", {"owner": args.owner, "lease_expires_at": exp, "lease_epoch": epoch,
+                                               **({"policy_overrides": overrides} if overrides else {})})
         out = _task_view(task_row(db, args.id))
         json_out(out)
 
@@ -2661,9 +2734,19 @@ def next_task(args):
     With --explain, the result also reports how many queued candidates were
     considered and why each skipped candidate was not picked
     (unsatisfied_dependencies with the blocking ids, recovery_backoff with its
-    cooldown deadline, deferred_until with its not_before, or seam_conflict
-    when another live lease holds the candidate's worktree/branch), plus the
-    effective priority of the pick when aging boosted it.
+    cooldown deadline, deferred_until with its not_before, seam_conflict
+    when another live lease holds the candidate's worktree/branch,
+    policy_missing_tag / policy_wip_cap when the candidate's project policy
+    gates it out of dispatch), plus the effective priority of the pick when
+    aging boosted it.
+
+    Project dispatch policy (policies/<project>.yaml) is enforced here the
+    same way it is on direct claim: `dispatch_requires_tag: <tag>` keeps
+    untagged work in the project undispatchable (direct claim refuses unless
+    --force), and `max_wip_per_owner: N` makes dispatch skip candidates whose
+    project is at the owner's live-lease cap instead of failing after the
+    pick — so a multi-project dispatcher is steered toward work it may
+    actually take.
 
     --tag scopes dispatch to tasks carrying that capability/scope tag
     (see `tag`/`untag`): an agent constrained to `--tag autopilot-safe` never
@@ -2706,6 +2789,7 @@ def next_task(args):
         rows = db.execute(q, vals).fetchall()
         eligible = []
         skipped = []
+        pol_cache = {}
         for r in rows:
             if r["not_before"] and r["not_before"] > t_now:
                 if explain:
@@ -2723,6 +2807,26 @@ def next_task(args):
                     skipped.append({"task_id": r["id"], "reason": "recovery_backoff",
                                     "recover_after": r["recover_after"]})
                 continue
+            # Project dispatch policy: cache per project so a fleet-wide
+            # sweep reads each policy file once.
+            pol = pol_cache.get(r["project"])
+            if pol is None:
+                pol = pol_cache[r["project"]] = _project_policy(r["project"])
+            required_tag = _dispatch_required_tag(pol)
+            if required_tag and required_tag not in _task_tags(r):
+                if explain:
+                    skipped.append({"task_id": r["id"], "reason": "policy_missing_tag",
+                                    "required_tag": required_tag})
+                continue
+            if args.claim:
+                cap = _wip_cap(pol)
+                if cap:
+                    held = _owner_project_leases(db, args.owner, r["project"], r["id"])
+                    if len(held) >= cap:
+                        if explain:
+                            skipped.append({"task_id": r["id"], "reason": "policy_wip_cap",
+                                            "cap": cap, "held": held})
+                        continue
             if args.claim:
                 # Dispatch must not hand out work whose seam (worktree/branch)
                 # is already held by another live lease — the claim would
@@ -2929,6 +3033,8 @@ def metrics(args):
         failures = {a: db.execute(
             "SELECT COUNT(*) n FROM audit_events WHERE action=?", (a,)).fetchone()["n"]
             for a in ("task_failed", "task_failed_terminal")}
+        claims_refused_by_policy = db.execute(
+            "SELECT COUNT(*) n FROM audit_events WHERE action='claim_refused_policy'").fetchone()["n"]
         cp_len = _critical_path(db)["length"]
         completed_no_receipt = db.execute(
             "SELECT COUNT(*) n FROM tasks t WHERE t.status='completed' AND NOT EXISTS("
@@ -2960,6 +3066,7 @@ def metrics(args):
         "secrets_allowed_total": secrets["secret_allowed"],
         "failures_retried_total": failures["task_failed"],
         "failures_terminal_total": failures["task_failed_terminal"],
+        "claims_refused_by_policy": claims_refused_by_policy,
         "handoffs_total": handoffs["total"] or 0,
         "handoffs_superseded": handoffs["superseded"] or 0,
         "handoffs_with_recall_proof": handoffs["proven"] or 0,

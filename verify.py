@@ -1900,6 +1900,48 @@ with tempfile.TemporaryDirectory() as td:
         and evu['payload']['policy_gate'] == 'merge', evu           # who approved, recorded durably
     run('update','pg-1','--next-action','polish')                   # no status change: ungated
     run('update','ev-3','--status','ready_to_deploy')               # policy-less project stays open
+    # Project dispatch policy: policies/<project>.yaml gates dispatch itself —
+    # a required capability tag keeps untagged work undispatchable and a WIP
+    # cap steers an owner at capacity toward other projects instead of failing.
+    (pol / 'policyproj.yaml').write_text('dispatch_requires_tag: worker-safe\nmax_wip_per_owner: 1\n')
+    run('create','--project','PolicyProj','--title','untagged work','--id','dp-1')
+    run('create','--project','PolicyProj','--title','tagged work','--id','dp-2','--tag','worker-safe')
+    run('create','--project','PolicyProj','--title','second tagged','--id','dp-3','--tag','worker-safe')
+    nx = run('next','--project','PolicyProj','--explain')
+    assert nx['task']['id'] == 'dp-2', nx                           # tagged work dispatches, oldest first
+    sk = next(s for s in nx['skipped'] if s['task_id'] == 'dp-1')
+    assert sk['reason'] == 'policy_missing_tag' and sk['required_tag'] == 'worker-safe', sk
+    err = run_fail('claim','dp-1','--owner','pa-1')
+    assert 'requires tag' in err and '--force' in err               # direct claim gated too
+    ref = next(e for e in run('events','--entity-type','task','--entity-id','dp-1')['events']
+               if e['action'] == 'claim_refused_policy')
+    assert ref['payload']['gate'] == 'dispatch_requires_tag', ref   # refusal is audited
+    run('claim','dp-1','--owner','pa-1','--force')                  # deliberate override
+    ovr = next(e for e in run('show','dp-1')['audit'] if e['action'] == 'claimed')
+    assert ovr['payload']['policy_overrides'][0]['gate'] == 'dispatch_requires_tag', ovr
+    run('release','dp-1','--owner','pa-1')
+    run('claim','dp-2','--owner','pa-1')                            # within cap (0 -> 1)
+    nx = run('next','--claim','--project','PolicyProj','--owner','pa-1','--explain')
+    assert nx['task'] is None, nx                                   # at cap: nothing handed out
+    sk = next(s for s in nx['skipped'] if s['task_id'] == 'dp-3')
+    assert sk['reason'] == 'policy_wip_cap' and sk['cap'] == 1 and sk['held'] == ['dp-2'], sk
+    err = run_fail('claim','dp-3','--owner','pa-1')
+    assert 'caps owner' in err                                      # direct claim refused at cap
+    c3 = run('next','--claim','--project','PolicyProj','--owner','pa-2')
+    assert c3['task']['id'] == 'dp-3' and c3['claimed'], c3         # other owners unaffected
+    # Steering: at cap here, fleet-wide dispatch moves to another project.
+    run('create','--project','Elsewhere','--title','other project','--id','dp-4')
+    run('release','dp-3','--owner','pa-2')
+    nx = run('next','--claim','--owner','pa-1','--explain')
+    sk = next(s for s in nx['skipped'] if s['task_id'] == 'dp-3')
+    assert sk['reason'] == 'policy_wip_cap', sk
+    assert nx['task'] is not None and nx['task']['project'] != 'PolicyProj', nx
+    # Removing the policy restores open dispatch; refusals stay visible in metrics.
+    (pol / 'policyproj.yaml').unlink()
+    nx = run('next','--project','PolicyProj','--explain')
+    assert all(s['reason'] != 'policy_missing_tag' for s in nx.get('skipped', [])), nx
+    m = run('metrics')
+    assert m['claims_refused_by_policy'] >= 2, m
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
