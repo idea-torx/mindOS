@@ -563,6 +563,42 @@ with tempfile.TemporaryDirectory() as td:
     assert out['failed'] == ['bo-4'], out
     row = next(r for r in run('list') if r['id'] == 'bo-4')
     assert row['status'] == 'failed' and row['recover_after'] == ''
+    # Task correction: update can edit title/description/priority/project after creation.
+    run('create','--project','Correct','--title','typo titel','--id','fix-1','--priority','P3')
+    err = run_fail('update','fix-1','--priority','P9')
+    assert 'invalid choice' in err
+    upd = run('update','fix-1','--title','corrected title','--description','fixed description',
+              '--priority','P1','--project','Renamed')
+    assert upd['title'] == 'corrected title' and upd['description'] == 'fixed description'
+    assert upd['priority'] == 'P1' and upd['project'] == 'Renamed', upd
+    detail = run('show','fix-1')
+    last = detail['audit'][0]
+    assert last['action'] == 'updated'
+    assert last['payload']['priority'] == 'P1' and last['payload']['project'] == 'Renamed', last
+    hits = run('search','corrected title')
+    assert [h['id'] for h in hits] == ['fix-1'], 'renamed task must be findable'
+    # Dependency edge removal: a mistaken edge can be undone, unblocking dispatch.
+    run('create','--project','Verify','--title','wrong prereq','--id','rm-a')
+    run('create','--project','Verify','--title','dependent on wrong prereq','--id','rm-b',
+        '--depends-on','rm-a','--priority','P0')
+    err = run_fail('claim','rm-b','--owner','tester','--minutes','5')
+    assert 'unsatisfied dependencies' in err
+    bb = run('blocked-by','rm-b')
+    assert any(b['id'] == 'rm-a' for b in bb['blockers']), bb
+    err = run_fail('dep-remove','rm-b','no-such-task')
+    assert 'task not found' in err
+    run('create','--project','Verify','--title','unrelated','--id','rm-c')
+    err = run_fail('dep-remove','rm-b','rm-c')
+    assert 'no such dependency' in err
+    rem = run('dep-remove','rm-b','rm-a')
+    assert rem['ok'] is True and rem['removed'] == 'rm-a', rem
+    bb = run('blocked-by','rm-b')
+    assert bb['blockers'] == [] and bb['blocked'] is False, 'removed edge must clear blockers'
+    got = run('claim','rm-b','--owner','tester','--minutes','5')
+    assert got['status'] == 'claimed', 'task must be claimable after edge removal'
+    detail = run('show','rm-b')
+    assert detail['dependencies'] == []
+    assert any(e['action'] == 'dependency_removed' for e in detail['audit'])
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

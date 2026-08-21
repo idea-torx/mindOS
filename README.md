@@ -244,9 +244,29 @@ dependency cannot be claimed, and `next` skips it when dispatching:
 ```bash
 python3 "$A" create --project Trove --title "Dependent task" --depends-on <prereq-id>
 python3 "$A" dep <task-id> <prereq-id>   # add a dependency edge (cycles rejected)
+python3 "$A" dep-remove <task-id> <prereq-id>   # remove a mistaken edge (audited)
 python3 "$A" next                        # highest-priority queued task whose deps are completed
 python3 "$A" next --project Trove --claim --owner hermes --minutes 30
 ```
+
+`dep-remove` corrects a mistaken `dep` / `create --depends-on` call: the edge is
+deleted, the removal is audited as `dependency_removed`, and the dependent task
+becomes claimable immediately. Removing a non-existent edge (or naming a task
+that does not exist) is rejected.
+
+## Correcting tasks after creation
+
+Tasks are not immutable: `update` can also edit identity fields, so a typo or a
+re-prioritization does not force a create/cancel round trip:
+
+```bash
+python3 "$A" update <task-id> --title "Corrected title"
+python3 "$A" update <task-id> --description "Fuller description" --priority P1
+python3 "$A" update <task-id> --project RenamedProject
+```
+
+Invalid priorities are rejected by the CLI, and every change is recorded in the
+task's audit trail with the new values.
 
 `next` orders by priority (`P0` first), then oldest-created. With `--claim`, the
 picked task's lease is acquired atomically in the same step, so concurrent

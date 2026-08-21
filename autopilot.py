@@ -612,7 +612,8 @@ def create(args):
 
 def update(args):
     fields = {}
-    for key in ("status", "next_action", "blocked_reason", "worktree", "branch", "pr_url", "owner", "due_at"):
+    for key in ("status", "next_action", "blocked_reason", "worktree", "branch", "pr_url", "owner",
+                "due_at", "title", "description", "priority", "project"):
         value = getattr(args, key, None)
         if value is not None:
             fields[key] = value
@@ -792,6 +793,18 @@ def add_dep(args):
     with conn() as db:
         add_dependency(db, args.id, args.depends_on)
     json_out({"ok": True, "task_id": args.id, "depends_on": args.depends_on})
+
+def remove_dep(args):
+    """Remove a dependency edge, correcting mistaken `dep` / create --depends-on calls."""
+    with conn() as db:
+        task_row(db, args.id)
+        task_row(db, args.depends_on)
+        cur = db.execute("DELETE FROM task_deps WHERE task_id=? AND depends_on=?",
+                         (args.id, args.depends_on))
+        if cur.rowcount != 1:
+            raise SystemExit(f"no such dependency: {args.id} does not depend on {args.depends_on}")
+        audit(db, "task", args.id, "dependency_removed", {"depends_on": args.depends_on})
+    json_out({"ok": True, "task_id": args.id, "removed": args.depends_on})
 
 def next_task(args):
     """Dispatch: highest-priority queued task whose dependencies are all completed.
@@ -1057,7 +1070,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p=sub.add_parser("init"); p.set_defaults(fn=lambda a: (ensure(), json_out({"ok":True,"db":str(DB)})))
     p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--due-at",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.set_defaults(fn=create)
-    p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.set_defaults(fn=update)
+    p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.add_argument("--title"); p.add_argument("--description"); p.add_argument("--priority",choices=sorted(PRIORITIES)); p.add_argument("--project"); p.set_defaults(fn=update)
     p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=complete)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
     p=sub.add_parser("block"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=block)
@@ -1073,6 +1086,7 @@ def main():
     p=sub.add_parser("metrics"); p.set_defaults(fn=metrics)
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
+    p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
     p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.set_defaults(fn=add_note)
