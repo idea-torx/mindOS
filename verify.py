@@ -10,11 +10,22 @@ with tempfile.TemporaryDirectory() as td:
         p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
         if p.returncode: raise AssertionError((args, p.stdout, p.stderr))
         return json.loads(p.stdout)
+    def run_fail(*args):
+        p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
+        assert p.returncode != 0, ('expected failure', args, p.stdout, p.stderr)
+        return p.stderr
     task = run('create','--project','Verify','--title','smoke','--id','verify-1')
     assert task['status'] == 'queued'
     run('claim','verify-1','--owner','tester','--minutes','5')
+    # Lease exclusivity: a second owner must not acquire a live lease.
+    err = run_fail('claim','verify-1','--owner','intruder','--minutes','5')
+    assert 'lease owned by tester' in err
+    # Same-owner reclaim is allowed; renewal via heartbeat keeps the lease live.
+    run('claim','verify-1','--owner','tester','--minutes','5')
     beat = run('heartbeat','verify-1','--owner','tester','--note','smoke')
     assert beat['status'] == 'running' and beat['lease_expires_at']
+    # A non-holder must not be able to renew someone else's lease.
+    run_fail('heartbeat','verify-1','--owner','intruder')
     rec = run('receipt','verify-1','--kind','verification','--payload','{"result":"pass"}')
     assert len(rec['sha256']) == 64 and (Path(td) / 'receipts' / (rec['receipt_id'] + '.json')).stat().st_mode & 0o077 == 0
     rows = run('list'); assert rows[0]['last_receipt'] == rec['receipt_id']

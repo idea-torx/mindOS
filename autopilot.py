@@ -130,13 +130,19 @@ def update(args):
 def claim(args):
     expires = datetime.now(timezone.utc).timestamp() + args.minutes * 60
     exp = datetime.fromtimestamp(expires, timezone.utc).replace(microsecond=0).isoformat()
+    t = now()
     with conn() as db:
         row = task_row(db, args.id)
         if row["status"] in {"completed", "cancelled"}:
             raise SystemExit(f"cannot claim terminal task: {row['status']}")
-        if row["lease_expires_at"] and row["lease_expires_at"] > now() and row["lease_owner"] not in ("", args.owner):
+        # Atomic acquire: the WHERE guard makes the lease check-and-set a single
+        # statement so concurrent claimers cannot both win the same lease.
+        cur = db.execute(
+            "UPDATE tasks SET status='claimed', lease_owner=?, lease_expires_at=?, updated_at=? "
+            "WHERE id=? AND (lease_owner=? OR lease_owner='' OR lease_expires_at='' OR lease_expires_at<=?)",
+            (args.owner, exp, t, args.id, args.owner, t))
+        if cur.rowcount != 1:
             raise SystemExit(f"lease owned by {row['lease_owner']}")
-        db.execute("UPDATE tasks SET status='claimed', lease_owner=?, lease_expires_at=?, updated_at=? WHERE id=?", (args.owner, exp, now(), args.id))
         db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"claimed",now(),"lease claimed"))
         audit(db, "task", args.id, "claimed", {"owner": args.owner, "lease_expires_at": exp})
         json_out(dict(task_row(db, args.id)))
@@ -144,12 +150,17 @@ def claim(args):
 def heartbeat(args):
     with conn() as db:
         row = task_row(db, args.id)
-        if row["lease_owner"] and row["lease_owner"] != args.owner:
-            raise SystemExit(f"lease owned by {row['lease_owner']}")
-        if row["lease_expires_at"] and row["lease_expires_at"] <= now():
-            raise SystemExit("lease expired; reclaim before heartbeat")
+        t = now()
         exp = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + 15 * 60, timezone.utc).replace(microsecond=0).isoformat()
-        db.execute("UPDATE tasks SET status='running', lease_owner=?, lease_expires_at=?, updated_at=? WHERE id=?", (args.owner,exp,now(),args.id))
+        # Atomic renewal: only the current lease holder with a live lease can renew.
+        cur = db.execute(
+            "UPDATE tasks SET status='running', lease_owner=?, lease_expires_at=?, updated_at=? "
+            "WHERE id=? AND (lease_owner=? OR lease_owner='') AND (lease_expires_at='' OR lease_expires_at>?)",
+            (args.owner, exp, t, args.id, args.owner, t))
+        if cur.rowcount != 1:
+            if row["lease_owner"] and row["lease_owner"] != args.owner:
+                raise SystemExit(f"lease owned by {row['lease_owner']}")
+            raise SystemExit("lease expired; reclaim before heartbeat")
         db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"alive",now(),args.note))
         audit(db, "task", args.id, "heartbeat", {"owner": args.owner, "lease_expires_at": exp})
         json_out({"ok": True, "task_id": args.id, "status": "running", "lease_expires_at": exp, "heartbeat_at": now()})
