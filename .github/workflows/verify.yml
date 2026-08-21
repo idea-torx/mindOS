@@ -1,0 +1,43 @@
+name: Verify
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Byte-compile all sources (py_compile)
+        run: python3 -m py_compile autopilot.py ops.py verify.py seed_current_state.py
+
+      - name: Secret-safe scan of tracked content
+        run: |
+          # Truncated fixture tokens in verify.py are deliberate test values
+          # (AKIAIO...MPLE etc.); the regexes below match only full-length
+          # credential shapes, so they pass on fixtures but catch real leaks.
+          ! grep -rnE '(ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{30,}|AKIA[0-9A-Z]{16}[A-Za-z0-9]|xox[abp]-[A-Za-z0-9-]{15,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)' --include='*.py' --include='*.md' --include='*.yaml' --include='*.yml' .
+
+      - name: Docs diff check (README vs command surface)
+        run: |
+          python3 - <<'EOF'
+          import re, pathlib
+          readme = pathlib.Path('README.md').read_text()
+          ops = pathlib.Path('ops.py').read_text()
+          cmds = set(re.findall(r"x=s\.add_parser\('([a-z0-9-]+)'\)", ops))
+          cmds |= set(re.findall(r"\('([a-z0-9-]+)',\s*[a-z_]+\)", ops))
+          missing = [c for c in sorted(cmds) if c not in readme]
+          assert not missing, f"commands undocumented in README: {missing}"
+          print("docs diff check: OK")
+          EOF
+
+      - name: Full end-to-end verification suite
+        run: python3 verify.py

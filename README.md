@@ -1092,6 +1092,8 @@ python3 "$O" recover --dry-run         # preview what the next pass would do, mu
 python3 "$O" approval approve <task-id> --by leo
 python3 "$O" policy <project> <action> # check user-approval policy for an action
 python3 "$O" processes                 # list active agent processes (read-only)
+python3 "$O" github                    # GitHub integration surface (read-only)
+python3 "$O" sentry                    # Sentry triage surface (read-only)
 python3 "$O" morning                   # morning brief
 python3 "$O" snapshot                  # consistent JSON export of all tables, sealed with a SHA-256
 python3 "$O" snapshot-check <file>     # verify a snapshot's integrity hash (exit 1 on tampering)
@@ -1858,6 +1860,7 @@ source during the restricted period.
 
 ## Repository guide
 
+- [README.md](README.md) — what MindOS is, command surface, design rules (this document)
 - [ARCHITECTURE.md](ARCHITECTURE.md) — layers, invariants, module map
 - [INSTALL.md](INSTALL.md) — install + migration from an existing home
 - [CONTRIBUTING.md](CONTRIBUTING.md) — workflow, gates, commit style
@@ -1865,6 +1868,8 @@ source during the restricted period.
 - [ROADMAP.md](ROADMAP.md) — shipped vs. next vs. non-goals
 - [CHANGELOG.md](CHANGELOG.md) — notable changes
 - [STABILITY.md](STABILITY.md) — audited fixed issues / accepted risks
+- [RELEASE.md](RELEASE.md) — release policy: no public release yet; FSL-1.1-MIT terms
+- [LICENSE](LICENSE) — FSL-1.1-MIT with automatic MIT future license
 
 ## Audit & hardening (stability round)
 

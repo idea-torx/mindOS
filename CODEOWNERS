@@ -1,0 +1,3 @@
+# CODEOWNERS — MindOS (private, source-available under FSL-1.1-MIT)
+# Default owner for everything.
+*       @idea-torx/leo

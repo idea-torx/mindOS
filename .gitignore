@@ -3,6 +3,9 @@ state.db
 state.db-*
 temporal.db
 temporal.db-*
+*.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 
