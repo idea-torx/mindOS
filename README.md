@@ -24,6 +24,7 @@ python3 "$A" leases [--all] [--owner hermes]        # fleet-wide lease view
 python3 "$A" transfer <task-id> --from-owner hermes --to-agent codex   # reassign a live lease
 python3 "$A" resume <task-id> --agent codex         # idempotent killed-session recovery
 python3 "$A" cancel <task-id> --owner leo --reason "obsolete"       # rejected on foreign leases
+python3 "$A" defer <task-id> --owner hermes --until "2026-08-22T09:00:00Z"  # park out of dispatch
 python3 "$A" show <task-id>          # task detail + receipts + audit trail + dependencies
 python3 "$A" search "deploy"         # substring search over task text fields
 python3 "$A" search "audit" --status queued --project Trove --priority P1
@@ -460,6 +461,46 @@ python3 "$A" list --overdue
 Timestamps accept any ISO 8601 form (naive values are assumed UTC) and are
 stored normalized; invalid timestamps are rejected. `context` includes
 `due_at` in the task summary so agents see deadlines in their prompt pack.
+
+## Deferral (not_before)
+
+A queued task can be parked out of dispatch until a future instant — useful
+for "retry after the deploy window", rate-limited external calls, or scheduled
+follow-ups. Unlike `block`, no reason or lifecycle change is involved; the
+task stays queued and simply is not dispatched until its time arrives:
+
+```bash
+python3 "$A" defer <task-id> --owner hermes --until "2026-08-22T09:00:00Z"
+python3 "$A" defer <task-id> --owner hermes --until ""      # clear the deferral
+python3 "$A" create --project Trove --title "Follow up" --not-before "2026-08-25T00:00:00Z"
+python3 "$A" update <task-id> --not-before "2026-08-23T12:00:00+02:00"
+```
+
+`next` skips deferred tasks (reason `deferred_until` with the `not_before`
+timestamp under `--explain`) exactly like recovery backoff, while an explicit
+`claim` remains allowed as a deliberate operator override. `metrics` reports
+the count as `queued_deferred`. Every defer/clear is audited with the owner
+and previous status.
+
+## Dispatch aging (starvation guard)
+
+Static priority ordering can starve old low-priority work when fresh P0/P1
+tasks keep arriving. `next` therefore applies a virtual priority boost at
+dispatch time: a queued task that has waited `--aging-minutes` (default 360)
+per level since creation is promoted one effective level, up to
+`--aging-boost` levels (default 2). A P3 that has waited 12+ hours dispatches
+like a P1 without its stored priority ever being mutated:
+
+```bash
+python3 "$A" next --explain                       # defaults: 360 min/level, max boost 2
+python3 "$A" next --aging-minutes 120 --aging-boost 3   # more aggressive fairness
+python3 "$A" next --aging-minutes 0               # strict static ordering (old behavior)
+```
+
+With `--explain`, a boosted pick reports `effective_priority` and
+`priority_boost`. Within one effective tier the longest-waiting task wins
+(oldest `created_at` first), so equal-priority work drains FIFO instead of
+last-touched-first.
 
 ## Blocking & unblocking
 

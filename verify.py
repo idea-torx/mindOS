@@ -1000,6 +1000,49 @@ with tempfile.TemporaryDirectory() as td:
         'walking from any link must reconstruct the full chain'
     err = run_fail('handoff-history', 'no-such-handoff')
     assert 'handoff not found' in err
+    # Deferral: a queued task parked with a future not_before is skipped by
+    # dispatch until its instant arrives; explicit claim stays an override.
+    run('create','--project','DeferTest','--title','urgent but later','--id','def-1','--priority','P0')
+    run('create','--project','DeferTest','--title','small now','--id','def-2','--priority','P3')
+    row = run('defer','def-1','--owner','op','--until','2099-01-01T00:00:00+00:00')
+    assert row['not_before'] == '2099-01-01T00:00:00+00:00', row
+    nx = run('next','--project','DeferTest','--explain')
+    assert nx['task']['id'] == 'def-2', nx
+    sk = next(s for s in nx['skipped'] if s['task_id'] == 'def-1')
+    assert sk['reason'] == 'deferred_until' and sk['not_before'] == '2099-01-01T00:00:00+00:00', nx
+    m = run('metrics'); assert m['queued_deferred'] >= 1, m
+    got = run('next','--claim','--project','DeferTest','--owner','tester','--minutes','5')
+    assert got['task']['id'] == 'def-2'
+    run('release','def-2','--owner','tester')
+    # Explicit claim overrides the deferral (deliberate operator action).
+    run('claim','def-1','--owner','tester','--minutes','5')
+    run('release','def-1','--owner','tester')
+    row = next(r for r in run('list') if r['id'] == 'def-1')
+    assert row['status'] == 'queued', row
+    # Clearing the deferral restores normal dispatch order.
+    run('defer','def-1','--owner','op','--until','')
+    row = next(r for r in run('list') if r['id'] == 'def-1')
+    assert row['not_before'] == '', row
+    nx = run('next','--project','DeferTest')
+    assert nx['task']['id'] == 'def-1', nx
+    err = run_fail('defer','def-2','--owner','op','--until','not-a-date')
+    assert 'invalid --until timestamp' in err
+    # Dispatch aging: an old task waiting far beyond the window is dispatched at
+    # a virtually promoted priority without mutating stored priority.
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        db.execute("UPDATE tasks SET created_at='2020-01-01T00:00:00+00:00' WHERE id='def-2'")
+        db.commit()
+    row = next(r for r in run('list') if r['id'] == 'def-2')
+    assert row['priority'] == 'P3', row
+    nx = run('next','--project','DeferTest','--explain')
+    assert nx['task']['id'] == 'def-1', 'fresh P0 must beat unboosted P3'
+    aged = run('next','--project','DeferTest','--explain','--aging-minutes','360','--aging-boost','4')
+    assert aged['task']['id'] == 'def-2', aged
+    assert aged['effective_priority'] == 'P0' and aged['priority_boost'] == 4, aged
+    row = next(r for r in run('list') if r['id'] == 'def-2')
+    assert row['priority'] == 'P3', 'aging must never mutate stored priority'
+    static = run('next','--project','DeferTest','--aging-minutes','0')
+    assert static['task']['id'] == 'def-1', '--aging-minutes 0 restores strict ordering'
     # Audit chain checkpoints: pin the head so tail truncation becomes detectable.
     cp = ops('checkpoint')
     assert cp['ok'] is True and cp['last_event_id'] > 0 and len(cp['sha256']) == 64, cp

@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS tasks (
    retry_count INTEGER NOT NULL DEFAULT 0,
    recover_after TEXT NOT NULL DEFAULT '',
    due_at TEXT NOT NULL DEFAULT '',
+   not_before TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_receipt TEXT NOT NULL DEFAULT ''
@@ -229,6 +230,8 @@ def _migrate(db) -> None:
         db.execute("ALTER TABLE tasks ADD COLUMN due_at TEXT NOT NULL DEFAULT ''")
     if "recover_after" not in task_cols:
         db.execute("ALTER TABLE tasks ADD COLUMN recover_after TEXT NOT NULL DEFAULT ''")
+    if "not_before" not in task_cols:
+        db.execute("ALTER TABLE tasks ADD COLUMN not_before TEXT NOT NULL DEFAULT ''")
     handoff_cols = {r[1] for r in db.execute("PRAGMA table_info(handoffs)")}
     if "recall_digest" not in handoff_cols:
         db.execute("ALTER TABLE handoffs ADD COLUMN recall_digest TEXT NOT NULL DEFAULT ''")
@@ -1233,9 +1236,10 @@ def create(args):
     task_id = args.id or f"{args.project.lower().replace(' ', '-')}-{uuid.uuid4().hex[:8]}"
     t = now()
     due_at = _normalize_due(getattr(args, "due_at", None) or "")
+    not_before = _normalize_iso(getattr(args, "not_before", None) or "", "--not-before")
     with conn() as db:
-        db.execute("INSERT INTO tasks(id,project,title,description,owner,status,priority,next_action,due_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (task_id,args.project,args.title,args.description,args.owner,"queued",args.priority,args.next_action,due_at,t,t))
-        audit(db, "task", task_id, "created", {"project": args.project, "owner": args.owner, "priority": args.priority, "due_at": due_at})
+        db.execute("INSERT INTO tasks(id,project,title,description,owner,status,priority,next_action,due_at,not_before,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (task_id,args.project,args.title,args.description,args.owner,"queued",args.priority,args.next_action,due_at,not_before,t,t))
+        audit(db, "task", task_id, "created", {"project": args.project, "owner": args.owner, "priority": args.priority, "due_at": due_at, "not_before": not_before})
         for dep in getattr(args, "depends_on", []) or []:
             add_dependency(db, task_id, dep)
     json_out({"ok": True, "id": task_id, "status": "queued"})
@@ -1243,7 +1247,7 @@ def create(args):
 def update(args):
     fields = {}
     for key in ("status", "next_action", "blocked_reason", "worktree", "branch", "pr_url", "owner",
-                "due_at", "title", "description", "priority", "project"):
+                "due_at", "title", "description", "priority", "project", "not_before"):
         value = getattr(args, key, None)
         if value is not None:
             fields[key] = value
@@ -1251,6 +1255,8 @@ def update(args):
         raise SystemExit(f"invalid status: {fields['status']}")
     if "due_at" in fields:
         fields["due_at"] = _normalize_due(fields["due_at"])
+    if "not_before" in fields:
+        fields["not_before"] = _normalize_iso(fields["not_before"], "--not-before")
     if fields.get("status") in {"completed", "failed", "cancelled"}:
         # Terminal transitions release any held lease so the task cannot look active.
         fields["lease_owner"] = ""
@@ -1335,6 +1341,28 @@ def unblock(args):
         t = now()
         db.execute("UPDATE tasks SET status='queued',blocked_reason='',updated_at=? WHERE id=?", (t, args.id))
         audit(db, "task", args.id, "unblocked", {"owner": args.owner})
+        json_out(dict(task_row(db, args.id)))
+
+def defer(args):
+    """Park a task out of dispatch until a future instant (or clear the park).
+
+    Sets not_before on a non-terminal task; `next` skips queued tasks whose
+    not_before is still in the future (reason deferred_until under --explain),
+    while an explicit claim stays allowed as a deliberate operator override —
+    mirroring recovery backoff semantics. `--until ''` clears the deferral.
+    Never overrides a foreign or expired lease.
+    """
+    until = _normalize_iso(args.until or "", "--until")
+    with conn() as db:
+        row = task_row(db, args.id)
+        if row["status"] in TERMINAL_STATUSES:
+            raise SystemExit(f"cannot defer terminal task: {row['status']}")
+        _require_not_foreign_lease(row, args.owner, "deferring")
+        t = now()
+        db.execute("UPDATE tasks SET not_before=?,updated_at=? WHERE id=?", (until, t, args.id))
+        audit(db, "task", args.id, "deferred",
+              {"owner": args.owner, "not_before": until,
+               "previous_status": row["status"], "cleared": until == ""})
         json_out(dict(task_row(db, args.id)))
 
 def blocked_by(args):
@@ -1458,16 +1486,27 @@ def next_task(args):
     Tasks in recovery backoff (recover_after in the future, set by ops.py
     recover after a stale lease) are skipped so failing work cannot hot-loop
     through dispatch; an explicit claim remains allowed as a deliberate
-    operator override.
+    operator override. Deferred tasks (not_before in the future, set via
+    defer) are skipped the same way until their scheduled instant arrives.
+
+    Dispatch aging guards against starvation: a queued task that has waited
+    --aging-minutes (default 360) per level, up to --aging-boost levels
+    (default 2), is dispatched at a virtually promoted priority so fresh P0/P1
+    work cannot crowd out old P3 work forever. Aging is computed from
+    created_at at dispatch time and never mutates stored priority; pass
+    --aging-minutes 0 to restore strict static ordering.
 
     With --explain, the result also reports how many queued candidates were
     considered and why each skipped candidate was not picked
-    (unsatisfied_dependencies with the blocking ids, or recovery_backoff with
-    its cooldown deadline), giving dispatchers visibility into why work is not
-    flowing.
+    (unsatisfied_dependencies with the blocking ids, recovery_backoff with its
+    cooldown deadline, or deferred_until with its not_before), plus the
+    effective priority of the pick when aging boosted it.
     """
     explain = bool(getattr(args, "explain", False))
     t_now = now()
+    t_dt = datetime.now(timezone.utc)
+    aging_minutes = getattr(args, "aging_minutes", 360)
+    aging_boost = getattr(args, "aging_boost", 2)
     with conn() as db:
         q = "SELECT * FROM tasks WHERE status='queued'"
         vals = []
@@ -1475,9 +1514,14 @@ def next_task(args):
             q += " AND project=?"; vals.append(args.project)
         q += _due_order()
         rows = db.execute(q, vals).fetchall()
-        picked = None
+        eligible = []
         skipped = []
         for r in rows:
+            if r["not_before"] and r["not_before"] > t_now:
+                if explain:
+                    skipped.append({"task_id": r["id"], "reason": "deferred_until",
+                                    "not_before": r["not_before"]})
+                continue
             pending = unsatisfied_deps(db, r["id"])
             if pending:
                 if explain:
@@ -1489,12 +1533,25 @@ def next_task(args):
                     skipped.append({"task_id": r["id"], "reason": "recovery_backoff",
                                     "recover_after": r["recover_after"]})
                 continue
-            picked = r
-            break
+            eff, boost = _effective_priority(r, t_dt, aging_minutes, aging_boost)
+            eligible.append((eff, boost, r))
+        picked = None
+        picked_eff = None
+        picked_boost = 0
+        if eligible:
+            # Effective priority first, then earliest deadline (undated last),
+            # then oldest-created first: within one effective tier the
+            # longest-waiting task wins, which is what makes aging fair.
+            eligible.sort(key=lambda e: (_prio_rank(e[0]), e[2]["due_at"] == "",
+                                         e[2]["due_at"], e[2]["created_at"]))
+            picked_eff, picked_boost, picked = eligible[0]
         out = {"ok": True, "task": dict(picked) if picked else None}
         if explain:
             out["considered"] = len(rows)
             out["skipped"] = skipped
+            if picked is not None:
+                out["effective_priority"] = picked_eff
+                out["priority_boost"] = picked_boost
         if picked is None:
             json_out(out)
             return
@@ -1596,6 +1653,9 @@ def metrics(args):
         in_backoff = db.execute(
             "SELECT COUNT(*) n FROM tasks WHERE status='queued' AND recover_after!='' AND recover_after>?",
             (t,)).fetchone()["n"]
+        deferred = db.execute(
+            "SELECT COUNT(*) n FROM tasks WHERE status='queued' AND not_before!='' AND not_before>?",
+            (t,)).fetchone()["n"]
         leases_by_owner = {r["lease_owner"]: r["n"] for r in db.execute(
             "SELECT lease_owner,COUNT(*) n FROM tasks WHERE lease_owner!='' AND lease_expires_at!='' AND lease_expires_at>? GROUP BY lease_owner",
             (t,))}
@@ -1622,6 +1682,7 @@ def metrics(args):
         "active_leases_by_owner": leases_by_owner,
         "queued_blocked_by_deps": blocked_by_deps,
         "tasks_in_backoff": in_backoff,
+        "queued_deferred": deferred,
         "overdue_tasks": [r["id"] for r in overdue],
         "due_within_24h": due_soon,
         "total_retries": retries["s"],
@@ -1657,6 +1718,32 @@ def _due_order(final: str = ", updated_at DESC") -> str:
     """Priority first, then earliest deadline (undated last), then a caller tiebreak."""
     return (" ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END, "
             "(due_at=''), due_at" + final)
+
+_PRIO_LEVELS = ("P0", "P1", "P2", "P3")
+
+def _prio_rank(p: str) -> int:
+    return _PRIO_LEVELS.index(p) if p in _PRIO_LEVELS else len(_PRIO_LEVELS)
+
+def _effective_priority(row, t_dt, aging_minutes: int, aging_boost: int):
+    """Virtual dispatch priority after queue aging; returns (priority, boost).
+
+    A task waits one promotion per full --aging-minutes since created_at,
+    capped at --aging-boost levels. Stored priority is never mutated.
+    """
+    base = _prio_rank(row["priority"])
+    if aging_minutes <= 0 or aging_boost <= 0 or base == 0 or not row["created_at"]:
+        return row["priority"], 0
+    try:
+        created = datetime.fromisoformat(row["created_at"])
+    except ValueError:
+        return row["priority"], 0
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    waited_min = (t_dt - created).total_seconds() / 60.0
+    boost = min(int(waited_min // aging_minutes), aging_boost)
+    if boost <= 0:
+        return row["priority"], 0
+    return _PRIO_LEVELS[max(base - boost, 0)], boost
 
 def search_tasks(args):
     """Operator search across task text fields with status/project/priority filters.
@@ -1727,12 +1814,13 @@ def main():
     ap = argparse.ArgumentParser(prog="autopilot")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p=sub.add_parser("init"); p.set_defaults(fn=lambda a: (ensure(), json_out({"ok":True,"db":str(DB)})))
-    p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--due-at",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.set_defaults(fn=create)
-    p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.add_argument("--title"); p.add_argument("--description"); p.add_argument("--priority",choices=sorted(PRIORITIES)); p.add_argument("--project"); p.set_defaults(fn=update)
+    p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--due-at",default=""); p.add_argument("--not-before",dest="not_before",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.set_defaults(fn=create)
+    p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.add_argument("--not-before",dest="not_before"); p.add_argument("--title"); p.add_argument("--description"); p.add_argument("--priority",choices=sorted(PRIORITIES)); p.add_argument("--project"); p.set_defaults(fn=update)
     p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.set_defaults(fn=complete)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
     p=sub.add_parser("block"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=block)
     p=sub.add_parser("unblock"); p.add_argument("id"); p.add_argument("--owner",required=True); p.set_defaults(fn=unblock)
+    p=sub.add_parser("defer"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--until",default=""); p.set_defaults(fn=defer)
     p=sub.add_parser("blocked-by"); p.add_argument("id"); p.set_defaults(fn=blocked_by)
     p=sub.add_parser("verify-chain"); p.add_argument("--checkpoint",default=""); p.set_defaults(fn=verify_chain)
     p=sub.add_parser("events"); p.add_argument("--entity-type"); p.add_argument("--entity-id"); p.add_argument("--action"); p.add_argument("--since",default=""); p.add_argument("--until",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--verify",action="store_true"); p.set_defaults(fn=events)
@@ -1745,7 +1833,7 @@ def main():
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
     p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
-    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.set_defaults(fn=next_task)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
