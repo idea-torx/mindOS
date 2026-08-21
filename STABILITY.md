@@ -1,0 +1,88 @@
+# Stability report — audit & hardening phase
+
+Produced by the audit round following the verified migration/install checkpoint
+(inventory → import → rollback). Scope: full read of `autopilot.py`, `ops.py`,
+`verify.py`; failure-injection and race-injection exercises added to `verify.py`.
+This report separates **fixed issues**, **accepted risks**, and **merge blockers**.
+
+## Fixed issues (this round)
+
+1. **`ops.py policy` ignored `HERMES_AUTOPILOT_HOME`** — it hardcoded
+   `Path.home()/'~/.hermes/autopilot/policies'` (a path that cannot exist, since
+   `~` was nested inside an absolute path), so every policy query reported
+   "no project policy" regardless of real gates. Now resolves through
+   `autopilot.POLICIES` like every other command.
+2. **Lost-update races in `complete` / `fail` / `release`** — the lease guard ran
+   on a row read, then the UPDATE landed unconditionally by id. A lease that
+   expired and was re-acquired (or transferred) between read and write could be
+   clobbered by the stale holder. All three mutations are now guarded
+   (`WHERE ... AND lease_owner=? AND lease_expires_at>?`) and refuse with
+   "lease changed since check" when the seam moved underneath them.
+3. **`ops.py recover` could wipe fresh leases** — the sweep planned from a
+   snapshot SELECT, then UPDATEd unconditionally; a worker claiming a task
+   mid-sweep lost its lease. Updates are now guarded on the snapshot's owner and
+   expiry; tasks that moved mid-sweep are reported in a new additive `skipped`
+   key. The sweep is also deterministically ordered (`ORDER BY id`).
+4. **`ops.py escalate` bumped tasks that settled mid-sweep** — same pattern;
+   now guarded on observed priority + open status, with `skipped` reporting.
+5. **Duplicate `create --id` crashed with a raw IntegrityError traceback** —
+   now a clean `task id already exists` refusal.
+6. **`ops.py approval` inserted receipt rows with no file or hash**, poisoning
+   every later `doctor` run with permanent `receipt_file_missing` findings.
+   Approval receipts are now sealed exactly like `receipt`: atomic 0600 file,
+   sha256 recorded in `file_hash`, row linked via `last_receipt`.
+7. **`tag`/`untag` were unguarded read-modify-write** — concurrent tag writes
+   silently dropped one side. Both are compare-and-swap on the observed tag set
+   now, refusing with "tags changed concurrently; retry".
+8. **`_load_result_doc` tracebacks** — malformed JSON or a missing
+   migration-result file now fail with clean SystemExit messages.
+9. **`doctor` FTS drift checks were ineffective for external-content tables** —
+   `COUNT(*)` over an external-content FTS5 table reads through to the content
+   table, so index drift was invisible (proven experimentally). All three tables
+   (`notes_fts`, `tasks_fts`, and previously-unchecked `handoffs_fts`) are now
+   compared against the true inverted-index contents via `fts5vocab(...,'instance')`
+   (temp-table only — the swept database is never written), naming
+   `missing_from_index` / `stale_in_index` rowids, with a count fallback when
+   fts5vocab is unavailable.
+10. **`ops.py` was not importable** — module-level `parse_args()` consumed the
+    importer's argv. Now guarded by `__main__`, enabling in-process testing.
+
+## Accepted risks (documented, not fixed)
+
+- **Receipt-file write happens after commit** (`receipt`, `approval`): a crash
+  in between leaves a row without its file. `doctor` detects this as
+  `receipt_file_missing`; remediation is manual re-seal. Moving the write inside
+  the transaction would trade a detectable gap for an un-detectable one.
+- **`update --status` remains a permissive operator escape hatch**: it can move
+  terminal tasks back to queued and does not manage leases beyond clearing them
+  on terminal transitions. This is long-standing operator surface; agents are
+  expected to use `claim`/`complete`/`fail`.
+- **`ack_handoff` is last-writer-wins** under a same-instant double-ack race;
+  both outcomes are semantically "acked", so no fencing was added.
+- **`_critical_path` recursion depth** tracks chain length; a >1000-deep
+  dependency chain would hit Python's recursion limit before producing wrong
+  output (it fails loudly, not falsely).
+- **`ops.py sentry`/`github`/`processes` touch live systems by design**
+  (Keychain, Sentry API, `gh`) and remain operator-invoked only; the contract's
+  live-system boundary holds because rounds never invoke them.
+- **FTS5 absence degrades to LIKE search** everywhere (unchanged); BM25 scores
+  and digests are only comparable within the same engine mode.
+- **SQLite single-writer serialization** is assumed; `busy_timeout=10000`
+  absorbs contention, but very long transactions (migration import) can still
+  starve concurrent writers for their duration.
+
+## Merge blockers
+
+None found. The audit hash chain, receipt sealing, work-order/migration seals,
+and secret guard all held under tamper injection (chain rewrite, tail truncation,
+checkpoint divergence, tampered manifests/result docs, redaction bypass attempts).
+
+## Verification added
+
+- Black-box: policy env resolution, duplicate-id refusal, sealed approval
+  receipts + clean doctor, malformed/missing result-doc handling,
+  handoffs_fts drift detection + rebuild repair.
+- In-process race injection (fresh isolated home): stolen-lease refusals for
+  `complete`/`fail`/`release` proving the thief's claim survives; recover
+  skipping a mid-sweep fresh claim; escalate skipping a task that settled
+  mid-sweep; tag compare-and-swap refusal.

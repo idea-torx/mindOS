@@ -2186,6 +2186,173 @@ with tempfile.TemporaryDirectory() as td:
     err = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-rollback',
                           str(oldfmt)], env=tenv, text=True, capture_output=True)
     assert err.returncode != 0 and 'no rollback journal' in err.stdout + err.stderr
+
+    # --- Audit & hardening round: regression coverage ---
+    # ops policy must resolve policies under HERMES_AUTOPILOT_HOME; a hardcoded
+    # live-home path would report gate decisions about the wrong fleet.
+    (Path(td) / 'policies').mkdir(exist_ok=True)
+    (Path(td) / 'policies' / 'polproj.yaml').write_text('merge_requires_user: true\n')
+    pol = ops('policy', 'polproj', 'merge')
+    assert pol['requires_user'] is True and pol['allowed'] is False, pol
+    (Path(td) / 'policies' / 'polproj.yaml').unlink()
+    pol = ops('policy', 'polproj', 'merge')
+    assert pol['allowed'] is False and pol['reason'] == 'no project policy', pol
+    # Duplicate create id: a clean refusal, never a raw IntegrityError traceback.
+    err = run_fail('create', '--project', 'Verify', '--title', 'dup', '--id', 'verify-1')
+    assert 'task id already exists' in err and 'Traceback' not in err and 'IntegrityError' not in err, err
+    # Approval receipts are sealed files (hash-matched), so doctor stays clean.
+    # A fresh home: earlier failure-injection tests leave deliberate problems
+    # in the main one that doctor must keep reporting.
+    env2 = os.environ.copy(); env2['HERMES_AUTOPILOT_HOME'] = str(Path(td) / 'clean-home')
+    def run2(*args):
+        p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env2, text=True, capture_output=True)
+        if p.returncode: raise AssertionError((args, p.stdout, p.stderr))
+        return json.loads(p.stdout)
+    def ops2(*a):
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=env2, text=True, capture_output=True)
+        assert p.returncode == 0, (a, p.stdout, p.stderr)
+        return json.loads(p.stdout)
+    run2('create', '--project', 'Verify', '--title', 'approval receipt', '--id', 'ap-1')
+    ap = ops2('approval', 'approve', 'ap-1', '--by', 'leo', '--reason', 'ship it')
+    ap_file = Path(td) / 'clean-home' / 'receipts' / (ap['receipt_id'] + '.json')
+    assert ap_file.exists(), ap
+    with sqlite3.connect(Path(td) / 'clean-home' / 'state.db') as db:
+        fh = db.execute('SELECT file_hash FROM receipts WHERE id=?', (ap['receipt_id'],)).fetchone()[0]
+    assert fh and hashlib.sha256(ap_file.read_bytes()).hexdigest() == fh, (fh, ap_file)
+    doc = ops2('doctor')
+    assert doc['ok'] is True and doc['problems'] == [], doc
+    # Malformed / missing migration result documents fail gracefully, not with a traceback.
+    bad = Path(td) / 'bad-result.json'; bad.write_text('{not json')
+    p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-rollback', str(bad)],
+                       env=env, text=True, capture_output=True)
+    assert p.returncode != 0 and 'not valid JSON' in p.stdout + p.stderr \
+        and 'Traceback' not in p.stderr, (p.returncode, p.stdout, p.stderr)
+    p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-rollback',
+                        str(Path(td) / 'nope.json')], env=env, text=True, capture_output=True)
+    assert p.returncode != 0 and 'not found' in p.stdout + p.stderr \
+        and 'Traceback' not in p.stderr, (p.returncode, p.stdout, p.stderr)
+    # doctor detects handoffs_fts index drift (and a rebuild repairs it).
+    run2('create', '--project', 'Verify', '--title', 'fts drift', '--id', 'fts-1')
+    run2('handoff', 'fts-1', '--from-agent', 'a', '--to-agent', 'b',
+         '--objective', 'drift probe', '--next-action', 'verify')
+    con = sqlite3.connect(Path(td) / 'clean-home' / 'state.db')
+    con.execute("INSERT INTO handoffs_fts(rowid,objective,status,from_agent,to_agent) "
+                "VALUES(99999,'ghost','','','')")
+    con.commit()
+    doc = ops2('doctor')
+    drift = [x for x in doc['problems'] if x['kind'] == 'fts_index_drift' and x['table'] == 'handoffs']
+    assert drift, doc
+    con.execute("INSERT INTO handoffs_fts(handoffs_fts) VALUES('rebuild')")
+    con.commit(); con.close()
+    doc = ops2('doctor')
+    assert doc['ok'] is True and doc['problems'] == [], doc
+
+    # --- In-process race-guard verification ---
+    # Black-box CLI runs cannot hit the window between an agent's row read and
+    # its write, so these tests inject the concurrent mutation directly and
+    # prove the guarded UPDATEs refuse instead of clobbering fresher state.
+    import argparse, io
+    from contextlib import redirect_stdout
+    race_td = tempfile.mkdtemp(prefix='ap-race-')
+    os.environ['HERMES_AUTOPILOT_HOME'] = race_td
+    sys.modules.pop('autopilot', None); sys.modules.pop('ops', None)
+    sys.path.insert(0, str(ROOT))
+    import autopilot as apmod
+    import ops as opsmod
+    apmod.ensure()
+    real_task_row, real_audit = apmod.task_row, apmod.audit
+    past, future = '2020-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00'
+    def rsql(q, params=()):
+        with apmod.conn() as c:
+            c.execute(q, params)
+    def rmk(task_id):
+        t0 = apmod.now()
+        rsql("INSERT INTO tasks(id,project,title,status,priority,created_at,updated_at) "
+             "VALUES(?,'Race','r','queued','P2',?,?)", (task_id, t0, t0))
+    # complete/fail/release: a lease stolen after the holder's row read turns
+    # the write into a refusal — the new owner's claim is never clobbered.
+    rmk('rc-c')
+    rsql("UPDATE tasks SET status='claimed',lease_owner='holder',lease_expires_at=? WHERE id='rc-c'", (future,))
+    with apmod.conn() as c:
+        stolen = c.execute("SELECT * FROM tasks WHERE id='rc-c'").fetchone()   # holder's view
+    rsql("UPDATE tasks SET lease_owner='thief',lease_expires_at=?,lease_epoch=lease_epoch+1 WHERE id='rc-c'", (future,))
+    apmod.task_row = lambda db, tid: stolen
+    try:
+        for fn, ns in (
+            (apmod.complete, argparse.Namespace(id='rc-c', owner='holder', note='',
+                                                epoch=None, recall_digest='', evidence_receipts=[])),
+            (apmod.fail, argparse.Namespace(id='rc-c', owner='holder', reason='x', no_retry=False,
+                                            max_retries=3, backoff_base=60, backoff_cap=3600, epoch=None)),
+            (apmod.release, argparse.Namespace(id='rc-c', owner='holder', epoch=None)),
+        ):
+            try:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    fn(ns)
+                raise AssertionError(('stale holder mutation succeeded', fn.__name__, buf.getvalue()))
+            except SystemExit as e:
+                assert 'lease changed' in str(e), (fn.__name__, str(e))
+    finally:
+        apmod.task_row = real_task_row
+    with apmod.conn() as c:
+        assert c.execute("SELECT lease_owner FROM tasks WHERE id='rc-c'").fetchone()[0] == 'thief'
+    # recover: a fresh claim landing mid-sweep keeps its lease (reported as skipped).
+    rmk('rc-r1'); rmk('rc-r2')
+    rsql("UPDATE tasks SET status='running',lease_owner='ghost',lease_expires_at=?,retry_count=0 "
+         "WHERE id IN ('rc-r1','rc-r2')", (past,))
+    def stealing_audit(db, *a, **k):
+        # Runs inside recover's open transaction: steal rc-r2's lease on the
+        # same connection (a second writer would deadlock on the lock).
+        db.execute("UPDATE tasks SET status='claimed',lease_owner='fresh-worker',lease_expires_at=? "
+                   "WHERE id='rc-r2'", (future,))
+        return real_audit(db, *a, **k)
+    apmod.audit = stealing_audit
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            opsmod.recover(argparse.Namespace(max_retries=3, dry_run=False,
+                                              backoff_base=60, backoff_cap=3600))
+        out = json.loads(buf.getvalue())
+    finally:
+        apmod.audit = real_audit
+    assert out['recovered'] == ['rc-r1'] and out['skipped'] == ['rc-r2'], out
+    with apmod.conn() as c:
+        r2 = c.execute("SELECT status,lease_owner FROM tasks WHERE id='rc-r2'").fetchone()
+    assert tuple(r2) == ('claimed', 'fresh-worker'), tuple(r2)
+    # escalate: a task that settles mid-sweep is skipped, not bumped posthumously.
+    rmk('rc-e1'); rmk('rc-e2')
+    rsql("UPDATE tasks SET priority='P3',due_at=? WHERE id IN ('rc-e1','rc-e2')", (past,))
+    def completing_audit(db, *a, **k):
+        db.execute("UPDATE tasks SET status='completed' WHERE id='rc-e2'")
+        return real_audit(db, *a, **k)
+    apmod.audit = completing_audit
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            opsmod.escalate(argparse.Namespace(dry_run=False))
+        out = json.loads(buf.getvalue())
+    finally:
+        apmod.audit = real_audit
+    assert out['skipped'] == ['rc-e2'] and [c['task_id'] for c in out['escalated']] == ['rc-e1'], out
+    # tag/untag: compare-and-swap refuses to drop a concurrent writer's tags.
+    rmk('rc-t')
+    with apmod.conn() as c:
+        stale_tags = c.execute("SELECT * FROM tasks WHERE id='rc-t'").fetchone()
+        c.execute('UPDATE tasks SET tags=\'["other"]\' WHERE id=\'rc-t\'')
+    apmod.task_row = lambda db, tid: stale_tags
+    try:
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                apmod.tag_task(argparse.Namespace(id='rc-t', tag=['x']))
+            raise AssertionError('concurrent tag write was lost silently')
+        except SystemExit as e:
+            assert 'concurrently' in str(e), str(e)
+    finally:
+        apmod.task_row = real_task_row
+    import shutil
+    shutil.rmtree(race_td, ignore_errors=True)
+
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

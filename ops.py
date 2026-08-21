@@ -26,14 +26,14 @@ def _backoff_deadline(retry_count: int, base: int, cap: int) -> str:
     return dt.replace(microsecond=0).isoformat()
 
 def recover(args=None):
-    now=utc(); recovered=[]; failed=[]
+    now=utc(); recovered=[]; failed=[]; skipped=[]
     max_retries = getattr(args, 'max_retries', 3) if args is not None else 3
     dry_run = bool(getattr(args, 'dry_run', False))
     backoff_base = getattr(args, 'backoff_base', 60)
     backoff_cap = getattr(args, 'backoff_cap', 3600)
     plan = []
     with db() as c:
-        rows=c.execute("SELECT id,lease_owner,lease_expires_at,status,retry_count FROM tasks WHERE lease_expires_at!='' AND lease_expires_at<=? AND status IN ('claimed','running','waiting_for_agent')",(now,)).fetchall()
+        rows=c.execute("SELECT id,lease_owner,lease_expires_at,status,retry_count FROM tasks WHERE lease_expires_at!='' AND lease_expires_at<=? AND status IN ('claimed','running','waiting_for_agent') ORDER BY id",(now,)).fetchall()
         for r in rows:
             new_retry = r['retry_count'] + 1
             if new_retry > max_retries:
@@ -53,15 +53,23 @@ def recover(args=None):
                 'count':len(plan)}))
             return
         for kind, r, new_retry, ra in plan:
+            # Guarded mutation: only reclaim while the lease is exactly as the
+            # snapshot saw it. A worker that claimed the task between the sweep's
+            # SELECT and this UPDATE keeps its fresh lease — the stale snapshot
+            # must not clobber it.
             if kind == 'failed':
-                c.execute("UPDATE tasks SET status='failed',lease_owner='',lease_expires_at='',retry_count=?,blocked_reason='max lease retries exceeded',updated_at=? WHERE id=?",(new_retry,now,r['id']))
+                cur=c.execute("UPDATE tasks SET status='failed',lease_owner='',lease_expires_at='',retry_count=?,blocked_reason='max lease retries exceeded',updated_at=? WHERE id=? AND lease_owner=? AND lease_expires_at<=?",(new_retry,now,r['id'],r['lease_owner'],now))
+                if cur.rowcount != 1:
+                    skipped.append(r['id']); continue
                 autopilot.audit(c, 'task', r['id'], 'lease_failed', {'previous_owner': r['lease_owner'], 'previous_status': r['status'], 'retry_count': new_retry})
                 failed.append(r['id'])
             else:
-                c.execute("UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',retry_count=?,recover_after=?,blocked_reason='stale lease recovered',updated_at=? WHERE id=?",(new_retry,ra,now,r['id']))
+                cur=c.execute("UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',retry_count=?,recover_after=?,blocked_reason='stale lease recovered',updated_at=? WHERE id=? AND lease_owner=? AND lease_expires_at<=?",(new_retry,ra,now,r['id'],r['lease_owner'],now))
+                if cur.rowcount != 1:
+                    skipped.append(r['id']); continue
                 autopilot.audit(c, 'task', r['id'], 'lease_recovered', {'previous_owner': r['lease_owner'], 'previous_status': r['status'], 'retry_count': new_retry, 'recover_after': ra})
                 recovered.append(r['id'])
-    print(json.dumps({'ok':True,'recovered':recovered,'failed':failed,
+    print(json.dumps({'ok':True,'recovered':recovered,'failed':failed,'skipped':skipped,
                       'backoff':{r['id']:ra for kind,r,_,ra in plan if kind=='recovered' and ra},
                       'count':len(recovered)+len(failed)}))
 
@@ -83,6 +91,7 @@ def escalate(args=None):
     t = utc()
     changed = []
     already_p0 = []
+    skipped = []
     with db() as c:
         rows = c.execute(
             "SELECT id,priority,due_at FROM tasks "
@@ -97,26 +106,52 @@ def escalate(args=None):
                             'to_priority': ESCALATION_ORDER[idx + 1], 'due_at': r['due_at']})
         if not dry:
             for ch in changed:
-                c.execute("UPDATE tasks SET priority=?,updated_at=? WHERE id=?",
-                          (ch['to_priority'], t, ch['task_id']))
+                # Guarded mutation: the bump only lands while priority and open
+                # status are exactly as swept — a task that settled (or was
+                # re-prioritized) mid-sweep is skipped, not double-bumped.
+                cur = c.execute(
+                    "UPDATE tasks SET priority=?,updated_at=? WHERE id=? AND priority=? "
+                    "AND status NOT IN ('completed','failed','cancelled')",
+                    (ch['to_priority'], t, ch['task_id'], ch['from_priority']))
+                if cur.rowcount != 1:
+                    skipped.append(ch['task_id'])
+                    continue
                 autopilot.audit(c, 'task', ch['task_id'], 'priority_escalated',
                                 {'from_priority': ch['from_priority'], 'to_priority': ch['to_priority'],
                                  'due_at': ch['due_at'], 'reason': 'overdue'})
     print(json.dumps({'ok': True, 'dry_run': dry, 'generated_at': t,
-                      'escalated': changed, 'already_p0': already_p0,
-                      'count': len(changed)}, sort_keys=True))
+                      'escalated': [ch for ch in changed if ch['task_id'] not in skipped],
+                      'already_p0': already_p0, 'skipped': skipped,
+                      'count': len(changed) - len(skipped)}, sort_keys=True))
 
 def approval(args):
     status={'approve':'waiting_for_review','reject':'blocked','block':'blocked'}[args.action]
     reason=args.reason or ('approval rejected' if args.action=='reject' else '')
+    rid=f'approval-{args.id}-{int(datetime.now().timestamp())}-{autopilot.uuid.uuid4().hex[:6]}'
+    created=utc()
+    payload={'action':args.action,'by':args.by,'reason':reason}
+    # Seal the approval receipt exactly like `receipt` does: without a written,
+    # hash-sealed file every later doctor sweep would report receipt_file_missing
+    # for this row forever.
+    data=json.dumps({'id':rid,'task_id':args.id,'kind':'approval','created_at':created,'payload':payload},indent=2,sort_keys=True)+'\n'
+    file_hash=hashlib.sha256(data.encode()).hexdigest()
     with db() as c:
         row=c.execute('SELECT * FROM tasks WHERE id=?',(args.id,)).fetchone()
         if not row: raise SystemExit('task not found: '+args.id)
         c.execute("UPDATE tasks SET status=?,blocked_reason=?,next_action=?,updated_at=? WHERE id=?",(status,reason,args.next_action or row['next_action'],utc(),args.id))
-        rid=f'approval-{args.id}-{int(datetime.now().timestamp())}-{autopilot.uuid.uuid4().hex[:6]}'
-        c.execute("INSERT INTO receipts(id,task_id,kind,payload_json,created_at) VALUES(?,?,?,?,?)",(rid,args.id,'approval',json.dumps({'action':args.action,'by':args.by,'reason':reason}),utc()))
+        c.execute("INSERT INTO receipts(id,task_id,kind,payload_json,created_at,file_hash) VALUES(?,?,?,?,?,?)",(rid,args.id,'approval',json.dumps(payload,sort_keys=True),created,file_hash))
+        c.execute("UPDATE tasks SET last_receipt=?,updated_at=? WHERE id=?", (rid, created, args.id))
         autopilot.audit(c, 'task', args.id, 'approval', {'action': args.action, 'by': args.by, 'reason': reason})
-    print(json.dumps({'ok':True,'id':args.id,'status':status,'by':args.by}))
+    target=autopilot.RECEIPTS/f'{rid}.json'
+    fd,tmp=tempfile.mkstemp(prefix=f'.{rid}.',dir=str(autopilot.RECEIPTS))
+    try:
+        with os.fdopen(fd,'w') as f:
+            f.write(data); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp,0o600)
+        os.replace(tmp,str(target))
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+    print(json.dumps({'ok':True,'id':args.id,'status':status,'by':args.by,'receipt_id':rid}))
 
 def processes(args=None):
     rc,out,err=run(['ps','-axo','pid=,etime=,command='])
@@ -741,6 +776,22 @@ def import_task(args=None):
                       'receipt_files_written': written, 'fk_violations': fk_violations}))
     if not ok: sys.exit(1)
 
+def _fts_index_docs(c, fts: str):
+    """Rowids actually present in an external-content FTS5 index.
+
+    COUNT(*) over an external-content FTS5 table reads through to the content
+    table, so it cannot see stale or missing index entries; the fts5vocab
+    'instance' table enumerates what the inverted index really holds. The
+    vocab table is created in the temp database, so the swept database file
+    itself is never written.
+    """
+    vt = f'temp._drift_vocab_{fts}'
+    c.execute(f"CREATE VIRTUAL TABLE {vt} USING fts5vocab('main','{fts}','instance')")
+    try:
+        return {r[0] for r in c.execute(f'SELECT DISTINCT doc FROM {vt}')}
+    finally:
+        c.execute(f'DROP TABLE {vt}')
+
 def doctor(args=None):
     """Read-only consistency sweep: orphan deps, receipt index/files, audit chain, stale leases."""
     problems = []
@@ -810,12 +861,26 @@ def doctor(args=None):
         for r in c.execute(
             "SELECT task_id,COUNT(*) n FROM handoffs WHERE superseded_by='' GROUP BY task_id HAVING n>1"):
             problems.append({'kind': 'multiple_live_handoffs', 'task_id': r['task_id'], 'count': r['n']})
-        if autopilot._fts_ready(c):
-            for table, fts in (('notes', 'notes_fts'), ('tasks', 'tasks_fts')):
-                src = c.execute(f'SELECT COUNT(*) n FROM {table}').fetchone()['n']
-                idx = c.execute(f'SELECT COUNT(*) n FROM {fts}').fetchone()['n']
-                if src != idx:
-                    problems.append({'kind': 'fts_index_drift', 'table': table, 'rows': src, 'indexed': idx})
+        for table, fts in (('notes', 'notes_fts'), ('tasks', 'tasks_fts'), ('handoffs', 'handoffs_fts')):
+            ready = autopilot._handoffs_fts_ready(c) if fts == 'handoffs_fts' else autopilot._fts_ready(c)
+            if not ready:
+                continue
+            src = {r[0] for r in c.execute(f'SELECT rowid FROM {table}')}
+            try:
+                idx = _fts_index_docs(c, fts)
+            except sqlite3.Error:
+                idx = None   # fts5vocab unavailable: degrade to the coarse count check
+            if idx is None:
+                n_idx = c.execute(f'SELECT COUNT(*) n FROM {fts}').fetchone()['n']
+                if len(src) != n_idx:
+                    problems.append({'kind': 'fts_index_drift', 'table': table,
+                                     'rows': len(src), 'indexed': n_idx})
+                continue
+            if src != idx:
+                problems.append({'kind': 'fts_index_drift', 'table': table,
+                                 'rows': len(src), 'indexed': len(idx),
+                                 'missing_from_index': sorted(src - idx)[:20],
+                                 'stale_in_index': sorted(idx - src)[:20]})
     print(json.dumps({'ok': not problems, 'problems': problems, 'count': len(problems)}, sort_keys=True))
 
 def handoff_check(args=None):
@@ -1895,7 +1960,11 @@ def migrate_import(args=None):
 
 def _load_result_doc(path: Path):
     """Load and seal-verify a sealed autopilot-migration-result-v1 document."""
-    doc = json.loads(path.read_text())
+    if not path.exists(): raise SystemExit(f'result document not found: {path}')
+    try:
+        doc = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f'result document is not valid JSON: {e}')
     if doc.get('format') != MIGRATION_RESULT_FORMAT:
         raise SystemExit(f'not a {MIGRATION_RESULT_FORMAT} document: {path}')
     body = {k: v for k, v in doc.items() if k not in ('sha256', 'format', 'created_at')}
@@ -2067,7 +2136,10 @@ def migrate_rollback(args=None):
         c.close()
 
 def policy(args):
-    path=Path.home()/'.hermes/autopilot/policies'/f'{args.project.lower()}.yaml'
+    # Resolve through autopilot.POLICIES so HERMES_AUTOPILOT_HOME is honored —
+    # a hardcoded live-home path would read (or miss) the wrong policies in
+    # isolated/test environments and report gate decisions about the wrong fleet.
+    path = autopilot.POLICIES / f'{args.project.lower()}.yaml'
     if not path.exists(): print(json.dumps({'allowed':False,'reason':'no project policy'})); return
     text=path.read_text(); key=args.action+'_requires_user: true'
     requires=key in text
@@ -2102,4 +2174,5 @@ x=s.add_parser('migrate-inventory'); x.add_argument('--root',required=True); x.a
 x=s.add_parser('migrate-inventory-check'); x.add_argument('path'); x.set_defaults(fn=migrate_inventory_check)
 x=s.add_parser('migrate-import'); x.add_argument('--inventory',required=True); x.add_argument('--source-id',dest='source_id',required=True); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--out',default=None,help='write a sealed autopilot-migration-result-v1 document'); x.add_argument('--redact',action='store_true'); x.add_argument('--allow-secret',action='store_true'); x.add_argument('--relink-audit',dest='relink_audit',action='store_true',help='merge into a non-empty audit ledger and relink the combined chain'); x.set_defaults(fn=migrate_import)
 x=s.add_parser('migrate-rollback'); x.add_argument('result'); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--force',action='store_true',help='cascade away drifted rows and local dependents of imported tasks'); x.set_defaults(fn=migrate_rollback)
-args=p.parse_args(); args.fn(args)
+if __name__ == '__main__':
+    args=p.parse_args(); args.fn(args)

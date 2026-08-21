@@ -1810,7 +1810,11 @@ def release(args):
         _require_live_lease(row, args.owner, "releasing")
         _require_epoch(row, getattr(args, "epoch", None), "releasing")
         t = now()
-        db.execute("UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',updated_at=? WHERE id=?", (t, args.id))
+        cur = db.execute(
+            "UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',updated_at=? "
+            "WHERE id=? AND lease_owner=? AND lease_expires_at>?", (t, args.id, args.owner, t))
+        if cur.rowcount != 1:
+            raise SystemExit("lease changed since check; reclaim before releasing")
         audit(db, "task", args.id, "lease_released", {"owner": args.owner})
         json_out(_task_view(task_row(db, args.id)))
 
@@ -2014,7 +2018,10 @@ def create(args):
     not_before = _normalize_iso(getattr(args, "not_before", None) or "", "--not-before")
     tags = sorted({_valid_tag(x) for x in (getattr(args, "tag", None) or [])})
     with conn() as db:
-        db.execute("INSERT INTO tasks(id,project,title,description,owner,status,priority,next_action,due_at,not_before,tags,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (task_id,args.project,args.title,args.description,args.owner,"queued",args.priority,args.next_action,due_at,not_before,json.dumps(tags),t,t))
+        try:
+            db.execute("INSERT INTO tasks(id,project,title,description,owner,status,priority,next_action,due_at,not_before,tags,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (task_id,args.project,args.title,args.description,args.owner,"queued",args.priority,args.next_action,due_at,not_before,json.dumps(tags),t,t))
+        except sqlite3.IntegrityError:
+            raise SystemExit(f"task id already exists: {task_id}")
         # Task-layer deduplication: flag open tasks in the same project whose
         # text restates this one. Informational — creation is never blocked.
         similar = _similar_open_tasks(db, args.project,
@@ -2190,7 +2197,15 @@ def complete(args):
             if not hit:
                 raise SystemExit(f"evidence receipt not found on this task: {rid}")
         t = now()
-        db.execute("UPDATE tasks SET status='completed',lease_owner='',lease_expires_at='',blocked_reason='',updated_at=? WHERE id=?", (t, args.id))
+        # Guarded mutation: the completion only lands while the lease is exactly
+        # as checked above. A lease that expired and was re-acquired (or
+        # transferred) between the row read and this write must not be clobbered
+        # by a stale holder — the rowcount guard turns that race into a refusal.
+        cur = db.execute(
+            "UPDATE tasks SET status='completed',lease_owner='',lease_expires_at='',blocked_reason='',updated_at=? "
+            "WHERE id=? AND lease_owner=? AND lease_expires_at>?", (t, args.id, args.owner, t))
+        if cur.rowcount != 1:
+            raise SystemExit("lease changed since check; reclaim before completing")
         # Downstream feedback: which queued dependents just became dispatchable.
         newly = sorted(d["id"] for d in pending_dependents(db, args.id)
                        if d["status"] == "queued" and not unsatisfied_deps(db, d["id"]))
@@ -2261,9 +2276,13 @@ def fail(args):
         reason = args.reason or "failed by agent"
         if not args.no_retry and new_retry <= args.max_retries:
             ra = _backoff_deadline(new_retry, args.backoff_base, args.backoff_cap)
-            db.execute("UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',"
-                       "blocked_reason=?,retry_count=?,recover_after=?,updated_at=? WHERE id=?",
-                       (reason, new_retry, ra, t, args.id))
+            cur = db.execute(
+                "UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',"
+                "blocked_reason=?,retry_count=?,recover_after=?,updated_at=? "
+                "WHERE id=? AND lease_owner=? AND lease_expires_at>?",
+                (reason, new_retry, ra, t, args.id, args.owner, t))
+            if cur.rowcount != 1:
+                raise SystemExit("lease changed since check; reclaim before failing")
             audit(db, "task", args.id, "task_failed",
                   {"owner": args.owner, "reason": reason, "retry_count": new_retry,
                    "recover_after": ra or None, "max_retries": args.max_retries})
@@ -2274,9 +2293,13 @@ def fail(args):
         else:
             stranded = sorted(d["id"] for d in pending_dependents(db, args.id)
                               if d["status"] not in TERMINAL_STATUSES)
-            db.execute("UPDATE tasks SET status='failed',lease_owner='',lease_expires_at='',"
-                       "blocked_reason=?,retry_count=?,recover_after='',updated_at=? WHERE id=?",
-                       (reason, new_retry, t, args.id))
+            cur = db.execute(
+                "UPDATE tasks SET status='failed',lease_owner='',lease_expires_at='',"
+                "blocked_reason=?,retry_count=?,recover_after='',updated_at=? "
+                "WHERE id=? AND lease_owner=? AND lease_expires_at>?",
+                (reason, new_retry, t, args.id, args.owner, t))
+            if cur.rowcount != 1:
+                raise SystemExit("lease changed since check; reclaim before failing")
             audit(db, "task", args.id, "task_failed_terminal",
                   {"owner": args.owner, "reason": reason, "retry_count": new_retry,
                    "no_retry": bool(args.no_retry), "dependents_stranded": stranded})
@@ -2356,8 +2379,12 @@ def tag_task(args):
         added = sorted(set(tags) - set(cur_tags))
         new_tags = sorted(set(cur_tags) | set(tags))
         if added:
-            db.execute("UPDATE tasks SET tags=?,updated_at=? WHERE id=?",
-                       (json.dumps(new_tags), now(), args.id))
+            # Compare-and-swap on the observed tag set so concurrent tag/untag
+            # calls cannot silently drop each other's writes.
+            cur = db.execute("UPDATE tasks SET tags=?,updated_at=? WHERE id=? AND tags=?",
+                             (json.dumps(new_tags), now(), args.id, row["tags"]))
+            if cur.rowcount != 1:
+                raise SystemExit("tags changed concurrently; retry")
             audit(db, "task", args.id, "task_tagged", {"tags": added})
         json_out({"ok": True, "task_id": args.id, "tags": new_tags,
                   "added": added, "already_tagged": [t for t in tags if t not in added]})
@@ -2371,8 +2398,10 @@ def untag_task(args):
         if tag not in cur_tags:
             raise SystemExit(f"task {args.id} does not carry tag '{tag}'")
         new_tags = [t for t in cur_tags if t != tag]
-        db.execute("UPDATE tasks SET tags=?,updated_at=? WHERE id=?",
-                   (json.dumps(new_tags), now(), args.id))
+        cur = db.execute("UPDATE tasks SET tags=?,updated_at=? WHERE id=? AND tags=?",
+                         (json.dumps(new_tags), now(), args.id, row["tags"]))
+        if cur.rowcount != 1:
+            raise SystemExit("tags changed concurrently; retry")
         audit(db, "task", args.id, "task_untagged", {"tag": tag})
     json_out({"ok": True, "task_id": args.id, "tags": new_tags, "removed": tag})
 

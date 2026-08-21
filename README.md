@@ -1500,6 +1500,32 @@ The full installer lifecycle is therefore: `init` → `migrate-inventory` →
 `migrate-import --apply --out` → (verify) → optional `migrate-rollback`,
 each stage dry-run-first, sealed, and independently re-runnable.
 
+## Audit & hardening (stability round)
+
+A full runtime audit (see `STABILITY.md` for the complete report) fixed the
+concurrency and false-success seams it found:
+
+- **Guarded lease mutations** — `complete`, `fail`, and `release` now land only
+  while the lease is exactly as checked (`AND lease_owner=? AND
+  lease_expires_at>?`); a lease stolen between an agent's read and write turns
+  the write into a `lease changed since check` refusal instead of clobbering the
+  new owner's claim. `ops.py recover` and `escalate` sweep with the same guard
+  and report mid-sweep losses under a new additive `skipped` key.
+- **Sealed approval receipts** — `ops.py approval` writes hash-sealed receipt
+  files like `receipt` does, so approvals no longer poison `doctor` with
+  permanent `receipt_file_missing` findings.
+- **Real FTS drift detection** — `COUNT(*)` over an external-content FTS5 table
+  reads through to the content table and cannot see index drift; `doctor` now
+  compares each index (`notes_fts`, `tasks_fts`, and the previously unchecked
+  `handoffs_fts`) against its true inverted-index contents via `fts5vocab`,
+  naming missing/stale rowids, with a count fallback when fts5vocab is absent.
+- **Smaller seams** — duplicate `create --id` refuses cleanly instead of
+  raising IntegrityError; `tag`/`untag` are compare-and-swap so concurrent
+  writers cannot drop each other's tags; malformed or missing migration-result
+  documents fail with clean messages; `ops.py policy` resolves policies under
+  `HERMES_AUTOPILOT_HOME` instead of a hardcoded live-home path; `ops.py` is
+  importable (`__main__`-guarded) for in-process testing.
+
 ## Next integration
 
 The hourly control tower should read this registry and report task changes. Existing project-specific policies should be added under `policies/` before allowing automatic side effects.
