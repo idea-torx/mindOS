@@ -2623,6 +2623,59 @@ with tempfile.TemporaryDirectory() as td:
     assert not any(p['kind'] == 'fts_index_drift' and p['table'] == 'session_messages'
                    for p in doc['problems']), doc
 
+    # Session retention: the disposable cache gets an explicit-bounded prune.
+    # --older-than is mandatory (argparse refusal) so no filter combination can
+    # express an unbounded wipe; invalid durations fail closed with a message.
+    run_fail('sessions-prune')
+    err = run_fail('sessions-prune', '--older-than', '12x')
+    assert 'invalid --older-than' in err, err
+    # Deterministic ages: make sess-clean ancient, everything else far-future.
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        db.execute("UPDATE sessions SET last_at='2020-01-01T00:00:00+00:00', ingested_at='2020-01-01T00:00:00+00:00' WHERE session_id='sess-clean'")
+        db.execute("UPDATE sessions SET last_at='2099-01-01T00:00:00+00:00', ingested_at='2099-01-01T00:00:00+00:00' WHERE session_id!='sess-clean'")
+        pre_events = db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
+    plan = run('sessions-prune', '--older-than', '30d')
+    assert plan['dry_run'] is True and len(plan['candidates']) == 1, plan
+    assert plan['candidates'][0]['session_id'] == 'sess-clean'
+    assert plan['candidates'][0]['messages'] == 4 and plan['totals']['sessions'] == 1
+    assert plan['by_source'] == {'claude-code': {'sessions': 1, 'messages': 4, 'bytes': plan['totals']['bytes']}}
+    assert plan['remaining_if_applied']['sessions'] == 2
+    # Filters narrow the plan; a non-matching scope plans zero candidates.
+    assert run('sessions-prune', '--older-than', '30d', '--project', 'Nowhere')['totals']['sessions'] == 0
+    prof = run('sessions-prune', '--older-than', '2021-01-01T00:00:00+00:00')   # absolute ISO form
+    assert len(prof['candidates']) == 1 and prof['candidates'][0]['session_id'] == 'sess-clean'
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        assert db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0] == 3   # dry-run touched nothing
+        assert db.execute("SELECT COUNT(*) FROM audit_events WHERE action='session_pruned'").fetchone()[0] == 0
+    # Apply: one transaction, exact counts, audited per source, index stays synced.
+    pruned = run('sessions-prune', '--older-than', '30d', '--apply')
+    assert pruned['dry_run'] is False and pruned['pruned']['sessions'] == 1 and pruned['pruned']['messages'] == 4
+    assert pruned['remaining'] == {'sessions': 2, 'messages': 2}
+    assert run('search-sessions', 'redirect cookie') == [], 'FTS kept deleted rows searchable'
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        row = db.execute("SELECT entity_id,payload_json FROM audit_events WHERE action='session_pruned'").fetchone()
+        ev = {'entity_id': row[0], 'payload_json': row[1]}
+        assert ev['entity_id'] == 'claude-code'
+        pj = json.loads(ev['payload_json'])
+        assert pj['sessions'] == 1 and pj['messages'] == 4 and pj['cutoff'], pj
+        n_pruned_events = db.execute("SELECT COUNT(*) FROM audit_events WHERE action='session_pruned'").fetchone()[0]
+        assert n_pruned_events == 1
+    doc = ops('doctor')
+    assert not any(p['kind'] == 'fts_index_drift' and p['table'] == 'session_messages'
+                   for p in doc['problems']), doc
+    # Zero-candidate apply audits nothing: empty runs leave no ledger noise.
+    again = run('sessions-prune', '--older-than', '30d', '--apply')
+    assert again['pruned']['sessions'] == 0 and 'remaining' in again
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        assert db.execute("SELECT COUNT(*) FROM audit_events WHERE action='session_pruned'").fetchone()[0] == 1
+    m = run('metrics')
+    assert m['sessions_pruned_total'] == 1 and m['sessions_indexed'] == 2, m
+    # The cache is disposable by design: a re-ingest rebuilds what was pruned.
+    reing = run('session-ingest', '--source', 'claude-code', '--root', str(sess_root), '--project', 'Auth', '--apply', '--redact')
+    assert reing['applied_files'] == 1, reing
+    rebuilt = run('search-sessions', 'redirect cookie', '--rank')
+    assert {h['session_id'] for h in rebuilt} == {'sess-clean'} and len(rebuilt) == 2
+
     # -----------------------------------------------------------------------
     # Temporal fact graph: assert/dedupe/retract/query/search, context-pack
     # integration, flag-gated recall recomputation, doctor guard, archive

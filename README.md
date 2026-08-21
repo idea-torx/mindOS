@@ -1603,6 +1603,7 @@ python3 "$A" session-scan --root ~/library-session-store            # redacted d
 python3 "$A" session-ingest --source claude-code --root ~/.../proj-a \
     --project Auth --apply --redact                                 # incremental index
 python3 "$A" search-sessions "redirect cookie" --role assistant --rank
+python3 "$A" sessions-prune --older-than 30d         # bounded retention pass over the session cache
 python3 "$A" context <task-id> --related-sessions 3                 # packs matching snippets
 ```
 
@@ -1639,6 +1640,35 @@ Design properties:
 - **Observability & hygiene**: `metrics` reports `sessions_indexed` /
   `session_messages_indexed`; `ops.py doctor` includes the session FTS index
   in its fts5vocab drift sweep.
+
+### Session retention (`sessions-prune`)
+
+The cache is disposable by design, so it gets a matching retention pass —
+bounded, planned first, and rebuildable:
+
+```bash
+python3 "$A" sessions-prune --older-than 30d                 # read-only dry-run plan
+python3 "$A" sessions-prune --older-than 30d \
+    --source claude-code --project Auth --apply              # bounded prune
+```
+
+Design properties:
+
+- **Bounded by construction**: `--older-than` (a relative age `Nd`/`Nh`/`Nm`
+  or an absolute ISO timestamp) is mandatory — no filter combination can ever
+  express "delete everything". A session's age is its last message time,
+  falling back to ingest time; `--source` / `--profile` / `--project` only
+  narrow the scope.
+- **Dry-run plan first**: the default run reports exact candidates with
+  per-source counts (sessions, messages, bytes) and touches nothing.
+- **Honest apply**: one transaction deletes only cache rows; the FTS triggers
+  keep the search index in sync and source transcript files are external
+  stores that are never touched. Each affected source gets a single audited
+  `session_pruned` event with its counts; a zero-candidate apply audits
+  nothing.
+- **Rebuildable**: pruning is never data loss — re-running `session-ingest`
+  restores pruned sessions from their sources, which is also the recovery
+  path for an over-eager prune. `metrics` reports `sessions_pruned_total`.
 
 ## Temporal fact graph (the sidecar)
 

@@ -2474,6 +2474,82 @@ def search_sessions(args):
             [*lvals, limit]).fetchall()]
     json_out(rows)
 
+def _retention_cutoff(value: str) -> str:
+    """Validate --older-than: a relative age (Nd/Nh/Nm) or an absolute ISO timestamp."""
+    v = (value or "").strip()
+    if not v:
+        raise SystemExit("--older-than is required to bound any prune (an unbounded wipe is refused)")
+    m = re.fullmatch(r"(\d+)([dhm])", v.lower())
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        if n <= 0:
+            raise SystemExit("--older-than duration must be positive")
+        delta = {"d": timedelta(days=n), "h": timedelta(hours=n), "m": timedelta(minutes=n)}[unit]
+        return (datetime.now(timezone.utc) - delta).replace(microsecond=0).isoformat()
+    return _normalize_iso(v, "--older-than")
+
+def sessions_prune(args):
+    """Retention pass over the disposable session cache.
+
+    Ingested transcripts are derived data — rebuildable from their source
+    stores by re-running session-ingest — but until now they grew without
+    bound. Pruning stays honest by construction: an --older-than bound is
+    mandatory so no filter combination can ever express "delete everything",
+    the default run is a read-only dry-run plan, and --apply deletes only
+    cache rows inside one transaction (the FTS triggers keep the search index
+    in sync; source transcript files are external and never touched). Each
+    affected source gets one audited event with exact counts, and because the
+    rows are rebuildable, recovery after an over-eager prune is simply a
+    re-ingest. A zero-candidate apply audits nothing: empty runs leave no
+    ledger noise.
+    """
+    cutoff = _retention_cutoff(getattr(args, "older_than", ""))
+    filters = {}
+    for flag in ("source", "profile", "project"):
+        v = (getattr(args, flag, "") or "").strip()
+        if v:
+            filters[flag] = v
+    where = ["COALESCE(NULLIF(s.last_at,''), s.ingested_at) <= ?"] + \
+            [f"s.{col}=?" for col in filters]
+    base_vals = [cutoff, *filters.values()]
+    with conn() as db:
+        cands = [dict(r) for r in db.execute(
+            "SELECT s.id,s.source,s.session_id,s.path,s.size_bytes,"
+            "COALESCE(NULLIF(s.last_at,''), s.ingested_at) AS effective_at,"
+            "(SELECT COUNT(*) FROM session_messages sm WHERE sm.session_row=s.id) AS messages "
+            "FROM sessions s WHERE " + " AND ".join(where) +
+            " ORDER BY s.source, s.session_id", base_vals).fetchall()]
+        pre_total = db.execute("SELECT COUNT(*) n FROM sessions").fetchone()["n"]
+    totals = {
+        "sessions": len(cands),
+        "messages": sum(c["messages"] for c in cands),
+        "bytes": sum(c["size_bytes"] for c in cands),
+    }
+    by_source = {}
+    for c in cands:
+        b = by_source.setdefault(c["source"], {"sessions": 0, "messages": 0, "bytes": 0})
+        b["sessions"] += 1; b["messages"] += c["messages"]; b["bytes"] += c["size_bytes"]
+    out = {"dry_run": not bool(getattr(args, "apply", False)), "cutoff": cutoff,
+           "filters": filters, "totals": totals, "by_source": by_source,
+           "candidates": [{k: c[k] for k in ("id", "source", "session_id", "path",
+                                             "size_bytes", "effective_at", "messages")}
+                          for c in cands]}
+    if getattr(args, "apply", False):
+        with conn() as db:
+            for c in cands:
+                db.execute("DELETE FROM sessions WHERE id=?", (c["id"],))
+            for src, b in sorted(by_source.items()):
+                audit(db, "session", src, "session_pruned",
+                      {"sessions": b["sessions"], "messages": b["messages"],
+                       "bytes": b["bytes"], "cutoff": cutoff, **filters})
+            remaining = db.execute(
+                "SELECT COUNT(*) n, COALESCE(SUM(message_count),0) m FROM sessions").fetchone()
+        out["pruned"] = totals
+        out["remaining"] = {"sessions": remaining["n"], "messages": remaining["m"]}
+    else:
+        out["remaining_if_applied"] = {"sessions": pre_total - len(cands)}
+    json_out(out)
+
 def _related_session_candidates(db, task_id: str, text: str, limit: int, scope: str) -> list:
     """Cross-task retrieval: ingested session messages matching this task's text.
 
@@ -3833,6 +3909,8 @@ def metrics(args):
         facts = db.execute(
             "SELECT COUNT(*) total, COALESCE(SUM(CASE WHEN valid_until='' OR valid_until>? "
             "THEN 1 ELSE 0 END),0) live FROM facts", (t,)).fetchone()
+        pruned_total = db.execute(
+            "SELECT COUNT(*) n FROM audit_events WHERE action='session_pruned'").fetchone()["n"]
     json_out({
         "generated_at": t,
         "tasks_total": sum(by_status.values()),
@@ -3870,6 +3948,7 @@ def metrics(args):
         "completions_blocked_by_evidence": completions_blocked,
         "sessions_indexed": sessions["n"],
         "session_messages_indexed": sessions["m"],
+        "sessions_pruned_total": pruned_total,
         "facts_total": facts["total"],
         "facts_live": facts["live"],
         "facts_closed": facts["total"] - facts["live"],
@@ -4096,6 +4175,7 @@ def main():
     p=sub.add_parser("session-scan"); p.add_argument("--root",required=True,help="directory tree of session transcripts to inventory (read-only)"); p.add_argument("--profile",default=""); p.add_argument("--project",default=""); p.add_argument("--since",default="",help="only files modified at/after this ISO timestamp"); p.add_argument("--max-file-bytes",dest="max_file_bytes",type=int,default=DEFAULT_SESSION_MAX_FILE_BYTES); p.set_defaults(fn=session_scan)
     p=sub.add_parser("session-ingest"); p.add_argument("--source",required=True,help="provenance label for the session store (e.g. claude-code)"); p.add_argument("--root",required=True); p.add_argument("--profile",default=""); p.add_argument("--project",default=""); p.add_argument("--since",default=""); p.add_argument("--max-file-bytes",dest="max_file_bytes",type=int,default=DEFAULT_SESSION_MAX_FILE_BYTES); p.add_argument("--apply",action="store_true",help="without this flag the command is a read-only dry-run plan"); p.add_argument("--redact",action="store_true"); p.add_argument("--allow-secret",dest="allow_secret",action="store_true"); p.set_defaults(fn=session_ingest)
     p=sub.add_parser("search-sessions"); p.add_argument("query"); p.add_argument("--source",default=""); p.add_argument("--project",default=""); p.add_argument("--role",default="",help="user or assistant"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_sessions)
+    p=sub.add_parser("sessions-prune"); p.add_argument("--older-than",dest="older_than",required=True,help="prune sessions whose last message predates this age (Nd/Nh/Nm) or ISO timestamp (required: an unbounded wipe is refused)"); p.add_argument("--source",default=""); p.add_argument("--profile",default=""); p.add_argument("--project",default=""); p.add_argument("--apply",action="store_true",help="without this flag the command is a read-only dry-run plan"); p.set_defaults(fn=sessions_prune)
     p=sub.add_parser("fact-assert"); p.add_argument("--subject",required=True,help="entity token (lowercase tag charset)"); p.add_argument("--predicate",required=True,help="relationship token (lowercase tag charset)"); p.add_argument("--object",required=True,help="entity token (lowercase tag charset)"); p.add_argument("--source",default="",help="agent/operator asserting the fact"); p.add_argument("--task",default="",help="task providing provenance (must exist)"); p.add_argument("--valid-hours",dest="valid_hours",type=float,default=None,help="validity window in hours (omit = valid until retracted)"); p.set_defaults(fn=fact_assert)
     p=sub.add_parser("fact-retract"); p.add_argument("fact_id"); p.add_argument("--reason",default=""); p.set_defaults(fn=fact_retract)
     p=sub.add_parser("facts"); p.add_argument("--subject",default=""); p.add_argument("--predicate",default=""); p.add_argument("--object",default=""); p.add_argument("--task",default=""); p.add_argument("--all",action="store_true",help="include closed validity windows (tagged with live flag)"); p.add_argument("--limit",type=int,default=100); p.set_defaults(fn=list_facts)

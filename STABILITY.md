@@ -88,13 +88,6 @@ This report separates **fixed issues**, **accepted risks**, and **merge blockers
   and digests are only comparable within the same engine mode.
 - **SQLite single-writer serialization** is assumed; `busy_timeout=10000`  absorbs contention, but very long transactions (migration import) can still
   starve concurrent writers for their duration.
-- **The session cache grows without TTL** — ingested transcripts stay until a
-  future consolidation/retention pass. This is bounded by explicit `--root`
-  ingestion choices and the rows are disposable by design (`DELETE FROM
-  sessions` cascades messages and the FTS triggers keep the index in sync);
-  no automatic retention was added because deleting conversation history
-  silently is exactly the kind of false-success behavior this runtime avoids.
-
 ## Fixed in the fact-graph transfer round (previously an accepted risk)
 
 1. **Fact-graph rows were not carried by migration import or work orders**
@@ -112,6 +105,19 @@ This report separates **fixed issues**, **accepted risks**, and **merge blockers
    credential-shaped `source`, journal coverage, local-fact blocker +
    forced cascade accounting, exact post-rollback zero, and clean import of
    a dropped-facts-table legacy source.
+
+## Fixed after the audit round (previously accepted risks)
+
+1. **The session cache grew without TTL** (accepted risk from the audit
+   round) — `sessions-prune` adds the retention pass: an explicitly bounded
+   prune (`--older-than` mandatory, so no filter combination can express an
+   unbounded wipe), dry-run plan by default, one-transaction apply that only
+   deletes derived cache rows (FTS triggers keep the index synced, source
+   stores are never touched), per-source audited `session_pruned` events with
+   exact counts, zero-candidate applies auditing nothing, a
+   `sessions_pruned_total` metric, and rebuildability proven by re-ingest.
+   Automatic retention was still deliberately *not* added — deletion stays an
+   explicit operator command, never a silent background behavior.
 
 ## Merge blockers
 
@@ -138,3 +144,8 @@ checkpoint divergence, tampered manifests/result docs, redaction bypass attempts
   `--since` plan filtering; byte-level proof that sources are never mutated.
 - Inventory seal fix: determinism assertion (identical trees → identical
   manifest modulo created_at) now passes; tampered manifests still refused.
+- Session retention: mandatory-bound refusal, invalid-duration failure,
+  filtered and absolute-ISO plans, dry-run touches nothing (rows and ledger),
+  exact-count audited apply, FTS stays synced post-delete (search + doctor
+  drift sweep), idempotent zero-candidate re-apply with no new audit events,
+  metrics parity, and rebuild-by-re-ingest.
