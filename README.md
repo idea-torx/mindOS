@@ -18,6 +18,7 @@ python3 "$A" heartbeat <task-id> --owner hermes --note "Running verification"
 python3 "$A" receipt <task-id> --kind verification --payload '{"tests":"pass","health":200}'
 python3 "$A" update <task-id> --status waiting_for_user --next-action "Leo review"
 python3 "$A" complete <task-id> --owner hermes --note "tests pass"  # requires live lease
+python3 "$A" fail <task-id> --owner codex --reason "tests red"      # failure + retry budget/backoff
 python3 "$A" release <task-id> --owner hermes       # live-lease holder only
 python3 "$A" renew <task-id> --owner hermes --minutes 45   # extend a live lease
 python3 "$A" leases [--all] [--owner hermes]        # fleet-wide lease view
@@ -987,6 +988,40 @@ Design properties:
 - **Audited**: the `lease_recovered` audit event records the applied
   `recover_after`.
 - **Observable**: `metrics` reports `tasks_in_backoff`.
+
+## Failure recording & retry budget (`fail`)
+
+`complete` records success, but an agent that attempted the work and could not
+finish had no first-class path — generic `update --status failed` silently lost
+the attempt. `fail` is its counterpart:
+
+```bash
+python3 "$A" fail <task-id> --owner codex --reason "tests red after rebase"
+python3 "$A" fail <task-id> --owner codex --reason "unrecoverable" --no-retry
+python3 "$A" fail <task-id> --owner codex --max-retries 5 --backoff-base 120 --backoff-cap 7200
+```
+
+Design properties:
+
+- **Lease-gated**: only the current holder of a live lease may record failure,
+  fenced by `--epoch` exactly like `complete`; terminal tasks are final.
+- **Shared retry budget**: each failure bumps `retry_count`, the same counter
+  stale-lease recovery consumes, so an agent's failures and recoveries draw
+  from one budget. While `retry_count <= --max-retries` (default 3) the task
+  returns to `queued`.
+- **Backoff, not hot-looping**: the task re-enters dispatch under the same
+  deterministic exponential cooldown as recovery — `recover_after = now +
+  backoff_base * 2^(retry_count-1)` seconds (default base 60s, capped at
+  3600s; base 0 disables). `next` skips cooling-down tasks (reason
+  `recovery_backoff` under `--explain`); a direct claim stays allowed as a
+  deliberate override and any lease acquisition clears the cooldown.
+- **Terminal escalation**: with the budget exhausted or `--no-retry`, the task
+  goes terminally `failed` with the reason preserved in `blocked_reason`, and
+  the response names `dependents_stranded` — direct non-terminal dependents the
+  permanent failure froze — so an operator can cancel or re-plan them.
+- **Audited & observable**: `task_failed` (retry scheduled) or
+  `task_failed_terminal` in the hash chain; `metrics` reports
+  `failures_retried_total` / `failures_terminal_total`.
 
 ## Deadline escalation (SLA sweep)
 

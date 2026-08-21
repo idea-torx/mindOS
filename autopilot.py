@@ -2058,6 +2058,76 @@ def cancel(args):
         audit(db, "task", args.id, "cancelled", {"owner": args.owner, "reason": args.reason})
         json_out(_task_view(task_row(db, args.id)))
 
+def _backoff_deadline(retry_count: int, base: int, cap: int) -> str:
+    """Deterministic exponential cooldown after the Nth failure: base * 2^(N-1), capped."""
+    if base <= 0:
+        return ""
+    delay = min(base * (2 ** (retry_count - 1)), cap)
+    dt = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    return dt.replace(microsecond=0).isoformat()
+
+def fail(args):
+    """Record an attempted-and-failed execution with a retry budget and backoff.
+
+    The first-class counterpart of `complete`: an agent that attempted the work
+    and could not finish reports it here instead of abusing generic
+    `update --status failed`, which silently loses the attempt. Mirrors ops.py
+    recover semantics so both failure paths share one budget:
+
+    - The caller must hold the live lease (fenced by --epoch like complete).
+    - Each failure consumes one unit of retry budget. While budget remains
+      (`retry_count <= --max-retries`, default 3) the task returns to `queued`
+      with an exponential cooldown `recover_after = now + backoff_base *
+      2^(retry_count-1)` seconds (--backoff-base default 60, --backoff-cap
+      default 3600; base 0 disables), so failing work cannot hot-loop through
+      dispatch. `next` already skips cooling-down tasks; a direct claim stays
+      allowed as a deliberate override and any acquisition clears the cooldown.
+    - With the budget exhausted (or --no-retry) the task goes terminally
+      `failed` with the reason preserved in blocked_reason, and direct queued
+      dependents are reported as dependents_stranded so the operator sees what
+      the permanent failure froze.
+    - Audited as `task_failed` (retry scheduled) or `task_failed_terminal`;
+      metrics reports failures_retried_total / failures_terminal_total.
+    """
+    if args.max_retries < 0:
+        raise SystemExit("--max-retries must be >= 0")
+    if args.backoff_cap < args.backoff_base:
+        raise SystemExit("--backoff-cap must be >= --backoff-base")
+    with conn() as db:
+        row = task_row(db, args.id)
+        if row["status"] in TERMINAL_STATUSES:
+            raise SystemExit(f"cannot fail terminal task: {row['status']}")
+        _require_live_lease(row, args.owner, "failing")
+        _require_epoch(row, getattr(args, "epoch", None), "failing")
+        new_retry = row["retry_count"] + 1
+        t = now()
+        reason = args.reason or "failed by agent"
+        if not args.no_retry and new_retry <= args.max_retries:
+            ra = _backoff_deadline(new_retry, args.backoff_base, args.backoff_cap)
+            db.execute("UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',"
+                       "blocked_reason=?,retry_count=?,recover_after=?,updated_at=? WHERE id=?",
+                       (reason, new_retry, ra, t, args.id))
+            audit(db, "task", args.id, "task_failed",
+                  {"owner": args.owner, "reason": reason, "retry_count": new_retry,
+                   "recover_after": ra or None, "max_retries": args.max_retries})
+            out = _task_view(task_row(db, args.id))
+            out["outcome"] = "retry_scheduled"
+            out["recover_after"] = ra
+            out["retries_remaining"] = max(args.max_retries - new_retry, 0)
+        else:
+            stranded = sorted(d["id"] for d in pending_dependents(db, args.id)
+                              if d["status"] not in TERMINAL_STATUSES)
+            db.execute("UPDATE tasks SET status='failed',lease_owner='',lease_expires_at='',"
+                       "blocked_reason=?,retry_count=?,recover_after='',updated_at=? WHERE id=?",
+                       (reason, new_retry, t, args.id))
+            audit(db, "task", args.id, "task_failed_terminal",
+                  {"owner": args.owner, "reason": reason, "retry_count": new_retry,
+                   "no_retry": bool(args.no_retry), "dependents_stranded": stranded})
+            out = _task_view(task_row(db, args.id))
+            out["outcome"] = "failed_terminal"
+            out["dependents_stranded"] = stranded
+        json_out(out)
+
 def block(args):
     """Operator transition to blocked: park work with a reason without cancelling it.
 
@@ -2308,7 +2378,8 @@ def next_task(args):
     """Dispatch: highest-priority queued task whose dependencies are all completed.
 
     Tasks in recovery backoff (recover_after in the future, set by ops.py
-    recover after a stale lease) are skipped so failing work cannot hot-loop
+    recover after a stale lease or by `fail` after a reported execution
+    failure) are skipped so failing work cannot hot-loop
     through dispatch; an explicit claim remains allowed as a deliberate
     operator override. Deferred tasks (not_before in the future, set via
     defer) are skipped the same way until their scheduled instant arrives.
@@ -2588,6 +2659,9 @@ def metrics(args):
         secrets = {a: db.execute(
             "SELECT COUNT(*) n FROM audit_events WHERE action=?", (a,)).fetchone()["n"]
             for a in ("secret_blocked", "secret_redacted", "secret_allowed")}
+        failures = {a: db.execute(
+            "SELECT COUNT(*) n FROM audit_events WHERE action=?", (a,)).fetchone()["n"]
+            for a in ("task_failed", "task_failed_terminal")}
     json_out({
         "generated_at": t,
         "tasks_total": sum(by_status.values()),
@@ -2612,6 +2686,8 @@ def metrics(args):
         "secrets_blocked_total": secrets["secret_blocked"],
         "secrets_redacted_total": secrets["secret_redacted"],
         "secrets_allowed_total": secrets["secret_allowed"],
+        "failures_retried_total": failures["task_failed"],
+        "failures_terminal_total": failures["task_failed_terminal"],
         "handoffs_total": handoffs["total"] or 0,
         "handoffs_superseded": handoffs["superseded"] or 0,
         "handoffs_with_recall_proof": handoffs["proven"] or 0,
@@ -2803,6 +2879,7 @@ def main():
     p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.add_argument("--not-before",dest="not_before"); p.add_argument("--title"); p.add_argument("--description"); p.add_argument("--priority",choices=sorted(PRIORITIES)); p.add_argument("--project"); p.set_defaults(fn=update)
     p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.set_defaults(fn=complete)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
+    p=sub.add_parser("fail"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.add_argument("--no-retry",dest="no_retry",action="store_true",help="skip the retry budget: fail terminally on the first attempt"); p.add_argument("--max-retries",dest="max_retries",type=int,default=3); p.add_argument("--backoff-base",dest="backoff_base",type=int,default=60); p.add_argument("--backoff-cap",dest="backoff_cap",type=int,default=3600); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=fail)
     p=sub.add_parser("block"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=block)
     p=sub.add_parser("unblock"); p.add_argument("id"); p.add_argument("--owner",required=True); p.set_defaults(fn=unblock)
     p=sub.add_parser("defer"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--until",default=""); p.set_defaults(fn=defer)

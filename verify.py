@@ -71,6 +71,41 @@ with tempfile.TemporaryDirectory() as td:
     detail = run('show','rec-1')
     assert detail['status'] == 'failed' and detail['blocked_reason'] == 'max lease retries exceeded'
     assert any(e['action'] == 'lease_failed' for e in detail['audit'])
+    # fail: first-class failure recording shares the recovery backoff machinery.
+    run('create','--project','Verify','--title','fail smoke','--id','fl-1')
+    err = run_fail('fail','fl-1','--owner','tester','--reason','premature')
+    assert 'no active lease' in err                                          # lease required
+    run('claim','fl-1','--owner','tester','--minutes','5')
+    err = run_fail('fail','fl-1','--owner','intruder')
+    assert 'lease owned by tester' in err                                    # foreign holder
+    f1 = run('fail','fl-1','--owner','tester','--reason','tests red','--backoff-base','60')
+    assert f1['outcome'] == 'retry_scheduled' and f1['status'] == 'queued' and f1['retry_count'] == 1
+    assert f1['retries_remaining'] == 2 and f1['lease_owner'] == '' and f1['recover_after']
+    detail = run('show','fl-1')
+    assert any(e['action'] == 'task_failed' for e in detail['audit'])
+    nx = run('next','--explain')                                             # dispatch skips cooldown
+    sk = next((s for s in nx.get('skipped',[]) if s['task_id'] == 'fl-1'), None)
+    assert sk is not None and sk['reason'] == 'recovery_backoff' and sk['recover_after']
+    run('claim','fl-1','--owner','tester','--minutes','5')                   # deliberate override clears it
+    row = next(r for r in run('list') if r['id'] == 'fl-1')
+    assert row['recover_after'] == ''
+    # Budget exhaustion: the third failure goes terminally failed and strands dependents.
+    run('create','--project','Verify','--title','downstream','--id','fl-2')
+    run('dep','fl-2','fl-1')
+    f2 = run('fail','fl-1','--owner','tester','--reason','still red','--max-retries','2')
+    assert f2['outcome'] == 'retry_scheduled' and f2['retry_count'] == 2
+    run('claim','fl-1','--owner','tester','--minutes','5')
+    f3 = run('fail','fl-1','--owner','tester','--reason','hopeless','--max-retries','2')
+    assert f3['outcome'] == 'failed_terminal' and f3['status'] == 'failed' and f3['retry_count'] == 3
+    assert f3['dependents_stranded'] == ['fl-2'] and f3['blocked_reason'] == 'hopeless'
+    detail = run('show','fl-1')
+    assert any(e['action'] == 'task_failed_terminal' for e in detail['audit'])
+    run_fail('fail','fl-1','--owner','tester')                               # terminal is final
+    # --no-retry forces a terminal failure on the first attempt.
+    run('create','--project','Verify','--title','no retry','--id','fl-3')
+    run('claim','fl-3','--owner','tester','--minutes','5')
+    f4 = run('fail','fl-3','--owner','tester','--reason','unrecoverable','--no-retry')
+    assert f4['outcome'] == 'failed_terminal' and f4['status'] == 'failed' and f4['retry_count'] == 1
     # leases: fleet-wide view hides expired-held leases by default; --all surfaces them.
     run('create','--project','Verify','--title','stale holder','--id','lst-1')
     run('claim','lst-1','--owner','ghost','--minutes','0')                  # expires immediately
@@ -87,8 +122,9 @@ with tempfile.TemporaryDirectory() as td:
     assert 'lst-1' in out['recovered']
     # Observability: metrics reflect the exercised state.
     m = run('metrics')
-    assert m['tasks_by_status'].get('failed') == 1
+    assert m['tasks_by_status'].get('failed') == 3
     assert m['tasks_by_status'].get('claimed') == 1
+    assert m['failures_retried_total'] == 2 and m['failures_terminal_total'] == 2
     assert m['stale_leases'] == 0 and m['receipts'] >= 1 and m['audit_events'] >= 4
     # Dependencies: dispatch skips blocked tasks; claim enforces dependency order.
     run('create','--project','Verify','--title','blocker','--id','dep-a','--priority','P1')
@@ -98,7 +134,7 @@ with tempfile.TemporaryDirectory() as td:
     assert nx['task']['id'] == 'dep-a', ('expected unblocked dep-a despite lower priority', nx)
     err = run_fail('claim','dep-b','--owner','tester','--minutes','5')
     assert 'unsatisfied dependencies' in err and 'dep-a(queued)' in err
-    m = run('metrics'); assert m['queued_blocked_by_deps'] == 1
+    m = run('metrics'); assert m['queued_blocked_by_deps'] == 2  # dep-b + stranded fl-2
     got = run('next','--claim','--owner','tester','--minutes','5')
     assert got['claimed'] is True and got['task']['id'] == 'dep-a' and got['lease_expires_at']
     run('update','dep-a','--status','completed')
@@ -106,6 +142,10 @@ with tempfile.TemporaryDirectory() as td:
     assert row['status'] == 'completed' and row['lease_owner'] == '', 'terminal update must release lease'
     got = run('next','--claim','--owner','tester','--minutes','5')
     assert got['task']['id'] == 'dep-b'
+    # Operator remediation for a terminally failed prerequisite: cancel the
+    # stranded dependent so archival guards see no live->terminal dependency.
+    cx = run('cancel','fl-2','--owner','leo','--reason','prerequisite fl-1 failed terminally')
+    assert cx['status'] == 'cancelled'
     detail = run('show','dep-b')
     dep = next(d for d in detail['dependencies'] if d['id'] == 'dep-a')
     assert dep['satisfied'] == 1 and dep['status'] == 'completed'
