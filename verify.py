@@ -1942,6 +1942,68 @@ with tempfile.TemporaryDirectory() as td:
     assert all(s['reason'] != 'policy_missing_tag' for s in nx.get('skipped', [])), nx
     m = run('metrics')
     assert m['claims_refused_by_policy'] >= 2, m
+    # Migration inventory: read-only durable-source discovery that seals a
+    # versioned, sha256-verified migration-plan manifest; fails closed on any
+    # corrupted or ambiguous source; never mutates a scanned source.
+    import hashlib
+    mig = Path(td) / 'migsources'
+    old_home = mig / 'machines/old/autopilot'; old_home.mkdir(parents=True)
+    menv = os.environ.copy(); menv['HERMES_AUTOPILOT_HOME'] = str(old_home)
+    def mrun(*a):
+        p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *a], env=menv, text=True, capture_output=True)
+        assert p.returncode == 0, (a, p.stdout, p.stderr)
+    mrun('init'); mrun('create', '--project', 'Legacy', '--title', 'carried work', '--id', 'mig-1')
+    (mig / 'broken/autopilot').mkdir(parents=True)
+    (mig / 'broken/autopilot/state.db').write_bytes(b'not a database at all')
+    amb_db = mig / 'stray.sqlite'; sqlite3.connect(amb_db).commit()
+    vault = mig / 'vault/Obs Vault/.obsidian'; vault.mkdir(parents=True)
+    (vault.parent / 'meeting.md').write_text('rotate the key AKIAIOSFODNN7EXAMPLE this week')
+    (mig / 'hindsight/banks/main').mkdir(parents=True)
+    (mig / 'hindsight/banks/main/memories.json').write_text('[]')
+    (mig / 'leohome/.hermes/profiles').mkdir(parents=True)
+    (mig / 'leohome/.hermes/profiles/leo.md').write_text('profile')
+    inv_path = Path(td) / 'inventory-full.json'
+    err = ops_fail('migrate-inventory', '--root', str(mig), '--out', str(inv_path))
+    assert 'failed closed' in err and str(mig / 'broken') in err, err   # names what is blocked
+    assert inv_path.stat().st_mode & 0o077 == 0                         # sealed manifest is 0600
+    inv = json.loads(inv_path.read_text())
+    assert inv['fail_closed'] is True and inv['summary']['blocked'] == 2, inv
+    by_kind = {s['kind']: s for s in inv['sources']}
+    def src(path):
+        return next(s for s in inv['sources'] if s['path'].endswith(str(path)))
+    assert src('broken/autopilot/state.db')['status'] == 'corrupted' \
+        and 'not a database' in src('broken/autopilot/state.db')['problems'][0]
+    assert by_kind['unknown_sqlite']['status'] == 'ambiguous'
+    assert by_kind['obsidian_vault']['secret_kinds'] == ['aws_access_key'], by_kind   # kind-only redaction
+    assert all('AKIAIOSFODNN7EXAMPLE' not in json.dumps(s) for s in inv['sources'])   # value never leaves
+    assert [p_['order'] for p_ in inv['plan']] == list(range(len(inv['plan'])))       # ordered plan
+    chk = ops('migrate-inventory-check', str(inv_path))
+    assert chk['ok'] is True and chk['summary']['healthy'] == 4, chk
+    tampered = json.loads(inv_path.read_text()); tampered['sources'][0]['status'] = 'ok'
+    inv_path.write_text(json.dumps(tampered, sort_keys=True))
+    err = ops_fail('migrate-inventory-check', str(inv_path))
+    assert 'integrity check failed' in err, err                    # tampered manifest refused
+    def tree_digest():
+        h = hashlib.sha256()
+        for p in sorted(mig.rglob('*')):
+            if p.is_file() and not p.is_symlink():
+                h.update(str(p.relative_to(mig)).encode()); h.update(p.read_bytes())
+        return h.hexdigest()
+    before = tree_digest()
+    clean = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-inventory',
+                            '--root', str(mig / 'machines')], env=env, text=True, capture_output=True)
+    assert clean.returncode == 0, clean.stderr                     # healthy subtree: no fail-closed exit
+    cdoc = json.loads(clean.stdout)
+    csrc = next(s for s in cdoc['sources'] if s['kind'] == 'autopilot_sqlite')
+    assert csrc['status'] == 'ok' and csrc['counts']['tasks'] == 1, csrc
+    assert cdoc['plan'][0]['kind'] == 'autopilot_sqlite' and 'import-task' in cdoc['plan'][0]['action'], cdoc
+    assert cdoc['summary']['secret_kinds'] == [], cdoc
+    clean2 = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-inventory',
+                             '--root', str(mig / 'machines')], env=env, text=True, capture_output=True)
+    d1, d2 = json.loads(clean.stdout), json.loads(clean2.stdout)
+    d1.pop('created_at'); d2.pop('created_at')
+    assert d1 == d2, 'identical sources must reproduce an identical manifest'
+    assert tree_digest() == before, 'discovery must never mutate a scanned source'
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

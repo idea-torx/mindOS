@@ -1291,6 +1291,236 @@ def unverified_completions(args=None):
                       'unverified': sum(1 for i in items if i['kind'] == 'no_receipts'),
                       'items': items}, sort_keys=True))
 
+MIGRATION_INVENTORY_FORMAT = 'autopilot-migration-inventory-v1'
+# Bounded discovery: an inventory sweep must never run away on a huge tree.
+_SCAN_SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv'}
+_SCAN_TEXT_EXTS = {'.md', '.json', '.txt', '.yaml', '.yml'}
+_SCAN_MAX_FILE_BYTES = 512 * 1024
+_SCAN_MAX_FILES_PER_SOURCE = 500
+# Durable-source kinds mapped to their migration plan step, in execution order.
+_MIGRATION_PLAN_STEPS = (
+    ('autopilot_sqlite', 0,
+     'back up the source database (snapshot semantics), verify its seal, then '
+     'restore or per-task import-task into the target Autopilot home'),
+    ('hindsight_bank', 1,
+     'import semantic memories as provenance-tagged notes with temporal '
+     'validity preserved; deduplicate and supersede on merge'),
+    ('hermes_home', 2,
+     'register profiles, skills, cron definitions, and ownership contracts '
+     'after control-plane initialization'),
+    ('obsidian_vault', 3,
+     'optional human archive input only: index as provenance-tagged memory; '
+     'never imported as execution truth'),
+    ('unknown_sqlite', 4,
+     'ambiguous source: resolve manually before any migration step'),
+)
+
+def _scan_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _classify_sqlite(path: Path):
+    """Open a candidate database strictly read-only and classify it.
+
+    Returns (status, problems, counts): status is 'ok' for a healthy Autopilot
+    database, 'corrupted' when SQLite cannot read it or integrity fails, and
+    'ambiguous' for valid SQLite that is not an Autopilot schema — the caller
+    fails closed on anything other than 'ok'.
+    """
+    try:
+        c = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=5)
+    except sqlite3.Error as e:
+        return 'corrupted', [f'{type(e).__name__}: {e}'], {}
+    try:
+        result = c.execute('PRAGMA integrity_check').fetchone()[0]
+        if result != 'ok':
+            return 'corrupted', [f'integrity_check: {result}'], {}
+        names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'tasks' not in names:
+            return 'ambiguous', ['valid sqlite without the Autopilot schema'], {}
+        counts = {t: c.execute(f'SELECT COUNT(*) AS n FROM "{t}"').fetchone()[0]
+                  for t in ('tasks', 'notes', 'handoffs', 'receipts',
+                            'heartbeats', 'task_deps', 'audit_events')
+                  if t in names}
+        return 'ok', [], counts
+    except sqlite3.Error as e:
+        return 'corrupted', [f'{type(e).__name__}: {e}'], {}
+    finally:
+        c.close()
+
+def _scan_source_files(base: Path, target: Path):
+    """Checksum every file under `target`, secret-scanning readable text.
+
+    Bounded (file count and size caps) so a giant vault cannot stall the sweep;
+    caps overflow is reported, never silent. Secret findings are kind-only —
+    the inventory must redact values even from its own manifest. Returns
+    (files, truncated).
+    """
+    if target.is_file():
+        candidates = [target]
+    else:
+        candidates = sorted(p for p in target.rglob('*') if p.is_file() and not p.is_symlink())
+    files, truncated = [], False
+    for p in candidates:
+        if len(files) >= _SCAN_MAX_FILES_PER_SOURCE:
+            truncated = True
+            break
+        try:
+            size = p.stat().st_size
+            entry = {'path': str(p.relative_to(base)), 'bytes': size,
+                     'sha256': _scan_sha256(p), 'secret_kinds': []}
+        except OSError:
+            continue
+        if p.suffix.lower() in _SCAN_TEXT_EXTS and size <= _SCAN_MAX_FILE_BYTES:
+            try:
+                text = p.read_text(errors='replace')
+            except OSError:
+                text = ''
+            entry['secret_kinds'] = sorted({f['kind'] for f in autopilot._secret_findings(text)})
+        files.append(entry)
+    return files, truncated
+
+def _discover_migration_sources(root: Path):
+    """Walk `root` once, classifying durable-source candidates.
+
+    Matched directories are pruned from further descent (their contents belong
+    to that source's own bounded scan), symlinks are never followed outside the
+    tree, and traversal order is deterministic so identical trees produce
+    identical inventories. Yields (kind, path) tuples.
+    """
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        d = Path(dirpath)
+        dirnames[:] = sorted(x for x in dirnames
+                             if x not in _SCAN_SKIP_DIRS and not (d / x).is_symlink())
+        matched = None
+        if d.name == 'autopilot' and (d / 'state.db').is_file():
+            found.append(('autopilot_sqlite', d / 'state.db'))
+            matched = True
+        elif (d / '.obsidian').is_dir():
+            found.append(('obsidian_vault', d))
+            matched = True
+        elif d.name == 'hindsight':
+            found.append(('hindsight_bank', d))
+            matched = True
+        elif d.name == '.hermes':
+            found.append(('hermes_home', d))
+            matched = True
+        if matched:
+            dirnames[:] = []   # do not re-classify inside a consumed source
+            continue
+        for name in sorted(filenames):
+            if name.endswith(('.db', '.sqlite')):
+                found.append(('unknown_sqlite', d / name))
+    return found
+
+def migrate_inventory(args=None):
+    """Discover durable migration sources under --root and seal a plan manifest.
+
+    Stage one of the installer/migrator: strictly read-only discovery that
+    classifies Autopilot databases, Hindsight banks, Hermes homes, Obsidian
+    vaults, and unrecognized SQLite files; checksums and secret-scans their
+    contents (kind-only findings); verifies database integrity; and emits a
+    versioned, sha256-sealed inventory manifest carrying an ordered migration
+    plan. Sources are never modified and no data leaves the machine.
+
+    Fail-closed: any corrupted or ambiguous source marks the whole inventory
+    `fail_closed` and exits non-zero — an operator must resolve ambiguity or
+    corruption before any import runs, and the sealed manifest records exactly
+    what was blocked and why. Re-running against unchanged sources reproduces
+    an identical plan section, so interrupted migrations can resume safely.
+    """
+    t = utc()
+    root = Path(getattr(args, 'root', '')).expanduser()
+    if not root.is_dir():
+        raise SystemExit(f'--root is not a directory: {root}')
+    root = root.resolve()
+    sources, fail_closed = [], False
+    for kind, path in _discover_migration_sources(root):
+        status, problems, counts = 'ok', [], {}
+        if kind in ('autopilot_sqlite', 'unknown_sqlite'):
+            status, problems, counts = _classify_sqlite(path)
+        files, truncated = _scan_source_files(
+            path.parent if path.is_file() else path.parent if kind == 'autopilot_sqlite' else path,
+            path)
+        kinds = sorted({k for f in files for k in f['secret_kinds']})
+        if problems or truncated:
+            problems = list(problems)
+            if truncated:
+                problems.append(f'file cap {_SCAN_MAX_FILES_PER_SOURCE} reached; contents partially scanned')
+        if status != 'ok':
+            fail_closed = True
+        sid = 'src-' + hashlib.sha256(str(path).encode()).hexdigest()[:12]
+        sources.append({'id': sid, 'kind': kind, 'path': str(path), 'status': status,
+                        'problems': problems, 'counts': counts, 'files': files,
+                        'secret_kinds': kinds, **({'truncated': True} if truncated else {})})
+    # Deterministic ordering: plan-step rank, then path — identical inputs,
+    # identical manifest (modulo created_at), so re-runs diff to nothing.
+    rank = {k: i for i, (k, _, _) in enumerate(_MIGRATION_PLAN_STEPS)}
+    sources.sort(key=lambda s: (rank.get(s['kind'], 99), s['path']))
+    actions = {k: a for k, _, a in _MIGRATION_PLAN_STEPS}
+    plan = [{'order': i, 'source_id': s['id'], 'kind': s['kind'],
+             'action': 'SKIP — resolve before migrating' if s['status'] != 'ok' else actions.get(s['kind'], 'review')}
+            for i, s in enumerate(sources)]
+    body = {'format': MIGRATION_INVENTORY_FORMAT, 'created_at': t, 'root': str(root),
+            'sources': sources, 'plan': plan, 'fail_closed': fail_closed,
+            'summary': {
+                'sources': len(sources),
+                'healthy': sum(1 for s in sources if s['status'] == 'ok'),
+                'blocked': sum(1 for s in sources if s['status'] != 'ok'),
+                'secret_kinds': sorted({k for s in sources for k in s['secret_kinds']})}}
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    doc = {**body, 'sha256': digest}
+    autopilot.ensure()
+    with db() as c:
+        autopilot.audit(c, 'system', 'migration-inventory', 'migration_inventory_sealed',
+                        {'sha256': digest, 'root': str(root), 'sources': len(sources),
+                         'fail_closed': fail_closed})
+    out = getattr(args, 'out', None)
+    if out:
+        out_path = Path(out); out_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix='.inventory.', dir=str(out_path.parent))
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(json.dumps(doc, sort_keys=True)); f.flush(); os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, str(out_path))
+        finally:
+            if os.path.exists(tmp): os.unlink(tmp)
+        print(json.dumps({'ok': not fail_closed, 'path': str(out_path), 'sha256': digest,
+                          'summary': body['summary'], 'fail_closed': fail_closed,
+                          'sources': [{k: s[k] for k in ('id', 'kind', 'path', 'status')}
+                                      for s in sources]}, sort_keys=True))
+    else:
+        print(json.dumps(doc, sort_keys=True))
+    if fail_closed:
+        blocked = [f"{s['id']} ({s['path']}): {'; '.join(s['problems'])}"
+                   for s in sources if s['status'] != 'ok']
+        sys.exit('migration inventory failed closed:\n  ' + '\n  '.join(blocked))
+
+def migrate_inventory_check(args):
+    """Verify a sealed inventory manifest without touching any database."""
+    path = Path(args.path)
+    if not path.exists(): raise SystemExit(f'inventory not found: {path}')
+    try:
+        doc = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f'inventory is not valid JSON: {e}')
+    expected = doc.get('sha256')
+    body = {k: v for k, v in doc.items() if k != 'sha256'}
+    if body.get('format') != MIGRATION_INVENTORY_FORMAT:
+        raise SystemExit('unrecognized inventory format')
+    actual = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    if actual != expected:
+        raise SystemExit('inventory integrity check failed; refusing a tampered manifest')
+    print(json.dumps({'ok': True, 'path': str(path), 'created_at': body.get('created_at'),
+                      'root': body.get('root'), 'summary': body.get('summary'),
+                      'fail_closed': body.get('fail_closed', False),
+                      'expected_sha256': expected, 'actual_sha256': actual}, sort_keys=True))
+
 def policy(args):
     path=Path.home()/'.hermes/autopilot/policies'/f'{args.project.lower()}.yaml'
     if not path.exists(): print(json.dumps({'allowed':False,'reason':'no project policy'})); return
@@ -1323,4 +1553,6 @@ x=s.add_parser('export-task'); x.add_argument('id'); x.add_argument('--out',defa
 x=s.add_parser('import-task'); x.add_argument('path'); x.add_argument('--force',action='store_true'); x.add_argument('--redact',action='store_true'); x.add_argument('--allow-secret',action='store_true'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=import_task)
 x=s.add_parser('approval'); x.add_argument('action',choices=['approve','reject','block']); x.add_argument('id'); x.add_argument('--by',default='leo'); x.add_argument('--reason',default=''); x.add_argument('--next-action',default=''); x.set_defaults(fn=approval)
 x=s.add_parser('policy'); x.add_argument('project'); x.add_argument('action'); x.set_defaults(fn=policy)
+x=s.add_parser('migrate-inventory'); x.add_argument('--root',required=True); x.add_argument('--out',default=None); x.set_defaults(fn=migrate_inventory)
+x=s.add_parser('migrate-inventory-check'); x.add_argument('path'); x.set_defaults(fn=migrate_inventory_check)
 args=p.parse_args(); args.fn(args)

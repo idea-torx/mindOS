@@ -1367,6 +1367,48 @@ gate kind are recorded in the audited `updated` event. Re-stating the current
 status is not a transition and stays ungated; projects without a policy file
 behave exactly as before.
 
+## Migration inventory (installer stage one)
+
+Bringing a new machine (or a new Autopilot home) up starts with honest
+discovery, not import. `migrate-inventory` walks an explicit `--root` — it
+never guesses at live homes or touches a source — and classifies the durable
+sources the migration model cares about: Autopilot SQLite databases
+(execution truth), Hindsight banks (shared brain input), Hermes homes
+(profiles/skills/cron/ownership), Obsidian vaults (optional human archive),
+and unrecognized SQLite files. Every source is checksummed file-by-file,
+Autopilot databases get a read-only integrity check plus row counts, and all
+scanned text is run through the same secret detector as the shared-memory
+write path — findings are reported **by kind only**, so the manifest can be
+shared without leaking credentials.
+
+The output is a versioned, sha256-sealed `autopilot-migration-inventory-v1`
+manifest carrying an ordered migration plan (control plane first, then
+Hindsight, Hermes registration, Obsidian archive) and is audited as
+`migration_inventory_sealed` in this home:
+
+```bash
+python3 "$O" migrate-inventory --root /Volumes/old-machine --out inventory.json
+python3 "$O" migrate-inventory-check inventory.json   # verify the seal before trusting it
+```
+
+Design rules, enforced and tested:
+
+- **Read-only**: sources are opened with SQLite read-only URIs; symlinks are
+  never followed; a full-fixture hash comparison proves discovery mutates
+  nothing.
+- **Fail-closed**: any corrupted database (`integrity_check != ok`, unreadable
+  bytes) or ambiguous source (valid SQLite without the Autopilot schema)
+  marks the inventory `fail_closed` and exits non-zero, naming every blocked
+  source — ambiguity must be resolved by an operator before any import runs.
+- **Deterministic**: identical trees produce byte-identical manifests modulo
+  `created_at` (sorted traversal, plan-rank ordering), so interrupted
+  migrations resume against the same plan.
+- **Bounded**: file-count and per-file size caps keep giant vaults from
+  stalling the sweep; cap overflow is reported in the manifest, not silent.
+- **Sealed manifests**: tampering any field breaks the sha256 seal and
+  `migrate-inventory-check` refuses the document; manifests are written
+  atomically with `0600` permissions.
+
 ## Next integration
 
 The hourly control tower should read this registry and report task changes. Existing project-specific policies should be added under `policies/` before allowing automatic side effects.
