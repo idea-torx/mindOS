@@ -808,6 +808,40 @@ with tempfile.TemporaryDirectory() as td:
     assert run('handoff-inbox','--agent','nobody')['count'] == 0
     err = run_fail('handoff-inbox','--agent','')
     assert '--agent is required' in err
+    # Handoff acknowledgment: the recipient durably accepts inbound work.
+    run('create','--project','Inbox','--title','ack host','--id','ack-1')
+    run_fail('ack','ack-1','--agent','claude-code')          # no live handoff yet
+    h_a1 = run('handoff','ack-1','--from-agent','codex','--to-agent','claude-code',
+               '--objective','take over the retry path')
+    err = run_fail('ack','ack-1','--agent','opencode')        # foreign recipient
+    assert "addressed to 'claude-code'" in err
+    err = run_fail('ack','ack-1','--agent','claude-code','--recall-digest','zzz')
+    assert 'invalid --recall-digest' in err
+    inbox = run('handoff-inbox','--agent','claude-code','--unacked-only')
+    assert 'ack-1' in {i['task_id'] for i in inbox['items']}, inbox
+    assert all(i['acked'] is False for i in inbox['items'])
+    ack = run('ack','ack-1','--agent','claude-code')
+    assert ack['ok'] is True and ack['already_acked'] is False and ack['acked_by'] == 'claude-code'
+    again = run('ack','ack-1','--agent','claude-code')        # idempotent re-ack
+    assert again['already_acked'] is True and again['acked_at'] == ack['acked_at']
+    cur = run('handoff-current','ack-1')
+    assert cur['acked_by'] == 'claude-code' and cur['acked_at'] == ack['acked_at']
+    inbox = run('handoff-inbox','--agent','claude-code','--unacked-only')
+    assert 'ack-1' not in {i['task_id'] for i in inbox['items']}, inbox
+    full = run('handoff-inbox','--agent','claude-code')
+    item = next(i for i in full['items'] if i['task_id'] == 'ack-1')
+    assert item['acked'] is True and item['acked_at'] == ack['acked_at']
+    detail = run('show','ack-1')
+    ev = next(e for e in detail['audit'] if e['action'] == 'handoff_acknowledged')
+    assert ev['payload']['agent'] == 'claude-code', ev
+    m = run('metrics'); assert m['handoffs_acked_total'] >= 1, m
+    # A superseding handoff resets acceptance; the SLA lint flags never-picked-up work.
+    h_a2 = run('handoff','ack-1','--from-agent','codex','--to-agent','opencode',
+               '--objective','reassigned after no pickup')
+    run_fail('ack','ack-1','--agent','claude-code'), 'old recipient must not ack a successor'
+    chk = ops('handoff-check','--task','ack-1','--ack-sla-hours','0')
+    prob = next(p for p in chk['problems'] if p['handoff_id'] == h_a2['id'])
+    assert 'stale_unacknowledged' in prob['reasons'], chk
     # Deadline escalation: overdue non-terminal tasks climb one priority level per pass.
     run('create','--project','Sla','--title','overdue p3','--id','sla-1','--priority','P3',
         '--due-at','2020-01-01T00:00:00Z')

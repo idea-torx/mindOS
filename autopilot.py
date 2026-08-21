@@ -111,6 +111,9 @@ CREATE TABLE IF NOT EXISTS handoffs (
   risks TEXT NOT NULL DEFAULT '[]',
   content_hash TEXT NOT NULL,
   recall_digest TEXT NOT NULL DEFAULT '',
+  acked_by TEXT NOT NULL DEFAULT '',
+  acked_at TEXT NOT NULL DEFAULT '',
+  ack_recall_digest TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   superseded_by TEXT NOT NULL DEFAULT ''
 );
@@ -229,6 +232,9 @@ def _migrate(db) -> None:
     handoff_cols = {r[1] for r in db.execute("PRAGMA table_info(handoffs)")}
     if "recall_digest" not in handoff_cols:
         db.execute("ALTER TABLE handoffs ADD COLUMN recall_digest TEXT NOT NULL DEFAULT ''")
+    for col in ("acked_by", "acked_at", "ack_recall_digest"):
+        if col not in handoff_cols:
+            db.execute(f"ALTER TABLE handoffs ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
     receipt_cols = {r[1] for r in db.execute("PRAGMA table_info(receipts)")}
     if "file_hash" not in receipt_cols:
         db.execute("ALTER TABLE receipts ADD COLUMN file_hash TEXT NOT NULL DEFAULT ''")
@@ -510,6 +516,8 @@ def _handoff_parsed(row, include_meta: bool = False):
         "from_agent": row["from_agent"], "to_agent": row["to_agent"],
         "status": row["status"], "objective": row["objective"],
         "commit_ref": row["commit_ref"], "recall_digest": row["recall_digest"],
+        "acked_by": row["acked_by"], "acked_at": row["acked_at"],
+        "ack_recall_digest": row["ack_recall_digest"],
         "created_at": row["created_at"],
     }
     for f in HANDOFF_LIST_FIELDS:
@@ -588,6 +596,41 @@ def current_handoff(args):
         row = _live_handoff(db, args.task_id)
     json_out(_handoff_parsed(row, include_meta=True) if row else None)
 
+def ack_handoff(args):
+    """Acknowledge the live handoff addressed to you (provider-neutral protocol).
+
+    The inbox surfaces inbound work; `ack` records that the recipient has
+    *accepted* it, closing the loop between "handed to" and "picked up by".
+    Only the addressed agent may ack, only the live handoff is acked (a new
+    handoff resets acceptance), re-acking is idempotent, and an optional
+    --recall-digest ties the acceptance to proof of recalled context. The
+    transition is audited as `handoff_acknowledged` in the hash chain.
+    """
+    agent = (args.agent or "").strip()
+    if not agent:
+        raise SystemExit("--agent is required")
+    digest = _require_digest(getattr(args, "recall_digest", "") or "", "--recall-digest")
+    t = now()
+    with conn() as db:
+        task_row(db, args.task_id)
+        row = _live_handoff(db, args.task_id)
+        if row is None:
+            raise SystemExit("no live handoff to acknowledge; record one with `handoff` first")
+        if row["to_agent"] != agent:
+            raise SystemExit(f"live handoff is addressed to '{row['to_agent'] or 'nobody'}', not '{agent}'")
+        if row["acked_by"]:
+            json_out({"ok": True, "task_id": args.task_id, "handoff_id": row["id"],
+                      "already_acked": True, "acked_by": row["acked_by"],
+                      "acked_at": row["acked_at"], "ack_recall_digest": row["ack_recall_digest"]})
+            return
+        db.execute("UPDATE handoffs SET acked_by=?,acked_at=?,ack_recall_digest=? WHERE id=?",
+                   (agent, t, digest, row["id"]))
+        audit(db, "task", args.task_id, "handoff_acknowledged",
+              {"handoff_id": row["id"], "agent": agent, "recall_digest": digest or None})
+    json_out({"ok": True, "task_id": args.task_id, "handoff_id": row["id"],
+              "already_acked": False, "acked_by": agent, "acked_at": t,
+              "ack_recall_digest": digest})
+
 def handoff_inbox(args):
     """Fleet-wide inbound view: every live handoff addressed to an agent.
 
@@ -598,13 +641,17 @@ def handoff_inbox(args):
     matches are listed — when a handoff is superseded by one addressed to
     someone else, the task leaves the previous recipient's inbox automatically.
     Each item joins the task's live state (title, status, priority, lease) so
-    the agent can triage without a follow-up `show` per task.
+    the agent can triage without a follow-up `show` per task, and carries the
+    handoff's acknowledgment state (`acked` / `acked_at`); `--unacked-only`
+    restricts the view to work not yet picked up.
     """
     agent = (args.agent or "").strip()
     if not agent:
         raise SystemExit("--agent is required")
     clauses = ["h.superseded_by=''", "h.to_agent=?"]
     vals = [agent]
+    if getattr(args, "unacked_only", False):
+        clauses.append("h.acked_by=''")
     if getattr(args, "project", ""):
         clauses.append("t.project=?")
         vals.append(args.project)
@@ -613,7 +660,7 @@ def handoff_inbox(args):
     with conn() as db:
         rows = db.execute(
             "SELECT h.id,h.task_id,h.from_agent,h.status,h.objective,h.commit_ref,"
-            "h.recall_digest,h.created_at,t.project,t.title AS task_title,"
+            "h.recall_digest,h.acked_by,h.acked_at,h.created_at,t.project,t.title AS task_title,"
             "t.status AS task_status,t.priority,t.lease_owner,t.lease_expires_at "
             "FROM handoffs h JOIN tasks t ON t.id=h.task_id "
             "WHERE " + " AND ".join(clauses) +
@@ -628,7 +675,9 @@ def handoff_inbox(args):
                       "live": bool(r["lease_owner"]) and r["lease_expires_at"] > t},
             "from_agent": r["from_agent"], "status": r["status"],
             "objective": r["objective"], "commit_ref": r["commit_ref"],
-            "recall_digest": r["recall_digest"], "created_at": r["created_at"],
+            "recall_digest": r["recall_digest"],
+            "acked": bool(r["acked_by"]), "acked_at": r["acked_at"] or None,
+            "created_at": r["created_at"],
         })
     json_out({"ok": True, "agent": agent, "generated_at": t,
               "count": len(items), "items": items})
@@ -1480,7 +1529,8 @@ def metrics(args):
         notes = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded, "
                            "SUM(CASE WHEN pinned!=0 AND superseded_by='' THEN 1 ELSE 0 END) pinned FROM notes").fetchone()
         handoffs = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded, "
-                              "SUM(CASE WHEN recall_digest!='' THEN 1 ELSE 0 END) proven FROM handoffs").fetchone()
+                              "SUM(CASE WHEN recall_digest!='' THEN 1 ELSE 0 END) proven, "
+                              "SUM(CASE WHEN acked_by!='' THEN 1 ELSE 0 END) acked FROM handoffs").fetchone()
     json_out({
         "generated_at": t,
         "tasks_total": sum(by_status.values()),
@@ -1502,6 +1552,7 @@ def metrics(args):
         "handoffs_total": handoffs["total"] or 0,
         "handoffs_superseded": handoffs["superseded"] or 0,
         "handoffs_with_recall_proof": handoffs["proven"] or 0,
+        "handoffs_acked_total": handoffs["acked"] or 0,
     })
 
 def list_tasks(args):
@@ -1625,7 +1676,8 @@ def main():
     p=sub.add_parser("handoff"); p.add_argument("task_id"); p.add_argument("--from-agent",required=True); p.add_argument("--to-agent",default=""); p.add_argument("--status",default=""); p.add_argument("--objective",default=""); p.add_argument("--evidence",action="append",default=[]); p.add_argument("--constraint",dest="constraints",action="append",default=[]); p.add_argument("--decision",dest="decisions",action="append",default=[]); p.add_argument("--file",dest="files",action="append",default=[]); p.add_argument("--commit",dest="commit_ref",default=""); p.add_argument("--next-action",dest="next_actions",action="append",default=[]); p.add_argument("--risk",dest="risks",action="append",default=[]); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.set_defaults(fn=add_handoff)
     p=sub.add_parser("handoffs"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_handoffs)
     p=sub.add_parser("handoff-current"); p.add_argument("task_id"); p.set_defaults(fn=current_handoff)
-    p=sub.add_parser("handoff-inbox"); p.add_argument("--agent",required=True); p.add_argument("--project"); p.add_argument("--limit",type=int,default=50); p.set_defaults(fn=handoff_inbox)
+    p=sub.add_parser("handoff-inbox"); p.add_argument("--agent",required=True); p.add_argument("--project"); p.add_argument("--limit",type=int,default=50); p.add_argument("--unacked-only",dest="unacked_only",action="store_true"); p.set_defaults(fn=handoff_inbox)
+    p=sub.add_parser("ack"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.set_defaults(fn=ack_handoff)
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)
     p=sub.add_parser("renew"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=renew)
     p=sub.add_parser("transfer"); p.add_argument("id"); p.add_argument("--from-owner",required=True,dest="from_owner"); p.add_argument("--to-owner",required=True,dest="to_owner"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=transfer)

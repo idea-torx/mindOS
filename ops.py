@@ -515,17 +515,27 @@ def handoff_check(args=None):
       newer audited recall for the task exists since, so the handoff may have
       been written against outdated context;
     - terminal_task_handoff: a live handoff on a completed/failed/cancelled
-      task — stale recovery bait.
+      task — stale recovery bait;
+    - stale_unacknowledged: an addressed live handoff older than the ack SLA
+      (--ack-sla-hours, default 24) that its recipient never acknowledged —
+      inbound work nobody picked up.
 
     Read-only: reports problems, never mutates. Digest freshness relative to
     *current* durable state is `recall-verify`'s job; this lint checks
     provenance (was it really recalled, and is it the latest recall).
     """
     t = utc()
+    sla_hours = getattr(args, 'ack_sla_hours', 24) if args is not None else 24
+    try:
+        sla_hours = float(sla_hours)
+    except (TypeError, ValueError):
+        raise SystemExit('--ack-sla-hours must be a number')
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=sla_hours)) \
+        .replace(microsecond=0).isoformat()
     problems = []
     with db() as c:
         q = ("SELECT h.id,h.task_id,h.to_agent,h.objective,h.evidence,h.next_actions,"
-             "h.recall_digest,t.status AS task_status FROM handoffs h "
+             "h.recall_digest,h.acked_by,h.created_at,t.status AS task_status FROM handoffs h "
              "JOIN tasks t ON t.id=h.task_id WHERE h.superseded_by=''")
         vals = []
         if getattr(args, 'task', ''):
@@ -561,6 +571,8 @@ def handoff_check(args=None):
                         reasons.append('older_than_latest_recall')
             if r['task_status'] in ('completed', 'failed', 'cancelled'):
                 reasons.append('terminal_task_handoff')
+            if r['to_agent'].strip() and not r['acked_by'] and r['created_at'] <= cutoff:
+                reasons.append('stale_unacknowledged')
             if reasons:
                 problems.append({'handoff_id': r['id'], 'task_id': r['task_id'],
                                  'reasons': sorted(reasons)})
@@ -638,7 +650,7 @@ import argparse
 p=argparse.ArgumentParser(); s=p.add_subparsers(dest='cmd',required=True)
 for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning),('doctor',doctor)]:
  x=s.add_parser(name); x.set_defaults(fn=fn)
-x=s.add_parser('handoff-check'); x.add_argument('--task',default=''); x.set_defaults(fn=handoff_check)
+x=s.add_parser('handoff-check'); x.add_argument('--task',default=''); x.add_argument('--ack-sla-hours',dest='ack_sla_hours',type=float,default=24); x.set_defaults(fn=handoff_check)
 x=s.add_parser('recall-stale'); x.set_defaults(fn=recall_stale)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--backoff-base',type=int,default=60); x.add_argument('--backoff-cap',type=int,default=3600); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('escalate'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=escalate)

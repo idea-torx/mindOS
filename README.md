@@ -194,6 +194,8 @@ python3 "$A" handoff <task-id> --from-agent codex --to-agent claude-code \
   --decision "use exponential backoff" --file src/retry.py \
   --commit abc1234 --next-action "open PR" --risk "flaky integration test"
 python3 "$A" handoff-current <task-id>   # recovery point for a new session
+python3 "$A" ack <task-id> --agent claude-code   # accept an inbound handoff
+python3 "$A" handoff-inbox --agent claude-code [--unacked-only]  # fleet-wide inbound view
 python3 "$A" handoffs <task-id>          # live handoff
 python3 "$A" handoffs <task-id> --all    # full temporal chain
 ```
@@ -246,6 +248,36 @@ state — title, status, priority, lease owner/liveness — plus the handoff's
 triage its inbound work without a follow-up `show` per task. The natural loop
 is: `handoff-inbox` → `resume <task-id> --agent me` → act → publish a receipt.
 
+## Handoff acknowledgment (ack)
+
+The inbox surfaces inbound work; `ack` records that the recipient has
+*accepted* it, closing the loop between "handed to" and "picked up by":
+
+```bash
+python3 "$A" ack <task-id> --agent claude-code
+python3 "$A" ack <task-id> --agent claude-code --recall-digest <sha256>   # tie acceptance to recalled context
+```
+
+Design properties:
+
+- **Addressed-only**: only the agent the live handoff is addressed to may ack
+  it; a foreign agent is rejected.
+- **Idempotent**: re-acking returns the existing acknowledgment
+  (`already_acked: true`) instead of duplicating state.
+- **Reset by supersession**: recording a new handoff clears acceptance — a
+  reassigned or updated handoff must be picked up again by its new recipient.
+- **Provenance**: an optional `--recall-digest` ties the acceptance to proof of
+  the context pack the recipient recalled before accepting.
+- **Audited**: every first ack records a `handoff_acknowledged` event in the
+  hash chain; `handoff-current`, `show`, and `handoffs --all` surface
+  `acked_by` / `acked_at`.
+- **Triage-aware**: inbox items carry `acked` / `acked_at`, and
+  `handoff-inbox --unacked-only` restricts the view to work not yet picked up.
+- **Observable**: `metrics` reports `handoffs_acked_total`, and
+  `ops.py handoff-check` flags an addressed live handoff older than the ack SLA
+  (`--ack-sla-hours`, default 24) that was never acknowledged as
+  `stale_unacknowledged`.
+
 ## Handoff protocol lint (handoff-check)
 
 The handoff protocol makes promises — an objective, a recipient, evidence or
@@ -269,6 +301,8 @@ Reported reasons:
 - `older_than_latest_recall` — genuinely recalled, but a newer audited recall
   for the task exists since, so the handoff may rest on stale context
 - `terminal_task_handoff` — live handoff on a completed/failed/cancelled task
+- `stale_unacknowledged` — addressed live handoff older than the ack SLA
+  (`--ack-sla-hours`, default 24) that its recipient never acknowledged
 
 Provenance is checked against the audit ledger, not recomputed digests, so
 routine lease renewals and the handoff's own recording never false-positive;
