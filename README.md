@@ -29,6 +29,7 @@ python3 "$A" defer <task-id> --owner hermes --until "2026-08-22T09:00:00Z"  # pa
 python3 "$A" tag <task-id> --tag autopilot-safe      # attach capability/scope tags (repeatable)
 python3 "$A" untag <task-id> --tag client:trove      # remove one tag
 python3 "$A" next --claim --owner codex --tag autopilot-safe  # tag-scoped dispatch
+python3 "$A" plan [--project P] [--tag T]   # parallel dispatch-wave schedule
 python3 "$A" show <task-id>          # task detail + receipts + audit trail + dependencies
 python3 "$A" search "deploy"         # substring search over task text fields
 python3 "$A" search "audit" --status queued --project Trove --priority P1
@@ -180,6 +181,42 @@ Design properties:
 - **Composable**: pair it with `next --prefer-unblocking` to actually work the
   chain — the path names what matters, unblocking tie-breaks help drain it.
 - **Observable**: `metrics` reports `critical_path_length` fleet-wide.
+
+## Dispatch wave plan (parallel schedule)
+
+`critical-path` says how many serial waves the open graph needs; `plan` says
+which tasks go in each wave. Wave 1 is every ready task (in-flight work
+included, shown with its live status), each later wave is what the previous
+waves unblock, and anything that can never start inside the requested scope is
+reported under `unschedulable` with its blockers instead of being silently
+dropped:
+
+```bash
+python3 "$A" plan                 # whole fleet
+python3 "$A" plan --project Trove # one project's graph
+python3 "$A" plan --tag autopilot-safe   # one capability scope
+# { "waves": [{"wave": 1, "tasks": [{"id": ..., "title": ..., "status": ..., "priority": ...}, ...]},
+#             {"wave": 2, "tasks": [...]}],
+#   "unschedulable": [{"id": ..., "blocked_by": [{"id": ..., "status": "missing"}]}],
+#   "waves_total": 2, "scheduled_tasks": 5, "open_tasks": 6 }
+```
+
+Design properties:
+
+- **Deterministic**: within a wave, tasks order by dispatch preference —
+  priority rank, then earliest deadline (undated last), then oldest-created,
+  then id — so identical state yields an identical schedule and re-running
+  `plan` diffs to nothing.
+- **Honest about scope**: a prerequisite outside the plan (a missing id, or a
+  live task in another project under `--project`) can never be scheduled here,
+  so it and everything downstream of it land in `unschedulable` with blocker
+  ids and statuses.
+- **Read-only simulation**: runtime guards that depend on live state (seam
+  conflicts, recovery backoff, deferral windows) still apply at claim time and
+  are deliberately not folded into the waves.
+- **Composable**: `waves_total` equals `critical-path`'s `length` for the same
+  scope — use `plan` to size parallel capacity per wave and work the waves
+  with `next --claim`.
 
 ## Lease transfer (cross-agent ownership)
 

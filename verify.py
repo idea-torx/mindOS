@@ -1802,6 +1802,56 @@ with tempfile.TemporaryDirectory() as td:
     run('cancel','tdup-2','--owner','tester')
     d4 = run('create','--project','Dupes','--title','fix login redirect loop','--id','tdup-4')
     assert 'similar_open_tasks' not in d4, d4                       # settled work is history, not a collision
+    # Dispatch wave plan: the fleet-level schedule — wave 1 is every ready task
+    # (in-flight included), each later wave is what the previous waves unblock,
+    # and out-of-scope prerequisites strand their downstream under
+    # `unschedulable` instead of being silently dropped or falsely promised.
+    run('create','--project','Plan','--title','root a','--id','pl-a','--priority','P1')
+    run('create','--project','Plan','--title','root b','--id','pl-b','--priority','P0')
+    run('create','--project','Plan','--title','join','--id','pl-j','--priority','P1')
+    run('dep','pl-j','pl-a'); run('dep','pl-j','pl-b')
+    run('create','--project','Plan','--title','tail','--id','pl-t')
+    run('dep','pl-t','pl-j')
+    run('create','--project','Elsewhere','--title','external blocker','--id','pl-x')
+    run('create','--project','Plan','--title','orphan dependent','--id','pl-o')
+    run('dep','pl-o','pl-x')                                        # cross-project prereq
+    pl = run('plan','--project','Plan')
+    assert [w['wave'] for w in pl['waves']] == [1, 2, 3], pl        # diamond drains in 3 waves
+    assert [t['id'] for t in pl['waves'][0]['tasks']] == ['pl-b','pl-a'], pl   # P0 before P1 inside a wave
+    assert [t['id'] for t in pl['waves'][1]['tasks']] == ['pl-j'], pl          # join waits for both roots
+    assert [t['id'] for t in pl['waves'][2]['tasks']] == ['pl-t'], pl
+    assert pl['waves_total'] == 3 and pl['scheduled_tasks'] == 4 and pl['open_tasks'] == 5, pl
+    uns = next(u for u in pl['unschedulable'] if u['id'] == 'pl-o')
+    assert uns['blocked_by'] == [{'id': 'pl-x', 'status': 'queued'}], uns      # honest about scope
+    # In-flight work is ready now and shows its live status in wave 1.
+    run('claim','pl-a','--owner','tester','--minutes','5')
+    run('heartbeat','pl-a','--owner','tester','--note','in flight')
+    pl = run('plan','--project','Plan')
+    w1 = {t['id']: t['status'] for t in pl['waves'][0]['tasks']}
+    assert w1.get('pl-a') == 'running', pl                          # claimed+heartbeat ⇒ running stays wave 1
+    # Determinism: identical state yields an identical schedule.
+    assert pl == run('plan','--project','Plan'), 'plan must be deterministic'
+    # waves_total parity with critical-path for the same scope.
+    cp = run('critical-path','--project','Plan')
+    assert cp['length'] == pl['waves_total'], (cp, pl)
+    # Completing a root pulls its dependents one wave earlier.
+    run('complete','pl-a','--owner','tester')
+    pl2 = run('plan','--project','Plan')
+    assert max(t['id'] for w in pl2['waves'][:1] for t in w['tasks']) == 'pl-b'
+    assert [t['id'] for t in pl2['waves'][1]['tasks']] == ['pl-j'], pl2
+    assert pl2['waves_total'] == 3, pl2                             # tail still needs its own wave
+    # Settled tasks leave the graph; an empty project plans nothing.
+    for tid in ('pl-b', 'pl-j', 'pl-t'):
+        run('claim', tid, '--owner', 'tester', '--minutes', '5')
+        run('complete', tid, '--owner', 'tester')
+    run('cancel','pl-o','--owner','tester')
+    assert run('plan','--project','Nothing')['open_tasks'] == 0 and run('plan','--project','Nothing')['waves'] == []
+    # Tag scoping: only tagged tasks are scheduled, untagged dependents go unschedulable.
+    run('create','--project','Plan','--title','tagged leaf','--id','pl-g1','--depends-on','pl-t')
+    run('tag','pl-g1','--tag','autopilot-safe')
+    plt = run('plan','--tag','autopilot-safe')
+    assert [[t['id'] for t in w['tasks']] for w in plt['waves']] == [['pl-g1']], plt
+    assert plt['unschedulable'] == [] and plt['scheduled_tasks'] == 1, plt   # completed prereq leaves the graph
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

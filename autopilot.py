@@ -2409,6 +2409,89 @@ def critical_path(args):
     json_out({"ok": True, **({"project": args.project} if getattr(args, "project", "") else {}),
               **out})
 
+def _dispatch_plan(db, project: str = "", tag: str = ""):
+    """Deterministic parallel dispatch-wave schedule over the open DAG.
+
+    `critical-path` names how many serial waves the open graph needs and which
+    chain defines that bound; this computes the actual waves — wave 1 is every
+    task whose prerequisites are all completed (including in-flight work, shown
+    with its live status), then each task joins the first wave after all of its
+    prerequisites' waves. Within a wave, tasks order by effective dispatch
+    preference (priority rank, then earliest deadline, then oldest-created,
+    then id) so identical state yields an identical schedule and two runs of
+    the same fleet diff to nothing.
+
+    Prerequisites outside the plan's scope (a missing id, or a live task in
+    another project when --project is set) can never be scheduled here, so
+    everything downstream of them is reported under `unschedulable` with the
+    blocking ids and their statuses instead of being silently dropped or
+    falsely promised. The plan is read-only simulation: runtime guards that
+    depend on live state (seam conflicts, recovery backoff, deferral windows)
+    still apply at claim time and are deliberately not folded in.
+    """
+    q = ("SELECT id,title,status,priority,due_at,created_at FROM tasks "
+         "WHERE status NOT IN ('completed','failed','cancelled')")
+    vals = []
+    if project:
+        q += " AND project=?"; vals.append(project)
+    if tag:
+        q += " AND tags LIKE ?"; vals.append('%"' + _valid_tag(tag) + '"%')
+    nodes = {}
+    for r in db.execute(q, vals).fetchall():
+        nodes[r["id"]] = dict(r)
+    prereqs = {}
+    for r in db.execute(
+            "SELECT d.task_id,d.depends_on,COALESCE(t.status,'missing') AS ds "
+            "FROM task_deps d LEFT JOIN tasks t ON t.id=d.depends_on").fetchall():
+        if r["ds"] == "completed" or r["task_id"] not in nodes:
+            continue  # satisfied prerequisites and settled dependents leave the graph
+        prereqs.setdefault(r["task_id"], {})[r["depends_on"]] = r["ds"]
+    wave_ids = []
+    done = set()
+    pending = set(nodes)
+    while True:
+        ready = sorted(
+            (n for n in pending if all(p in done for p in prereqs.get(n, ()))),
+            key=lambda n: (_prio_rank(nodes[n]["priority"]), nodes[n]["due_at"] == "",
+                           nodes[n]["due_at"], nodes[n]["created_at"], n))
+        if not ready:
+            break
+        wave_ids.append(ready)
+        done.update(ready)
+        pending.difference_update(ready)
+    return {
+        "waves": [{"wave": i + 1,
+                   "tasks": [{"id": n, **{k: nodes[n][k] for k in ("title", "status", "priority")}}
+                             for n in ids]}
+                  for i, ids in enumerate(wave_ids)],
+        "unschedulable": [{"id": n,
+                           **{k: nodes[n][k] for k in ("title", "status", "priority")},
+                           "blocked_by": [{"id": p, "status": s}
+                                          for p, s in sorted(prereqs[n].items()) if p not in done]}
+                          for n in sorted(pending)],
+        "waves_total": len(wave_ids),
+        "scheduled_tasks": len(done),
+        "open_tasks": len(nodes),
+    }
+
+def plan(args):
+    """Parallel dispatch-wave schedule for the open dependency DAG.
+
+    `critical-path` answers how many waves and which chain bounds them; `plan`
+    answers which tasks run in each wave. Wave 1 is every ready task (in-flight
+    included), each later wave is what the previous waves unblock, and anything
+    that can never start inside the requested scope lands in `unschedulable`
+    with its blockers. Read-only and deterministic: same fleet state, same
+    schedule. Use it to brief operators, size parallel capacity per wave, or
+    sanity-check that dispatch is actually draining the graph in wave order.
+    """
+    project = (args.project or "").strip()
+    tag = (getattr(args, "tag", "") or "").strip()
+    with conn() as db:
+        out = _dispatch_plan(db, project, tag)
+    json_out({"ok": True, **({"project": project} if project else {}),
+              **({"tag": tag} if tag else {}), **out})
+
 def verify_chain(args):
     """Recompute the audit hash chain; optionally pin-check against a sealed
     checkpoint file to also detect tail truncation or history rewriting."""
@@ -3024,6 +3107,7 @@ def main():
     p=sub.add_parser("similar"); p.add_argument("id"); p.add_argument("--threshold",type=float,default=None,help="token-Jaccard cutoff (default: 0.8 / AUTOPILOT_NEAR_DUP_THRESHOLD)"); p.set_defaults(fn=similar_tasks)
     p=sub.add_parser("impact"); p.add_argument("id"); p.set_defaults(fn=impact)
     p=sub.add_parser("critical-path"); p.add_argument("--project",default=""); p.set_defaults(fn=critical_path)
+    p=sub.add_parser("plan"); p.add_argument("--project",default=""); p.add_argument("--tag",default="",help="only schedule tasks carrying this tag"); p.set_defaults(fn=plan)
     p=sub.add_parser("verify-chain"); p.add_argument("--checkpoint",default=""); p.set_defaults(fn=verify_chain)
     p=sub.add_parser("events"); p.add_argument("--entity-type"); p.add_argument("--entity-id"); p.add_argument("--action"); p.add_argument("--since",default=""); p.add_argument("--until",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--verify",action="store_true"); p.set_defaults(fn=events)
     p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--force",action="store_true",help="claim even if another live lease holds the same worktree/branch seam"); p.set_defaults(fn=claim)
