@@ -155,6 +155,11 @@ Design properties:
 - **Deduplication**: exact duplicate content on the same task returns the
   existing note (`deduplicated: true`) instead of growing the store; a
   duplicate add of pinned content promotes the existing note to pinned.
+- **Near-duplicate guard**: rephrased restatements (high token-Jaccard overlap,
+  default ≥ 0.8, tunable via `AUTOPILOT_NEAR_DUP_THRESHOLD`) are still stored
+  but flagged: the response carries `similar_to` with note ids and similarity
+  scores, and the audited `note_added` event records `similar_notes`, so shared
+  memory does not silently accumulate near-identical facts.
 - **Pinning**: `--pinned` marks a note as critical. Pinned notes pack first in
   `context` (and survive tight budgets that drop unpinned notes), and the pin
   survives supersession so temporal fact chains stay protected.
@@ -259,9 +264,10 @@ Reported reasons:
 - `missing_objective` — the resume point has no stated goal
 - `sparse_no_evidence_or_next_actions` — a self-report without proof
 - `unproven_recall_digest` — the cited digest never appears in the audited
-  `context_recalled` stream (fabricated or mistyped citation)
-- `older_than_latest_recall` — genuinely recalled, but a newer `recall` for
-  the task has been audited since, so the handoff may rest on stale context
+  recall stream (`context_recalled` or `session_resumed`; a resume digest is
+  first-class provenance) — fabricated or mistyped citation
+- `older_than_latest_recall` — genuinely recalled, but a newer audited recall
+  for the task exists since, so the handoff may rest on stale context
 - `terminal_task_handoff` — live handoff on a completed/failed/cancelled task
 
 Provenance is checked against the audit ledger, not recomputed digests, so
@@ -312,12 +318,18 @@ pinned-first notes, cross-task related notes) plus:
 - **Latest receipts**: the 3 most recent receipts with parsed payloads.
 - **Sealed digest**: a deterministic SHA-256 over the durable context (the
   recall timestamp is excluded), so identical state yields an identical,
-  referenceable digest. Any state change moves it.
+  referenceable digest. Any state change moves it. A second `core_digest`
+  excludes the live-handoff section: an agent recalls first and records its
+  handoff afterwards, so its own handoff must not count as drift against its
+  own citation — note/receipt/lease/dep drift still moves both digests.
 
-Each recall is audited as a `context_recalled` event carrying the agent and
-digest, so a receipt can later prove exactly which context was recalled before
-acting. A self-report is never execution truth without a receipt; a digest ties
-the two together.
+Each recall is audited as a `context_recalled` event carrying the agent, the
+digest, the core digest, and the bundle parameters (budget, related count,
+scope) — so downstream sweeps can recompute the digest exactly as it was
+recalled. `resume` audits its bundle the same way (`session_resumed`), making a
+resume digest first-class recall provenance for handoffs and completions. A
+self-report is never execution truth without a receipt; a digest ties the two
+together.
 
 `recall-verify` closes the loop: pass a previously recalled digest and it
 recomputes the current bundle (same algorithm, no audit write) and reports
@@ -331,7 +343,25 @@ context detectable after the fact.
 python3 "$A" recall <task-id> --agent codex --budget 6000 --related 5
 python3 "$A" recall-verify <task-id> --digest <sha256> --agent codex --budget 6000 --related 5
 python3 "$A" events --action context_recalled --entity-id <task-id>
+python3 ops.py recall-stale   # fleet sweep: which live handoffs cite drifted context?
 ```
+
+## Fleet freshness sweep (recall-stale)
+
+`recall-verify` answers freshness for one task and one digest the caller
+already holds; `ops.py recall-stale` answers the operator question across the
+whole fleet. For every *live* handoff citing a `--recall-digest`, it recomputes
+the task's current recall bundle exactly as it was originally recalled (the
+audited event stores the bundle parameters) and compares digests:
+
+- `fresh` — the cited recall's core context still matches current durable state
+- `stale` — notes, receipts, lease state, or deps moved since; the item carries
+  the recomputed `current_digest` so the next agent can re-recall before acting
+- `unproven_recall_digest` — no audited recall/resume ever produced the digest
+- `unknown_recall_params` — proven by a legacy pre-parameter-capture event;
+  freshness cannot be recomputed exactly
+
+Read-only: reports problems, never mutates.
 
 ## Ranked retrieval (FTS5)
 

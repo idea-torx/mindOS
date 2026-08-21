@@ -508,11 +508,12 @@ def handoff_check(args=None):
     - missing_objective: the resume point has no stated goal;
     - sparse: neither evidence nor next_actions (a self-report without proof);
     - unproven_recall_digest: the handoff cites a --recall-digest that never
-      appears in the audited `context_recalled` stream — a fabricated or
-      mistyped citation (self-report without proof);
+      appears in the audited recall stream (`context_recalled` or
+      `session_resumed`) — a fabricated or mistyped citation (self-report
+      without proof);
     - older_than_latest_recall: the cited digest was genuinely recalled but a
-      newer `recall` for the task has been audited since, so the handoff may
-      have been written against outdated context;
+      newer audited recall for the task exists since, so the handoff may have
+      been written against outdated context;
     - terminal_task_handoff: a live handoff on a completed/failed/cancelled
       task — stale recovery bait.
 
@@ -546,14 +547,15 @@ def handoff_check(args=None):
             if r['recall_digest']:
                 proven = c.execute(
                     "SELECT 1 FROM audit_events WHERE entity_type='task' AND entity_id=? "
-                    "AND action='context_recalled' AND payload_json LIKE ? LIMIT 1",
+                    "AND action IN ('context_recalled','session_resumed') "
+                    "AND payload_json LIKE ? LIMIT 1",
                     (r['task_id'], '%"digest": "' + r['recall_digest'] + '"%')).fetchone()
                 if not proven:
                     reasons.append('unproven_recall_digest')
                 else:
                     latest = c.execute(
                         "SELECT payload_json FROM audit_events WHERE entity_type='task' "
-                        "AND entity_id=? AND action='context_recalled' "
+                        "AND entity_id=? AND action IN ('context_recalled','session_resumed') "
                         "ORDER BY id DESC LIMIT 1", (r['task_id'],)).fetchone()
                     if latest and json.loads(latest['payload_json']).get('digest') != r['recall_digest']:
                         reasons.append('older_than_latest_recall')
@@ -564,6 +566,66 @@ def handoff_check(args=None):
                                  'reasons': sorted(reasons)})
     print(json.dumps({'ok': not problems, 'generated_at': t,
                       'problems': problems, 'count': len(problems)}, sort_keys=True))
+
+def recall_stale(args=None):
+    """Fleet-wide freshness sweep: which live handoffs cite drifted context?
+
+    `recall-verify` answers freshness for one task and one digest the caller
+    already holds; this sweep answers the operator question across the whole
+    fleet: for every *live* handoff citing a --recall-digest, recompute the
+    task's current recall bundle exactly as it was originally recalled (the
+    audited event stores the bundle parameters — budget, related, scope,
+    agent) and compare digests.
+
+    Per-item states:
+    - fresh: the cited recall's *core* context (everything except the handoff
+      section — the agent's own post-recall handoff is not self-drift) still
+      matches current durable state;
+    - stale: notes, receipts, lease state, or deps have moved since the cited
+      recall; the item carries the recomputed `current_digest` so the next
+      agent can re-recall before acting;
+    - unproven_recall_digest: no audited recall/resume event ever produced
+      the cited digest (fabricated or mistyped);
+    - unknown_recall_params: the digest was proven by a legacy event recorded
+      before parameter/core capture; freshness cannot be recomputed exactly.
+
+    Read-only: reports problems, never mutates.
+    """
+    t = utc()
+    items = []
+    with db() as c:
+        rows = c.execute(
+            "SELECT h.id AS handoff_id,h.task_id,h.recall_digest "
+            "FROM handoffs h JOIN tasks t ON t.id=h.task_id "
+            "WHERE h.superseded_by='' AND h.recall_digest!='' ORDER BY h.task_id,h.id").fetchall()
+        for r in rows:
+            item = {'handoff_id': r['handoff_id'], 'task_id': r['task_id'],
+                    'recall_digest': r['recall_digest']}
+            ev = c.execute(
+                "SELECT payload_json FROM audit_events WHERE entity_type='task' AND entity_id=? "
+                "AND action IN ('context_recalled','session_resumed') "
+                "AND payload_json LIKE ? ORDER BY id DESC LIMIT 1",
+                (r['task_id'], '%"digest": "' + r['recall_digest'] + '"%')).fetchone()
+            if not ev:
+                item['state'] = 'unproven_recall_digest'
+            else:
+                payload = json.loads(ev['payload_json'])
+                params = {k: payload.get(k) for k in ('budget', 'related', 'related_scope')}
+                if any(v is None for v in params.values()) or not payload.get('core_digest'):
+                    item['state'] = 'unknown_recall_params'
+                else:
+                    bundle = autopilot._build_recall_bundle(
+                        c, r['task_id'], payload.get('agent') or '',
+                        params['budget'], params['related'], params['related_scope'])
+                    item['state'] = ('fresh' if bundle['core_digest'] == payload['core_digest']
+                                     else 'stale')
+                    item['current_digest'] = bundle['digest']
+            items.append(item)
+    counts = {}
+    for i in items:
+        counts[i['state']] = counts.get(i['state'], 0) + 1
+    print(json.dumps({'ok': True, 'generated_at': t, 'checked': len(items),
+                      'states': counts, 'items': items}, sort_keys=True))
 
 def policy(args):
     path=Path.home()/'.hermes/autopilot/policies'/f'{args.project.lower()}.yaml'
@@ -577,6 +639,7 @@ p=argparse.ArgumentParser(); s=p.add_subparsers(dest='cmd',required=True)
 for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning),('doctor',doctor)]:
  x=s.add_parser(name); x.set_defaults(fn=fn)
 x=s.add_parser('handoff-check'); x.add_argument('--task',default=''); x.set_defaults(fn=handoff_check)
+x=s.add_parser('recall-stale'); x.set_defaults(fn=recall_stale)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--backoff-base',type=int,default=60); x.add_argument('--backoff-cap',type=int,default=3600); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('escalate'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=escalate)
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)

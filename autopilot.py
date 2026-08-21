@@ -331,6 +331,44 @@ def _note_hash(task_id: str, content: str) -> str:
     """Content hash for exact-duplicate detection scoped to one task."""
     return hashlib.sha256(f"{task_id}|{content.strip()}".encode()).hexdigest()
 
+def _near_dup_threshold() -> float:
+    """Jaccard similarity above which a new note is flagged as a near-duplicate."""
+    try:
+        v = float(os.environ.get("AUTOPILOT_NEAR_DUP_THRESHOLD", "0.8"))
+        return v if 0.0 < v <= 1.0 else 0.8
+    except ValueError:
+        return 0.8
+
+def _tokens(text: str) -> set:
+    return {t for t in re.findall(r"[a-z0-9]+", text.lower())}
+
+def _jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+def _near_duplicates(db, task_id: str, content: str) -> list:
+    """Live notes on this task whose token overlap with `content` is high.
+
+    Exact duplicates are already deduplicated by content_hash; this catches
+    rephrased restatements so shared memory does not silently accumulate
+    near-identical facts. Informational only: the note is still stored, and
+    the flag travels in the output plus the audited event payload.
+    """
+    toks = _tokens(content)
+    if not toks:
+        return []
+    threshold = _near_dup_threshold()
+    similar = []
+    for r in db.execute(
+            "SELECT id,content FROM notes WHERE task_id=? AND superseded_by=''",
+            (task_id,)).fetchall():
+        sim = _jaccard(toks, _tokens(r["content"]))
+        if sim >= threshold:
+            similar.append({"note_id": r["id"], "similarity": round(sim, 3)})
+    similar.sort(key=lambda s: (-s["similarity"], s["note_id"]))
+    return similar
+
 def live_note(db, task_id: str, content_hash: str):
     return db.execute(
         "SELECT * FROM notes WHERE task_id=? AND content_hash=? AND superseded_by='' ORDER BY created_at DESC LIMIT 1",
@@ -359,10 +397,14 @@ def add_note(args):
             json_out({"ok": True, "id": existing["id"], "task_id": args.task_id,
                       "deduplicated": True, "created_at": existing["created_at"]})
             return
+        similar = _near_duplicates(db, args.task_id, content)
         db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at,pinned) VALUES(?,?,?,?,?,?,?,?)",
                    (nid, args.task_id, args.kind, content, args.source, h, t, pinned))
-        audit(db, "task", args.task_id, "note_added", {"note_id": nid, "kind": args.kind, "source": args.source, "pinned": bool(pinned)})
-    json_out({"ok": True, "id": nid, "task_id": args.task_id, "deduplicated": False, "created_at": t})
+        audit(db, "task", args.task_id, "note_added",
+              {"note_id": nid, "kind": args.kind, "source": args.source, "pinned": bool(pinned),
+               "similar_notes": [s["note_id"] for s in similar]})
+    json_out({"ok": True, "id": nid, "task_id": args.task_id, "deduplicated": False,
+              "similar_to": similar, "created_at": t})
 
 def list_notes(args):
     with conn() as db:
@@ -740,11 +782,21 @@ def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: i
                 (task_id,)).fetchall()],
     }
     # Digest covers durable context only — not the recall timestamp — so
-    # identical state yields an identical, referenceable digest.
+    # identical state yields an identical, referenceable digest. The core
+    # digest additionally excludes the live-handoff section: an agent recalls
+    # first and records its handoff afterwards, so the handoff it writes must
+    # not count as drift against its own citation (fleet sweeps compare cores;
+    # note/receipt/lease drift still shows up in both).
     digest = hashlib.sha256(json.dumps(
         {k: v for k, v in bundle.items() if k != "recalled_at"},
         sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     bundle["digest"] = digest
+    core = hashlib.sha256(json.dumps(
+        {k: v for k, v in bundle.items()
+         if k not in ("recalled_at", "digest", "handoff", "handoff_packed",
+                      "used_chars", "truncated")},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    bundle["core_digest"] = core
     return bundle
 
 def recall(args):
@@ -763,8 +815,13 @@ def recall(args):
                                       getattr(args, "agent", "") or "",
                                       args.budget, getattr(args, "related", 0),
                                       getattr(args, "related_scope", "project"))
+        # Record the bundle parameters alongside the digest so fleet sweeps
+        # (ops.py recall-stale) can recompute the digest exactly as recalled.
         audit(db, "task", args.task_id, "context_recalled",
-              {"agent": bundle["agent"], "digest": bundle["digest"]})
+              {"agent": bundle["agent"], "digest": bundle["digest"],
+               "core_digest": bundle["core_digest"],
+               "budget": args.budget, "related": getattr(args, "related", 0),
+               "related_scope": getattr(args, "related_scope", "project")})
     json_out(bundle)
 
 def recall_verify(args):
@@ -839,8 +896,14 @@ def resume(args):
         bundle = _build_recall_bundle(db, args.task_id, agent, args.budget,
                                       getattr(args, "related", 0),
                                       getattr(args, "related_scope", "project"))
+        # session_resumed doubles as recall provenance: the digest is recorded
+        # with its bundle parameters so a handoff citing a resume digest passes
+        # the handoff-check lint and fleet sweeps can recompute it exactly.
         audit(db, "task", args.task_id, "session_resumed",
-              {"agent": agent, "action": action, "digest": bundle["digest"]})
+              {"agent": agent, "action": action, "digest": bundle["digest"],
+               "core_digest": bundle["core_digest"],
+               "budget": args.budget, "related": getattr(args, "related", 0),
+               "related_scope": getattr(args, "related_scope", "project")})
     json_out({"ok": True, "task_id": args.task_id, "action": action, **bundle})
 
 def search_notes(args):

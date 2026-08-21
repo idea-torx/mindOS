@@ -903,6 +903,55 @@ with tempfile.TemporaryDirectory() as td:
     assert all(p['task_id'] == 'hc-1' for p in chk['problems'])
     doc = ops('doctor')
     assert doc['ok'] is True and doc['problems'] == [], doc
+    # Near-duplicate memory guard: rephrased restatements are flagged, distinct notes are not.
+    run('create','--project','Verify','--title','dup host','--id','dup-1')
+    d1 = run('note','dup-1','--content','postgres pool exhausted under heavy load')
+    assert d1['deduplicated'] is False and d1['similar_to'] == [], d1
+    d2 = run('note','dup-1','--content','postgres pool exhausted under heavy load now')
+    assert d2['similar_to'] and d2['similar_to'][0]['note_id'] == d1['id'], d2
+    assert d2['similar_to'][0]['similarity'] >= 0.8, d2
+    d3 = run('note','dup-1','--content','gardening tip about tomatoes entirely unrelated')
+    assert d3['similar_to'] == [], d3
+    detail = run('show','dup-1')
+    ev = next(e for e in detail['audit'] if e['action'] == 'note_added'
+              and e['payload'].get('similar_notes'))
+    assert ev['payload']['note_id'] == d2['id'] and ev['payload']['similar_notes'] == [d1['id']], ev
+    # The near-duplicate is still stored (informational, not suppressed).
+    live_dups = run('notes','dup-1')
+    assert {n['id'] for n in live_dups} == {d1['id'], d2['id'], d3['id']}
+    # Resume digests are first-class provenance: a handoff citing one passes the lint.
+    run('create','--project','Verify','--title','resume proof','--id','rp-1')
+    rr = run('resume','rp-1','--agent','codex')
+    run('release','rp-1','--owner','codex')
+    rh = run('handoff','rp-1','--from-agent','codex','--to-agent','opencode',
+             '--objective','continue from resumed session','--next-action','verify state',
+             '--recall-digest',rr['digest'])
+    chk = ops('handoff-check','--task','rp-1')
+    assert chk['ok'] is True and chk['problems'] == [], chk
+    # Fleet freshness sweep: recall-stale recomputes cited digests across all live handoffs.
+    run('create','--project','Verify','--title','fresh host','--id','fs-1')
+    rf = run('recall','fs-1','--agent','codex','--budget','4000')
+    fh = run('handoff','fs-1','--from-agent','codex','--to-agent','claude-code',
+             '--objective','sweep check','--next-action','verify','--recall-digest',rf['digest'])
+    rs = ops('recall-stale')
+    item = next(i for i in rs['items'] if i['task_id'] == 'fs-1')
+    assert item['state'] == 'fresh' and item['handoff_id'] == fh['id'], item
+    run('note','fs-1','--kind','fact','--content','drift after the handoff was written','--source','verify')
+    rs = ops('recall-stale')
+    item = next(i for i in rs['items'] if i['task_id'] == 'fs-1')
+    assert item['state'] == 'stale' and item['current_digest'] != rf['digest'], item
+    assert rs['states'].get('stale', 0) >= 1, rs
+    # A fabricated citation is unproven; superseding makes it the live handoff under test.
+    fabh = run('handoff','fs-1','--from-agent','claude-code','--to-agent','opencode',
+               '--objective','fabricated citation','--next-action','x','--recall-digest','e'*64)
+    assert fabh['superseded'] == fh['id']
+    rs = ops('recall-stale')
+    item = next(i for i in rs['items'] if i['handoff_id'] == fabh['id'])
+    assert item['state'] == 'unproven_recall_digest', item
+    assert all(i['handoff_id'] != fh['id'] for i in rs['items']), \
+        'superseded handoffs must leave the sweep'
+    doc = ops('doctor')
+    assert doc['ok'] is True and doc['problems'] == [], doc
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
