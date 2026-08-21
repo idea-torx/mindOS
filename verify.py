@@ -713,6 +713,67 @@ with tempfile.TemporaryDirectory() as td:
     cev = [e for e in run('events','--entity-id','ho-1','--action','completed')['events']
            if e['payload'].get('recall_digest') == rv2['current_digest']]
     assert cev, 'completed event must carry the cited recall digest'
+    # Cross-agent ownership transfer: atomic live-lease reassignment with fencing.
+    run('create','--project','Verify','--title','pass the baton','--id','xfer-1')
+    run('claim','xfer-1','--owner','agent-a','--minutes','5')
+    err = run_fail('transfer','xfer-1','--from-owner','agent-b','--to-owner','agent-c')
+    assert 'lease owned by agent-a' in err
+    err = run_fail('transfer','xfer-1','--from-owner','agent-a','--to-owner','agent-a')
+    assert 'must differ' in err
+    err = run_fail('transfer','xfer-1','--from-owner','agent-a','--to-owner','agent-b','--epoch','99')
+    assert 'lease superseded' in err
+    tr = run('transfer','xfer-1','--from-owner','agent-a','--to-owner','agent-b','--minutes','45')
+    assert tr['ok'] is True and tr['to_owner'] == 'agent-b' and tr['status'] == 'claimed', tr
+    assert tr['lease_epoch'] == 2 and tr['lease_expires_at'], tr
+    row = next(r for r in run('list') if r['id'] == 'xfer-1')
+    assert row['lease_owner'] == 'agent-b' and row['status'] == 'claimed'
+    # The old holder is fenced out immediately: owner mismatch and stale epoch both fail.
+    err = run_fail('heartbeat','xfer-1','--owner','agent-a')
+    assert 'lease owned by agent-b' in err
+    err = run_fail('renew','xfer-1','--owner','agent-b','--minutes','5','--epoch','1')
+    assert 'lease superseded' in err
+    detail = run('show','xfer-1')
+    assert any(e['action'] == 'lease_transferred' for e in detail['audit'])
+    err = run_fail('transfer','fin-1','--from-owner','agent-a','--to-owner','agent-b')
+    assert 'terminal task' in err
+    # Idempotent cross-agent recovery: resume recreates a killed session in one call.
+    run('create','--project','Verify','--title','killed session','--id','res-1')
+    run('note','res-1','--kind','fact','--content','resume marker note','--source','verify')
+    r1 = run('resume','res-1','--agent','codex','--budget','8000')
+    assert r1['ok'] is True and r1['action'] == 'claimed', r1
+    assert r1['task']['id'] == 'res-1' and len(r1['digest']) == 64
+    assert r1['lease']['owner'] == 'codex' and r1['lease']['held_by_caller'] is True, r1['lease']
+    # Idempotent: resuming again by the same holder mutates nothing.
+    r2 = run('resume','res-1','--agent','codex','--budget','8000')
+    assert r2['action'] == 'already_held' and r2['digest'] == r1['digest'], r2
+    row = next(r for r in run('list') if r['id'] == 'res-1')
+    assert row['lease_epoch'] == r1['lease']['epoch'], 'already_held must not bump the epoch'
+    # A foreign live lease blocks resume until it is transferred.
+    err = run_fail('resume','res-1','--agent','claude-code')
+    assert 'lease owned by codex' in err and 'transfer' in err
+    run('transfer','res-1','--from-owner','codex','--to-owner','claude-code')
+    r3 = run('resume','res-1','--agent','claude-code')
+    assert r3['action'] == 'already_held' and r3['lease']['held_by_caller'] is True, r3
+    evs = run('events','--entity-id','res-1','--action','session_resumed')
+    assert evs['count'] >= 3, evs
+    # An expired lease is reclaimed automatically — no operator recovery needed first.
+    run('release','res-1','--owner','claude-code')
+    run('claim','res-1','--owner','ghost','--minutes','0')
+    r4 = run('resume','res-1','--agent','codex')
+    assert r4['action'] == 'claimed' and r4['lease']['owner'] == 'codex', r4
+    # Guards mirror claim: blocked and dep-blocked tasks cannot be resumed.
+    run('block','res-1','--owner','codex','--reason','paused mid-flight')
+    err = run_fail('resume','res-1','--agent','codex')
+    assert 'task is blocked' in err and 'paused mid-flight' in err
+    run('unblock','res-1','--owner','codex')
+    run('create','--project','Verify','--title','res prereq','--id','res-dep-a')
+    run('create','--project','Verify','--title','res dependent','--id','res-dep-b','--depends-on','res-dep-a')
+    err = run_fail('resume','res-dep-b','--agent','codex')
+    assert 'unsatisfied dependencies' in err
+    err = run_fail('resume','fin-1','--agent','codex')
+    assert 'terminal task' in err
+    doc = ops('doctor')
+    assert doc['ok'] is True and doc['problems'] == [], doc
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

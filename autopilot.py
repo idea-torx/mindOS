@@ -741,6 +741,59 @@ def recall_verify(args):
               "fresh": bundle["digest"] == digest,
               "recalled_digest": digest, "current_digest": bundle["digest"]})
 
+def resume(args):
+    """Idempotent cross-agent recovery: recreate a killed session in one call.
+
+    This is the recovery half of the handoff protocol. Given the latest
+    durable handoff (via the recall bundle), an incoming agent calls `resume`
+    instead of hand-orchestrating claim + recall:
+
+    - live lease held by the caller → no mutation, bundle returned
+      (`action: already_held`) — calling resume twice is safe;
+    - expired or absent lease → claimed atomically for the caller
+      (`action: claimed`), honoring per-owner caps and dep/blocked guards;
+    - live lease held by someone else → rejected; ask them to `transfer`.
+
+    The response embeds the full sealed recall bundle (digest, lease state,
+    receipts) so the session restarts against exactly the context it will be
+    held to, and every resume is audited as `session_resumed`.
+    """
+    agent = (args.agent or "").strip()
+    if not agent:
+        raise SystemExit("--agent is required")
+    with conn() as db:
+        row = task_row(db, args.task_id)
+        if row["status"] in TERMINAL_STATUSES:
+            raise SystemExit(f"cannot resume terminal task: {row['status']}")
+        if row["status"] == "blocked":
+            raise SystemExit("task is blocked: %s; unblock before resuming"
+                             % (row["blocked_reason"] or "no reason recorded"))
+        pending = unsatisfied_deps(db, args.task_id)
+        if pending:
+            raise SystemExit("unsatisfied dependencies: " + ", ".join(f"{d['id']}({d['status']})" for d in pending))
+        t = now()
+        live = bool(row["lease_owner"]) and row["lease_expires_at"] > t
+        if live and row["lease_owner"] != agent:
+            raise SystemExit(f"lease owned by {row['lease_owner']}; ask them to transfer it before resuming")
+        if live:
+            action = "already_held"
+        else:
+            cap = resolve_max_active(args)
+            acquired, exp, epoch = _acquire(db, args.task_id, agent, args.minutes, cap)
+            if not acquired:
+                raise SystemExit(_explain_acquire_failure(db, args.task_id, agent, cap))
+            db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note",
+                       (args.task_id, agent, "claimed", now(), "resumed session"))
+            audit(db, "task", args.task_id, "claimed",
+                  {"owner": agent, "lease_expires_at": exp, "lease_epoch": epoch, "via": "resume"})
+            action = "claimed"
+        bundle = _build_recall_bundle(db, args.task_id, agent, args.budget,
+                                      getattr(args, "related", 0),
+                                      getattr(args, "related_scope", "project"))
+        audit(db, "task", args.task_id, "session_resumed",
+              {"agent": agent, "action": action, "digest": bundle["digest"]})
+    json_out({"ok": True, "task_id": args.task_id, "action": action, **bundle})
+
 def search_notes(args):
     """Keyword retrieval over note content with kind/project/status filters via the task join.
 
@@ -829,6 +882,46 @@ def renew(args):
         audit(db, "task", args.id, "lease_renewed", {"owner": args.owner, "minutes": args.minutes, "lease_expires_at": exp})
         json_out({"ok": True, "task_id": args.id, "status": row["status"], "owner": args.owner,
                   "lease_expires_at": exp, "lease_epoch": row["lease_epoch"]})
+
+def transfer(args):
+    """Atomically reassign a live lease to another agent.
+
+    The provider-neutral counterpart to a handoff: when work moves from one
+    agent to another, ownership moves with it. Only the current holder of a
+    live lease may transfer; the fencing epoch bumps on transfer so the old
+    holder's token is invalidated immediately even though the owner-name check
+    would otherwise still pass. Status is preserved and the new window starts
+    from now.
+    """
+    if args.minutes <= 0:
+        raise SystemExit("--minutes must be positive")
+    if args.to_owner == args.from_owner:
+        raise SystemExit("--to-owner must differ from --from-owner")
+    with conn() as db:
+        row = task_row(db, args.id)
+        if row["status"] in TERMINAL_STATUSES:
+            raise SystemExit(f"cannot transfer terminal task: {row['status']}")
+        _require_epoch(row, getattr(args, "epoch", None), "transferring")
+        t = now()
+        exp = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + args.minutes * 60, timezone.utc).replace(microsecond=0).isoformat()
+        cur = db.execute(
+            "UPDATE tasks SET lease_owner=?, lease_expires_at=?, lease_epoch=lease_epoch+1, updated_at=? "
+            "WHERE id=? AND lease_owner=? AND lease_expires_at!='' AND lease_expires_at>?",
+            (args.to_owner, exp, t, args.id, args.from_owner, t))
+        if cur.rowcount != 1:
+            if not row["lease_owner"]:
+                raise SystemExit("no active lease; claim before transferring")
+            if row["lease_owner"] != args.from_owner:
+                raise SystemExit(f"lease owned by {row['lease_owner']}")
+            raise SystemExit("lease expired; reclaim before transferring")
+        new_epoch = db.execute("SELECT lease_epoch FROM tasks WHERE id=?", (args.id,)).fetchone()[0]
+        audit(db, "task", args.id, "lease_transferred",
+              {"from_owner": args.from_owner, "to_owner": args.to_owner,
+               "minutes": args.minutes, "lease_expires_at": exp,
+               "previous_epoch": row["lease_epoch"], "lease_epoch": new_epoch})
+        json_out({"ok": True, "task_id": args.id, "status": row["status"],
+                  "from_owner": args.from_owner, "to_owner": args.to_owner,
+                  "lease_expires_at": exp, "lease_epoch": new_epoch})
 
 def leases(args):
     """Fleet-wide lease observability: who holds what, until when, live or stale.
@@ -1419,6 +1512,8 @@ def main():
     p=sub.add_parser("handoff-current"); p.add_argument("task_id"); p.set_defaults(fn=current_handoff)
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)
     p=sub.add_parser("renew"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=renew)
+    p=sub.add_parser("transfer"); p.add_argument("id"); p.add_argument("--from-owner",required=True,dest="from_owner"); p.add_argument("--to-owner",required=True,dest="to_owner"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=transfer)
+    p=sub.add_parser("resume"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=resume)
     p=sub.add_parser("leases"); p.add_argument("--owner"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=leases)
     args=ap.parse_args(); args.fn(args)
 

@@ -21,6 +21,8 @@ python3 "$A" complete <task-id> --owner hermes --note "tests pass"  # requires l
 python3 "$A" release <task-id> --owner hermes       # live-lease holder only
 python3 "$A" renew <task-id> --owner hermes --minutes 45   # extend a live lease
 python3 "$A" leases [--all] [--owner hermes]        # fleet-wide lease view
+python3 "$A" transfer <task-id> --from-owner hermes --to-agent codex   # reassign a live lease
+python3 "$A" resume <task-id> --agent codex         # idempotent killed-session recovery
 python3 "$A" cancel <task-id> --owner leo --reason "obsolete"       # rejected on foreign leases
 python3 "$A" show <task-id>          # task detail + receipts + audit trail + dependencies
 python3 "$A" search "deploy"         # substring search over task text fields
@@ -92,6 +94,44 @@ Each entry carries `task_id`, `project`, `title`, `status`, `priority`,
 `owner`, `lease_expires_at`, `lease_epoch`, a `live` flag, and
 `seconds_remaining`. Default output hides expired-held leases so it answers
 "what is active right now"; `--all` answers "what will `recover` sweep".
+
+## Lease transfer (cross-agent ownership)
+
+When work moves from one agent to another, ownership moves with it. `transfer`
+atomically reassigns a live lease — only the current holder of a *live* lease
+may transfer, the fencing epoch bumps so the old holder's token is invalidated
+immediately, and status is preserved:
+
+```bash
+python3 "$A" transfer <task-id> --from-owner codex --to-owner claude-code --minutes 45
+python3 "$A" transfer <task-id> --from-owner codex --to-owner claude-code --epoch 3   # fenced
+```
+
+The transition is audited as `lease_transferred` with both owners and both
+epochs. Terminal tasks, foreign holders, expired leases, and same-owner
+transfers are rejected.
+
+## Session recovery (resume)
+
+`resume` is the one-call recovery half of the handoff protocol: a killed or
+fresh session recreates itself from durable state in moments, instead of hand-
+orchestrating claim + recall. It applies the same guards as `claim` (terminal,
+blocked, and dep-blocked tasks are rejected with their reasons), then:
+
+- **live lease held by the caller** → no mutation; returns the sealed recall
+  bundle with `action: already_held` (calling `resume` twice is safe);
+- **expired or absent lease** → claimed atomically for the caller, honoring
+  per-owner caps (`action: claimed`);
+- **live lease held by someone else** → rejected; ask them to `transfer`.
+
+```bash
+python3 "$A" resume <task-id> --agent codex [--budget 6000] [--related 5]
+```
+
+The response embeds the full recall bundle (task header, deps, live handoff,
+notes, lease state, latest receipts) sealed with the deterministic digest, and
+every resume is audited as `session_resumed` carrying the agent, action, and
+digest — so recovery is idempotent, observable, and provably context-fresh.
 
 ## Shared memory (task notes)
 
