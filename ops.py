@@ -1244,6 +1244,53 @@ def dup_tasks(args=None):
                       'duplicate_tasks': sum(len(cl['duplicates']) for cl in clusters_out)},
                      sort_keys=True))
 
+def unverified_completions(args=None):
+    """Fleet sweep: completions whose execution truth is missing or broken.
+
+    A self-report is never execution truth without a receipt. Two problem
+    kinds make that contract observable instead of aspirational:
+
+    - no_receipts: a completed task with zero receipts — the completion is a
+      bare agent claim with nothing sealed to back it;
+    - evidence_receipt_missing: an audited `completed` event cites
+      `--receipt` evidence ids that no longer exist in the receipts table
+      (deleted rows, partial restore, archive drift) — the cited proof
+      vanished after the fact.
+
+    Read-only: reports, never mutates. Remediation for no_receipts is posting
+    the missing evidence (receipt) or re-opening the task if none exists.
+    """
+    t = utc()
+    items = []
+    with db() as c:
+        rows = c.execute(
+            "SELECT t.id,t.project,t.title,t.updated_at,"
+            "(SELECT COUNT(*) FROM receipts r WHERE r.task_id=t.id) n "
+            "FROM tasks t WHERE t.status='completed' ORDER BY t.updated_at").fetchall()
+        for r in rows:
+            if r['n'] == 0:
+                items.append({'kind': 'no_receipts', 'task_id': r['id'],
+                              'project': r['project'], 'title': r['title'],
+                              'updated_at': r['updated_at']})
+        have = {x['id'] for x in c.execute('SELECT id FROM receipts')}
+        for ev in c.execute(
+                "SELECT entity_id,payload_json,created_at FROM audit_events "
+                "WHERE action='completed' AND payload_json LIKE '%evidence_receipts%' "
+                "ORDER BY id").fetchall():
+            try:
+                payload = json.loads(ev['payload_json'])
+            except json.JSONDecodeError:
+                continue
+            missing = [rid for rid in payload.get('evidence_receipts', [])
+                       if rid not in have]
+            if missing:
+                items.append({'kind': 'evidence_receipt_missing',
+                              'task_id': ev['entity_id'], 'receipt_ids': missing,
+                              'completed_at': ev['created_at']})
+    print(json.dumps({'ok': True, 'generated_at': t, 'count': len(items),
+                      'unverified': sum(1 for i in items if i['kind'] == 'no_receipts'),
+                      'items': items}, sort_keys=True))
+
 def policy(args):
     path=Path.home()/'.hermes/autopilot/policies'/f'{args.project.lower()}.yaml'
     if not path.exists(): print(json.dumps({'allowed':False,'reason':'no project policy'})); return
@@ -1261,6 +1308,7 @@ x=s.add_parser('notes-expired'); x.set_defaults(fn=notes_expired)
 x=s.add_parser('secret-scan'); x.add_argument('--all',action='store_true'); x.set_defaults(fn=secret_scan)
 x=s.add_parser('consolidate'); x.add_argument('--task',default=''); x.add_argument('--threshold',type=float,default=None); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=consolidate)
 x=s.add_parser('dup-tasks'); x.add_argument('--threshold',type=float,default=None); x.set_defaults(fn=dup_tasks)
+x=s.add_parser('unverified-completions'); x.set_defaults(fn=unverified_completions)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--backoff-base',type=int,default=60); x.add_argument('--backoff-cap',type=int,default=3600); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('escalate'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=escalate)
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)

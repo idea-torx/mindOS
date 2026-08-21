@@ -2049,6 +2049,23 @@ def similar_tasks(args):
               "threshold": threshold if threshold is not None else _near_dup_threshold(),
               "count": len(similar), "similar": similar})
 
+# Readiness statuses whose entry can be gated by a project policy file
+# (policies/<project>.yaml, `<action>_requires_user: true` — the same
+# convention ops.py policy reports on).
+_GATED_STATUS_ACTIONS = {"ready_to_merge": "merge", "ready_to_deploy": "deploy"}
+
+def _policy_requires_user(project: str, action: str) -> bool:
+    """True when the project's policy demands user approval for `action`.
+
+    Mirrors ops.py policy semantics. A missing or unreadable policy file
+    allows the transition so fleets without policies keep today's behavior.
+    """
+    try:
+        text = (POLICIES / f"{project.lower()}.yaml").read_text()
+    except OSError:
+        return False
+    return f"{action}_requires_user: true" in text
+
 def update(args):
     fields = {}
     for key in ("status", "next_action", "blocked_reason", "worktree", "branch", "pr_url", "owner",
@@ -2070,9 +2087,24 @@ def update(args):
         raise SystemExit("no updates supplied")
     fields["updated_at"] = now()
     with conn() as db:
-        task_row(db, args.id)
+        row = task_row(db, args.id)
+        # Policy gate: entering a gated readiness state is a side-effectful
+        # promise; when the project's policy demands a human, refuse until an
+        # explicit --approved-by names who accepted it. Re-stating the current
+        # status is not a transition and stays ungated.
+        gate_action = _GATED_STATUS_ACTIONS.get(fields.get("status"))
+        approval = None
+        if gate_action and row["status"] != fields["status"] \
+                and _policy_requires_user(row["project"], gate_action):
+            approver = (getattr(args, "approved_by", "") or "").strip()
+            if not approver:
+                raise SystemExit(
+                    f"project policy requires user approval for '{gate_action}' before "
+                    f"entering {fields['status']}; re-run with --approved-by <name>")
+            approval = {"policy_gate": gate_action, "approved_by": approver}
         db.execute(f"UPDATE tasks SET {', '.join(k+'=?' for k in fields)} WHERE id=?", (*fields.values(), args.id))
-        audit(db, "task", args.id, "updated", {k: v for k, v in fields.items() if k != "updated_at"})
+        audit(db, "task", args.id, "updated",
+              {**{k: v for k, v in fields.items() if k != "updated_at"}, **(approval or {})})
         json_out(_task_view(task_row(db, args.id)))
 
 def _require_live_lease(row, owner: str, verb: str) -> None:
@@ -2092,13 +2124,27 @@ def _require_not_foreign_lease(row, owner: str, verb: str) -> None:
         raise SystemExit("lease expired; reclaim before " + verb)
 
 def complete(args):
+    """Mark a leased task completed, optionally citing sealed evidence receipts.
+
+    A self-report is never execution truth without a receipt: `--receipt <id>`
+    (repeatable) links the completion to integrity-sealed receipts that must
+    already exist *on this task*, so the audited `completed` event carries
+    verifiable provenance instead of a bare claim. Unknown ids and receipts
+    belonging to other tasks are refused.
+    """
     recall_digest = _require_digest(getattr(args, "recall_digest", "") or "", "--recall-digest")
+    evidence = list(dict.fromkeys(getattr(args, "evidence_receipts", None) or []))
     with conn() as db:
         row = task_row(db, args.id)
         if row["status"] in {"completed", "cancelled"}:
             raise SystemExit(f"cannot complete terminal task: {row['status']}")
         _require_live_lease(row, args.owner, "completing")
         _require_epoch(row, getattr(args, "epoch", None), "completing")
+        for rid in evidence:
+            hit = db.execute("SELECT id FROM receipts WHERE id=? AND task_id=?",
+                             (rid, args.id)).fetchone()
+            if not hit:
+                raise SystemExit(f"evidence receipt not found on this task: {rid}")
         t = now()
         db.execute("UPDATE tasks SET status='completed',lease_owner='',lease_expires_at='',blocked_reason='',updated_at=? WHERE id=?", (t, args.id))
         # Downstream feedback: which queued dependents just became dispatchable.
@@ -2106,9 +2152,12 @@ def complete(args):
                        if d["status"] == "queued" and not unsatisfied_deps(db, d["id"]))
         audit(db, "task", args.id, "completed", {"owner": args.owner, "note": args.note,
                                                  "recall_digest": recall_digest or None,
-                                                 "newly_unblocked": newly})
+                                                 "newly_unblocked": newly,
+                                                 **({"evidence_receipts": evidence} if evidence else {})})
         out = _task_view(task_row(db, args.id))
         out["newly_unblocked"] = newly
+        if evidence:
+            out["evidence_receipts"] = evidence
         json_out(out)
 
 def cancel(args):
@@ -2881,6 +2930,9 @@ def metrics(args):
             "SELECT COUNT(*) n FROM audit_events WHERE action=?", (a,)).fetchone()["n"]
             for a in ("task_failed", "task_failed_terminal")}
         cp_len = _critical_path(db)["length"]
+        completed_no_receipt = db.execute(
+            "SELECT COUNT(*) n FROM tasks t WHERE t.status='completed' AND NOT EXISTS("
+            "SELECT 1 FROM receipts r WHERE r.task_id=t.id)").fetchone()["n"]
     json_out({
         "generated_at": t,
         "tasks_total": sum(by_status.values()),
@@ -2912,6 +2964,7 @@ def metrics(args):
         "handoffs_superseded": handoffs["superseded"] or 0,
         "handoffs_with_recall_proof": handoffs["proven"] or 0,
         "handoffs_acked_total": handoffs["acked"] or 0,
+        "completions_without_receipt": completed_no_receipt,
     })
 
 def list_tasks(args):
@@ -3096,8 +3149,8 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p=sub.add_parser("init"); p.set_defaults(fn=lambda a: (ensure(), json_out({"ok":True,"db":str(DB)})))
     p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--due-at",default=""); p.add_argument("--not-before",dest="not_before",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.add_argument("--tag",action="append",default=[],help="capability/scope tag (repeatable)"); p.set_defaults(fn=create)
-    p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.add_argument("--not-before",dest="not_before"); p.add_argument("--title"); p.add_argument("--description"); p.add_argument("--priority",choices=sorted(PRIORITIES)); p.add_argument("--project"); p.set_defaults(fn=update)
-    p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.set_defaults(fn=complete)
+    p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.add_argument("--not-before",dest="not_before"); p.add_argument("--title"); p.add_argument("--description"); p.add_argument("--priority",choices=sorted(PRIORITIES)); p.add_argument("--project"); p.add_argument("--approved-by",dest="approved_by",default="",help="user approving a policy-gated readiness transition (recorded in the audit chain)"); p.set_defaults(fn=update)
+    p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.add_argument("--receipt",dest="evidence_receipts",action="append",default=[],help="evidence receipt id on this task cited by the completion (repeatable)"); p.set_defaults(fn=complete)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
     p=sub.add_parser("fail"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.add_argument("--no-retry",dest="no_retry",action="store_true",help="skip the retry budget: fail terminally on the first attempt"); p.add_argument("--max-retries",dest="max_retries",type=int,default=3); p.add_argument("--backoff-base",dest="backoff_base",type=int,default=60); p.add_argument("--backoff-cap",dest="backoff_cap",type=int,default=3600); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=fail)
     p=sub.add_parser("block"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=block)

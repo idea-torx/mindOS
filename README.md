@@ -1309,6 +1309,31 @@ each sealed file so silent corruption or tampering surfaces as a
 - health-check result
 - approval record
 
+## Evidence-linked completions & policy-gated readiness
+
+A self-report is never execution truth without a receipt. `complete` accepts
+repeatable `--receipt <id>` flags citing integrity-sealed receipts **on the
+same task**; unknown ids and other tasks' receipts are refused, and the cited
+ids are recorded in the audited `completed` event so provenance survives in
+the chain. Omitting the flag keeps the legacy shape byte-compatible.
+
+Two observability paths make unverified completions visible instead of
+aspirational:
+
+- `metrics` reports `completions_without_receipt` — completed tasks with zero
+  receipts (bare agent claims);
+- `ops.py unverified-completions` sweeps the fleet read-only for both bare
+  claims (`no_receipts`) and completions whose cited evidence later vanished
+  (`evidence_receipt_missing`, e.g. deleted rows or partial restore).
+
+Project policies can gate side-effectful readiness promises: with
+`policies/<project>.yaml` containing `merge_requires_user: true` (or
+`deploy_requires_user`), `update --status ready_to_merge|ready_to_deploy`
+refuses until `--approved-by <name>` names who accepted it. The approver and
+gate kind are recorded in the audited `updated` event. Re-stating the current
+status is not a transition and stays ungated; projects without a policy file
+behave exactly as before.
+
 ## Next integration
 
 The hourly control tower should read this registry and report task changes. Existing project-specific policies should be added under `policies/` before allowing automatic side effects.

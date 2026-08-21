@@ -1852,6 +1852,54 @@ with tempfile.TemporaryDirectory() as td:
     plt = run('plan','--tag','autopilot-safe')
     assert [[t['id'] for t in w['tasks']] for w in plt['waves']] == [['pl-g1']], plt
     assert plt['unschedulable'] == [] and plt['scheduled_tasks'] == 1, plt   # completed prereq leaves the graph
+    # Evidence-linked completions & policy-gated readiness transitions:
+    # a self-report is never execution truth without a receipt, and project
+    # policies gate merge/deploy readiness behind explicit user approval.
+    run('create','--project','Plain','--title','no receipts needed','--id','ev-1')
+    run('claim','ev-1','--owner','tester','--minutes','5')
+    c1 = run('complete','ev-1','--owner','tester')                  # backward compatible shape
+    assert 'evidence_receipts' not in c1, c1
+    run('create','--project','Plain','--title','evidenced','--id','ev-2')
+    run('claim','ev-2','--owner','tester','--minutes','5')
+    rec2 = run('receipt','ev-2','--kind','verification','--payload','{"tests":"pass"}')
+    err = run_fail('complete','ev-2','--owner','tester','--receipt','nonexistent')
+    assert 'evidence receipt not found' in err                      # unknown receipt refused
+    run('create','--project','Plain','--title','other task','--id','ev-3')
+    rec3 = run('receipt','ev-3','--kind','log','--payload','{}')
+    err = run_fail('complete','ev-2','--owner','tester','--receipt',rec3['receipt_id'])
+    assert 'evidence receipt not found' in err                      # another task's receipt is not evidence
+    c2 = run('complete','ev-2','--owner','tester','--receipt',rec2['receipt_id'])
+    assert c2['evidence_receipts'] == [rec2['receipt_id']], c2
+    evc = next(e for e in run('show','ev-2')['audit'] if e['action'] == 'completed')
+    assert evc['payload']['evidence_receipts'] == [rec2['receipt_id']], evc   # provenance in the chain
+    uv = ops('unverified-completions')
+    kinds = {i['task_id']: i['kind'] for i in uv['items']}
+    assert kinds.get('ev-1') == 'no_receipts', uv                   # bare self-report flagged
+    assert kinds.get('ev-2') is None, uv                            # evidenced completion passes
+    m = run('metrics')
+    assert m['completions_without_receipt'] >= 1, m
+    # Cited evidence that later vanishes (deleted rows / partial restore) is observable.
+    import sqlite3 as _sq
+    with _sq.connect(Path(td) / 'state.db') as db:
+        db.execute('DELETE FROM receipts WHERE id=?', (rec2['receipt_id'],))
+    uv = ops('unverified-completions')
+    # Losing the receipt makes the completion both unbacked and broken-cited.
+    miss = next(i for i in uv['items'] if i['task_id'] == 'ev-2'
+                and i['kind'] == 'evidence_receipt_missing')
+    assert miss['receipt_ids'] == [rec2['receipt_id']], miss
+    # Policy gate: entering a gated readiness state consults policies/<project>.yaml.
+    pol = Path(td) / 'policies'; pol.mkdir(exist_ok=True)
+    (pol / 'gated.yaml').write_text('merge_requires_user: true\n')
+    run('create','--project','Gated','--title','needs approval','--id','pg-1')
+    err = run_fail('update','pg-1','--status','ready_to_merge')
+    assert 'user approval' in err and '--approved-by' in err        # silent readiness refused
+    up = run('update','pg-1','--status','ready_to_merge','--approved-by','leo')
+    assert up['status'] == 'ready_to_merge'
+    evu = next(e for e in run('show','pg-1')['audit'] if e['action'] == 'updated')
+    assert evu['payload']['approved_by'] == 'leo' \
+        and evu['payload']['policy_gate'] == 'merge', evu           # who approved, recorded durably
+    run('update','pg-1','--next-action','polish')                   # no status change: ungated
+    run('update','ev-3','--status','ready_to_deploy')               # policy-less project stays open
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
