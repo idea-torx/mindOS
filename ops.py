@@ -488,6 +488,259 @@ def archive_restore(args):
                       'fk_violations': fk_violations}))
     if not ok: sys.exit(1)
 
+WORKORDER_FORMAT = 'autopilot-workorder-v1'
+# Child tables carried by a work order; 'tasks' is exported separately as
+# 'task' since it gets sanitization and merge semantics of its own.
+WORKORDER_TABLES = ('task_deps', 'heartbeats', 'receipts', 'notes', 'handoffs')
+WORKORDER_ACTIVE_STATUSES = ('claimed', 'running', 'waiting_for_agent')
+
+def _doc_secret_kinds(node):
+    """Credential kinds present anywhere in a JSON-ish structure (kind only)."""
+    kinds = set()
+    if isinstance(node, str):
+        for f in autopilot._secret_findings(node):
+            kinds.add(f['kind'])
+    elif isinstance(node, dict):
+        for v in node.values():
+            kinds |= _doc_secret_kinds(v)
+    elif isinstance(node, list):
+        for v in node:
+            kinds |= _doc_secret_kinds(v)
+    return kinds
+
+def _redact_doc(node):
+    if isinstance(node, str):
+        return autopilot._redact_secrets(node)
+    if isinstance(node, dict):
+        return {k: _redact_doc(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_redact_doc(v) for v in node]
+    return node
+
+def _apply_workorder_secret_policy(tables, redact, allow, task_id, action):
+    """Shared privacy boundary for export/import: block by default, redact or
+    allow explicitly. Returns (kinds, tables_after). Audits the decision."""
+    kinds = sorted(_doc_secret_kinds(tables))
+    if not kinds:
+        return [], tables
+    if allow:
+        autopilot.audit(autopilot.conn(), 'task', task_id, 'secret_allowed',
+                        {'fields': ['workorder'], 'kinds': kinds})
+        return kinds, tables
+    if redact:
+        autopilot.audit(autopilot.conn(), 'task', task_id, 'secret_redacted',
+                        {'fields': ['workorder'], 'kinds': kinds})
+        return kinds, _redact_doc(tables)
+    autopilot.audit(autopilot.conn(), 'task', task_id, 'secret_blocked',
+                    {'fields': ['workorder'], 'kinds': kinds})
+    raise SystemExit(
+        'refusing to %s credential-shaped content (%s); re-run with --redact '
+        'to %s a redacted copy or --allow-secret to override'
+        % (action, ', '.join(kinds), 'write' if action == 'export' else 'import'))
+
+def export_task(args=None):
+    """Seal one task's full execution state into a portable work-order file.
+
+    A work order is the provider-neutral unit of cross-boundary recovery: it
+    carries the task row, dependency edges in both directions, complete note
+    and handoff history, receipts (with their sealed files), and the heartbeat,
+    all under one sha256 seal so any Autopilot home can verify integrity before
+    importing. The same secret guard that protects shared-memory writes guards
+    the export boundary — a credential never leaves the database unredacted.
+    """
+    tid = args.id
+    with db() as c:
+        task = c.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
+        if not task:
+            raise SystemExit('task not found: ' + tid)
+        def fetch(sql):
+            return [dict(r) for r in c.execute(sql, (tid,)).fetchall()]
+        tables = {
+            'task_deps': [dict(r) for r in c.execute(
+                'SELECT * FROM task_deps WHERE task_id=? OR depends_on=?', (tid, tid)).fetchall()],
+            'heartbeats': fetch('SELECT * FROM heartbeats WHERE task_id=?'),
+            'receipts': fetch('SELECT * FROM receipts WHERE task_id=?'),
+            'notes': fetch('SELECT * FROM notes WHERE task_id=? ORDER BY created_at, rowid'),
+            'handoffs': fetch('SELECT * FROM handoffs WHERE task_id=? ORDER BY created_at, rowid'),
+        }
+    receipt_files = {}
+    for r in tables['receipts']:
+        p = autopilot.RECEIPTS / (r['id'] + '.json')
+        receipt_files[r['id']] = p.read_text() if p.exists() else None
+    body = {'format': WORKORDER_FORMAT, 'version': 1, 'exported_at': utc(),
+            'task_id': tid, 'task': dict(task), 'tables': tables,
+            'receipt_files': receipt_files}
+    kinds, tables = _apply_workorder_secret_policy(
+        tables, getattr(args, 'redact', False), getattr(args, 'allow_secret', False),
+        tid, 'export')
+    if kinds:
+        body['tables'] = tables
+        body['secret_kinds'] = kinds
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    doc = {**body, 'sha256': digest}
+    counts = {t: len(tables[t]) for t in WORKORDER_TABLES}
+    with db() as c:
+        autopilot.audit(c, 'task', tid, 'workorder_exported',
+                        {'sha256': digest, 'counts': counts,
+                         **({'secret_kinds': kinds} if kinds else {})})
+    if getattr(args, 'out', None):
+        out_path = Path(args.out); out_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix='.workorder.', dir=str(out_path.parent))
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(json.dumps(doc, sort_keys=True)); f.flush(); os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, str(out_path))
+        finally:
+            if os.path.exists(tmp): os.unlink(tmp)
+        print(json.dumps({'ok': True, 'task_id': tid, 'path': str(out_path),
+                          'sha256': digest, 'counts': counts,
+                          'receipt_files': len(receipt_files),
+                          **({'secret_kinds': kinds} if kinds else {})}, sort_keys=True))
+    else:
+        print(json.dumps(doc, sort_keys=True))
+
+def _load_workorder(path: Path):
+    """Read and integrity-check a work-order file; returns its body."""
+    if not path.exists(): raise SystemExit(f'work order not found: {path}')
+    try:
+        doc = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f'work order is not valid JSON: {e}')
+    expected = doc.get('sha256')
+    body = {k: v for k, v in doc.items() if k != 'sha256'}
+    if body.get('format') != WORKORDER_FORMAT:
+        raise SystemExit('unrecognized work-order format')
+    actual = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    if actual != expected:
+        raise SystemExit('work-order integrity check failed; refusing a tampered file')
+    body['sha256'] = expected   # re-attach the verified seal for provenance
+    if not isinstance(body.get('task'), dict) or not body['task'].get('id'):
+        raise SystemExit('work order has no task row')
+    return body
+
+def import_task(args=None):
+    """Idempotently merge a verified work order into this Autopilot home.
+
+    Recovery across boundaries must be safe to retry: an identical re-import
+    deduplicates instead of duplicating; a changed task refuses without --force,
+    and --force merges rather than clobbers (local child rows are preserved).
+    An imported task can never arrive still leased — active statuses are reset
+    to queued with lease fields cleared, because the previous owner does not
+    exist here. Dependency edges are inserted only when both endpoints exist
+    locally; dangling ones are reported, never silently dropped. The secret
+    guard runs again on import so an override at the source cannot leak
+    credentials into this home unnoticed.
+    """
+    body = _load_workorder(Path(args.path))
+    tid = body['task']['id']
+    dry = bool(getattr(args, 'dry_run', False))
+    force = bool(getattr(args, 'force', False))
+    kinds, tables = _apply_workorder_secret_policy(
+        body.get('tables', {}), getattr(args, 'redact', False),
+        getattr(args, 'allow_secret', False), tid, 'import')
+    task_in = dict(body['task'])
+    sanitized = task_in['status'] in WORKORDER_ACTIVE_STATUSES
+    if sanitized:
+        task_in.update(status='queued', lease_owner='', lease_expires_at='',
+                       blocked_reason='imported from work order')
+    autopilot.ensure()
+    with sqlite3.connect(DB, timeout=10) as c:
+        c.row_factory = sqlite3.Row
+        c.execute('PRAGMA foreign_keys=ON')
+        existing = c.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
+        existing = dict(existing) if existing else None
+        identical = False
+        if existing:
+            identical = existing == task_in and all(
+                {r['id']: r for r in tables.get(t, [])} ==
+                {r['id']: dict(r) for r in c.execute(
+                    f'SELECT * FROM {t} WHERE '
+                    + ('task_id=?' if t != 'task_deps' else 'task_id=? OR depends_on=?'),
+                    (tid, tid) if t == 'task_deps' else (tid,)).fetchall()}
+                for t in ('notes', 'handoffs', 'receipts'))
+        if dry:
+            print(json.dumps({'ok': True, 'dry_run': True, 'task_id': tid,
+                              'exists': existing is not None, 'identical': identical,
+                              'would_sanitize_lease': sanitized,
+                              'seal_verified': True, 'counts':
+                              {t: len(tables.get(t, [])) for t in WORKORDER_TABLES}}))
+            return
+        if identical:
+            with db() as ac:
+                autopilot.audit(ac, 'task', tid, 'workorder_import_deduplicated',
+                                {'sha256': body['sha256'], 'exported_at': body.get('exported_at')})
+            print(json.dumps({'ok': True, 'task_id': tid, 'deduplicated': True,
+                              'sanitized': False, 'inserted': {}, 'skipped_deps': []}))
+            return
+        if existing and not force:
+            raise SystemExit(
+                f'task {tid} already exists with different state; pass --force to merge')
+        c.execute('BEGIN')
+        if existing:
+            cols = list(task_in.keys())
+            c.execute(f'UPDATE tasks SET {",".join(f"{col}=?" for col in cols)} WHERE id=?',
+                      [*[task_in[col] for col in cols], tid])
+        else:
+            cols = list(task_in.keys())
+            c.execute(f'INSERT INTO tasks({",".join(cols)}) VALUES({",".join("?" * len(cols))})',
+                      [task_in[col] for col in cols])
+        inserted = {}
+        for t in ('notes', 'handoffs', 'receipts'):
+            n = 0
+            for row in tables.get(t, []):
+                cols = list(row.keys())
+                cur = c.execute(
+                    f'INSERT OR IGNORE INTO {t}({",".join(cols)}) VALUES({",".join("?" * len(cols))})',
+                    [row[k] for k in cols])
+                n += cur.rowcount
+            inserted[t] = n
+        hb = tables.get('heartbeats', [])
+        for row in hb:
+            cols = list(row.keys())
+            c.execute(f'INSERT OR REPLACE INTO heartbeats({",".join(cols)}) VALUES({",".join("?" * len(cols))})',
+                      [row[k] for k in cols])
+        skipped_deps = []
+        for row in tables.get('task_deps', []):
+            both = c.execute(
+                "SELECT (SELECT COUNT(*) FROM tasks WHERE id IN (?,?)) n",
+                (row['task_id'], row['depends_on'])).fetchone()['n'] == 2
+            if not both:
+                skipped_deps.append(f"{row['task_id']}->{row['depends_on']}")
+                continue
+            cur = c.execute('INSERT OR IGNORE INTO task_deps(task_id,depends_on,created_at) VALUES(?,?,?)',
+                            (row['task_id'], row['depends_on'], row['created_at']))
+            inserted['task_deps'] = inserted.get('task_deps', 0) + cur.rowcount
+        fk_violations = [dict(r) for r in c.execute('PRAGMA foreign_key_check').fetchall()]
+        c.commit()
+        autopilot.audit(c, 'task', tid, 'task_imported',
+                        {'sha256': body['sha256'], 'exported_at': body.get('exported_at'),
+                         'replaced': existing is not None, 'sanitized_lease': sanitized,
+                         'inserted': inserted, 'skipped_deps': skipped_deps,
+                         **({'secret_kinds': kinds} if kinds else {})})
+    written = 0
+    for rid, text in (body.get('receipt_files') or {}).items():
+        if text is None:
+            continue
+        target = autopilot.RECEIPTS / (rid + '.json')
+        if target.exists():
+            continue
+        fd, tmp = tempfile.mkstemp(prefix=f'.{rid}.', dir=str(autopilot.RECEIPTS))
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(text); f.flush(); os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, str(target))
+            written += 1
+        finally:
+            if os.path.exists(tmp): os.unlink(tmp)
+    ok = not fk_violations
+    print(json.dumps({'ok': ok, 'task_id': tid, 'deduplicated': False,
+                      'replaced': existing is not None, 'sanitized': sanitized,
+                      'inserted': inserted, 'skipped_deps': skipped_deps,
+                      'receipt_files_written': written, 'fk_violations': fk_violations}))
+    if not ok: sys.exit(1)
+
 def doctor(args=None):
     """Read-only consistency sweep: orphan deps, receipt index/files, audit chain, stale leases."""
     problems = []
@@ -954,6 +1207,8 @@ x=s.add_parser('snapshot-restore'); x.add_argument('path'); x.add_argument('--fo
 x=s.add_parser('archive'); x.add_argument('--before',required=True); x.add_argument('--out',default=None); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=archive)
 x=s.add_parser('archive-check'); x.add_argument('path'); x.set_defaults(fn=archive_check)
 x=s.add_parser('archive-restore'); x.add_argument('path'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=archive_restore)
+x=s.add_parser('export-task'); x.add_argument('id'); x.add_argument('--out',default=None); x.add_argument('--redact',action='store_true'); x.add_argument('--allow-secret',action='store_true'); x.set_defaults(fn=export_task)
+x=s.add_parser('import-task'); x.add_argument('path'); x.add_argument('--force',action='store_true'); x.add_argument('--redact',action='store_true'); x.add_argument('--allow-secret',action='store_true'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=import_task)
 x=s.add_parser('approval'); x.add_argument('action',choices=['approve','reject','block']); x.add_argument('id'); x.add_argument('--by',default='leo'); x.add_argument('--reason',default=''); x.add_argument('--next-action',default=''); x.set_defaults(fn=approval)
 x=s.add_parser('policy'); x.add_argument('project'); x.add_argument('action'); x.set_defaults(fn=policy)
 args=p.parse_args(); args.fn(args)

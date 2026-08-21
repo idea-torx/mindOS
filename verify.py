@@ -1477,6 +1477,100 @@ with tempfile.TemporaryDirectory() as td:
     err = run_fail('verify-chain','--checkpoint',cp['path'])
     assert 'integrity check failed' in err
     cpf.write_text(orig_cp)
+    # Portable work orders: sealed single-task export/import across homes.
+    run('create','--project','Verify','--title','work order source','--id','wo-dep')
+    run('create','--project','Verify','--title','work order traveler','--id','wo-1')
+    run('dep','wo-1','wo-dep')
+    run('note','wo-1','--content','traveler fact one')
+    run('handoff','wo-1','--from-agent','agent-a','--to-agent','agent-b',
+        '--objective','carry this work across the boundary')
+    rec = run('receipt','wo-1','--kind','verification','--payload','{"stage":"pre-export"}')
+    run('update','wo-dep','--status','completed')
+    run('claim','wo-1','--owner','traveler','--minutes','5')     # active status
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        db.execute("INSERT INTO task_deps(task_id,depends_on,created_at)"
+                   " VALUES('wo-1','ghost-task','2026-01-01T00:00:00+00:00')")
+    wo_path = Path(td) / 'wo-1.json'
+    exp = ops('export-task','wo-1','--out',str(wo_path))
+    assert exp['ok'] is True and exp['sha256'] and exp['counts']['notes'] == 1 \
+        and exp['counts']['receipts'] == 1 and exp['counts']['task_deps'] == 2, exp
+    wo_dep_path = Path(td) / 'wo-dep.json'
+    ops('export-task','wo-dep','--out',str(wo_dep_path))
+    assert wo_path.stat().st_mode & 0o077 == 0
+    # Tamper evidence: a mutated work order is refused before any import.
+    orig_wo = wo_path.read_text()
+    tampered = json.loads(orig_wo); tampered['task']['title'] = 'tampered'
+    wo_path.write_text(json.dumps(tampered, sort_keys=True))
+    err = ops_fail('import-task',str(wo_path))
+    assert 'integrity check failed' in err, err
+    err = ops_fail('import-task',str(wo_path),'--force')
+    assert 'integrity check failed' in err, '--force must not bypass the seal'
+    wo_path.write_text(orig_wo)
+    # Cross-home import into a fresh Autopilot state directory.
+    home2 = Path(td) / 'home2'; home2.mkdir()
+    env2 = os.environ.copy(); env2['HERMES_AUTOPILOT_HOME'] = str(home2)
+    def ops2(*a):
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=env2, text=True, capture_output=True)
+        assert p.returncode == 0, (a, p.stdout, p.stderr)
+        return json.loads(p.stdout)
+    def ops2_fail(*a):
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=env2, text=True, capture_output=True)
+        assert p.returncode != 0, (a, p.stdout, p.stderr)
+        return p.stderr.strip() or p.stdout.strip()
+    def run2(*a):
+        p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *a], env=env2, text=True, capture_output=True)
+        if p.returncode: raise AssertionError((a, p.stdout, p.stderr))
+        return json.loads(p.stdout)
+    plan = ops2('import-task',str(wo_path),'--dry-run')
+    assert plan['seal_verified'] is True and plan['exists'] is False \
+        and plan['would_sanitize_lease'] is True, plan
+    # Prerequisite first: the edge survives only when both endpoints exist.
+    dep_imp = ops2('import-task',str(wo_dep_path))
+    assert dep_imp['ok'] is True and dep_imp['sanitized'] is False, dep_imp
+    imp = ops2('import-task',str(wo_path))
+    assert imp['ok'] is True and imp['deduplicated'] is False and imp['sanitized'] is True, imp
+    assert imp['skipped_deps'] == ['wo-1->ghost-task'], imp   # dangling edge reported, not dropped
+    t2 = run2('show','wo-1')
+    assert t2['status'] == 'queued' and t2['lease_owner'] == '' \
+        and t2['blocked_reason'] == 'imported from work order', t2
+    assert len(t2['receipts']) == 1 and t2['receipts'][0]['id'] == rec['receipt_id']
+    assert (home2 / 'receipts' / (rec['receipt_id'] + '.json')).exists()
+    assert any(n['content'] == 'traveler fact one' for n in run2('notes','wo-1'))
+    assert t2['handoff']['objective'] == 'carry this work across the boundary'
+    dep_ids = {d['id'] for d in t2['dependencies']}
+    assert 'wo-dep' in dep_ids, t2
+    assert next(d for d in t2['dependencies'] if d['id'] == 'wo-dep')['satisfied'] == 1
+    assert any(e['action'] == 'task_imported' for e in t2['audit'])
+    # Idempotency: re-importing the identical work order deduplicates.
+    again = ops2('import-task',str(wo_path))
+    assert again['deduplicated'] is True and again['sanitized'] is False, again
+    assert len(run2('notes','wo-1')) == 1, 're-import must not duplicate child rows'
+    # Divergence: new note at the source; plain import refuses, --force merges.
+    run('note','wo-1','--content','traveler fact two')
+    exp2 = ops('export-task','wo-1','--out',str(wo_path))
+    assert exp2['counts']['notes'] == 2, exp2
+    err = ops2_fail('import-task',str(wo_path))
+    assert 'different state' in err and '--force' in err, err
+    merged = ops2('import-task',str(wo_path),'--force')
+    assert merged['replaced'] is True and merged['inserted']['notes'] == 1, merged
+    notes2 = run2('notes','wo-1')
+    assert len(notes2) == 2, 'merge preserves local rows and adds only the new one'
+    # Privacy boundary holds on both ends of the transfer.
+    run('note','wo-1','--content','key AKIAIOSFODNN7EXAMPLE pinned','--allow-secret')
+    err = ops_fail('export-task','wo-1','--out',str(wo_path))
+    assert 'aws_access_key' in err and '--redact' in err, err
+    expr = ops('export-task','wo-1','--out',str(wo_path),'--redact')
+    assert expr['secret_kinds'] == ['aws_access_key'], expr
+    wo_raw = Path(td) / 'wo-1-raw.json'
+    rawexp = ops('export-task','wo-1','--out',str(wo_raw),'--allow-secret')
+    assert rawexp['secret_kinds'] == ['aws_access_key'], rawexp
+    err = ops2_fail('import-task',str(wo_raw))
+    assert 'aws_access_key' in err, 'import re-runs the guard even on a sealed file'
+    imr = ops2('import-task',str(wo_path),'--redact','--force')
+    assert imr['ok'] is True and imr['inserted']['notes'] == 1, imr
+    assert 'secret_kinds' not in imr, 'an already-redacted file must pass the guard cleanly'
+    stored = next(n for n in run2('notes','wo-1') if 'AKIA' in n['content'] or 'REDACTED' in n['content'])
+    assert '[REDACTED:aws_access_key]' in stored['content'] and 'AKIAIOSFODNN7EXAMPLE' not in stored['content'], stored
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

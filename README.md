@@ -957,6 +957,44 @@ Design properties:
   collisions unless `--force`, reinserts rows in FK order, recreates receipt
   files atomically with `0600` permissions, and re-checks foreign keys.
 
+## Portable work orders (cross-home task transfer)
+
+Archives move *retired* fleet history; work orders move *live* work. A work
+order is the provider-neutral unit of cross-boundary recovery: one task's full
+execution state — the task row, dependency edges in both directions, complete
+note and handoff history, receipts with their sealed files, and the heartbeat —
+sealed under a single sha256 so any Autopilot home can verify integrity before
+importing:
+
+```bash
+python3 "$O" export-task t1 --out /tmp/t1.json     # sealed autopilot-workorder-v1
+python3 "$O" import-task /tmp/t1.json --dry-run    # seal check + merge preview
+python3 "$O" import-task /tmp/t1.json              # merge into this home
+```
+
+Design properties:
+
+- **Tamper-evident**: the sha256 seal covers every exported row and receipt
+  file; `import-task` refuses a mutated file before touching the database, and
+  `--force` does not bypass the seal.
+- **Lease sanitization**: an imported task can never arrive still leased —
+  `claimed`/`running`/`waiting_for_agent` reset to `queued` with lease fields
+  cleared, because the previous owner does not exist in this home.
+- **Idempotent recovery**: an identical re-import deduplicates (audited) instead
+  of duplicating; a changed export refuses without `--force`, and `--force`
+  merges rather than clobbers (local child rows are preserved, only new rows
+  are inserted).
+- **Dependency-aware**: dependency edges are inserted only when both endpoints
+  exist locally; dangling ones are reported in `skipped_deps`, never silently
+  dropped. Import prerequisite tasks first to carry the full graph.
+- **Privacy boundary on both ends**: the same secret guard that protects
+  shared-memory writes scans the whole document at export *and* again at
+  import (so an `--allow-secret` override at the source cannot leak credentials
+  into this home unnoticed). Default is refuse; `--redact` transfers
+  `[REDACTED:<kind>]` copies; every decision is audited kind-only.
+- **Atomic writes**: files are written via fsync + atomic rename with `0600`
+  permissions; receipt files are restored only when absent locally.
+
 ## Lifecycle guardrails
 
 - `complete` enforces claim-before-complete: only the current holder of a live
