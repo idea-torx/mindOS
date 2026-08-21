@@ -2353,6 +2353,98 @@ with tempfile.TemporaryDirectory() as td:
     import shutil
     shutil.rmtree(race_td, ignore_errors=True)
 
+    # Session ingestion: read-only adapter over external agent transcripts.
+    import hashlib as _hl
+    sess_root = Path(td) / 'session-store' / 'proj-a'
+    sess_root.mkdir(parents=True)
+    def _sess_w(name, lines):
+        p = sess_root / name
+        p.write_text("\n".join(lines) + "\n")
+        return p
+    clean = _sess_w('sess-clean.jsonl', [
+        json.dumps({"type": "user", "message": {"role": "user", "content": "please fix the login redirect bug in the auth module"}, "timestamp": "2026-08-20T10:00:00Z"}),
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "found the stale token check in session.py"}, {"type": "tool_use", "id": "t1"}]}, "timestamp": "2026-08-20T10:01:00Z"}),
+        json.dumps({"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "..."}]}}),
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "the fix clears the redirect cookie in session.py"}, "timestamp": "2026-08-20T10:02:00Z"}),
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "the fix clears the redirect cookie in session.py"}, "timestamp": "2026-08-20T10:02:05Z"}),
+        'not json at all',
+    ])
+    secret = _sess_w('sess-secret.jsonl', [
+        json.dumps({"role": "user", "content": "deploy with API_KEY=sk-live-abc123456 now"}),
+    ])
+    _sess_w('sess-junk.jsonl', ['{"weird": true}', '{"also": false}'])
+    src_hashes = {p.name: _hl.sha256(p.read_bytes()).hexdigest() for p in sess_root.iterdir()}
+    # Scan: redacted inventory, kind-only secret findings, values never leave.
+    inv = run('session-scan', '--root', str(sess_root))
+    assert inv['totals']['discovered'] == 3 and inv['totals']['indexable'] == 2, inv['totals']
+    assert inv['totals']['secret_kinds'] == ['credential_assignment'], inv['totals']
+    assert inv['files'][0]['status'] == 'indexed' or any(f['status'] == 'unsupported' for f in inv['files'])
+    inv_flat = json.dumps(inv)
+    assert 'sk-live' not in inv_flat and 'API_KEY' not in inv_flat, 'inventory leaked a secret value'
+    # Dry-run ingest touches nothing.
+    plan = run('session-ingest', '--source', 'claude-code', '--root', str(sess_root), '--project', 'Auth')
+    assert plan['dry_run'] is True and 'applied_files' not in plan
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        assert db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0] == 0
+    # Fail closed on credential-shaped content.
+    err = run_fail('session-ingest', '--source', 'claude-code', '--root', str(sess_root), '--apply')
+    assert 'credential-shaped' in err
+    # Redacted apply: tool outputs skipped, dup collapsed, malformed counted.
+    ing = run('session-ingest', '--source', 'claude-code', '--root', str(sess_root), '--project', 'Auth', '--apply', '--redact')
+    assert ing['dry_run'] is False and ing['applied_files'] == 2, ing
+    assert ing['totals']['unsupported'] == 1 and ing['totals']['duplicates_collapsed'] == 1
+    assert ing['totals']['malformed_lines'] == 3 and ing['totals']['tool_results_skipped'] == 3
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        db.row_factory = sqlite3.Row
+        vals = [r[0] for r in db.execute("SELECT content FROM session_messages")]
+        assert not any('sk-live' in v or 'API_KEY' in v for v in vals), 'raw secret reached the cache'
+        assert sum('[REDACTED:credential_assignment]' in v for v in vals) == 1
+        srow = db.execute("SELECT * FROM sessions WHERE session_id='sess-clean'").fetchone()
+        assert srow['message_count'] == 3 and srow['tool_results_skipped'] == 3
+        assert db.execute("SELECT COUNT(*) FROM audit_events WHERE action='session_ingested'").fetchone()[0] == 2
+    # Idempotent re-run: everything unchanged, nothing rewritten.
+    ing2 = run('session-ingest', '--source', 'claude-code', '--root', str(sess_root), '--project', 'Auth', '--apply', '--redact')
+    assert ing2['applied_files'] == 0 and ing2['totals']['unchanged'] == 2, ing2
+    # Search with provenance + role filter (FTS path).
+    hits = run('search-sessions', 'redirect cookie', '--rank', '--source', 'claude-code')
+    assert len(hits) == 1 and hits[0]['session_id'] == 'sess-clean' and hits[0]['role'] == 'assistant'
+    assert run('search-sessions', 'cookie', '--role', 'user') == []      # role filter
+    assert len(run('search-sessions', 'cookie', '--role', 'assistant')) == 1
+    # Context-pack protocol: sessions surface like notes/handoffs, flag-gated.
+    stask = run('create', '--project', 'Auth', '--title', 'fix login redirect bug in auth module', '--id', 'sess-t1')
+    pack = run('context', 'sess-t1', '--related-sessions', '2')
+    assert pack['related_sessions_matched'] >= 1 and pack['related_sessions_packed'] <= 2
+    legacy_pack = run('context', 'sess-t1')
+    assert 'related_sessions' not in legacy_pack, 'flag-gated key leaked into legacy shape'
+    rb = run('recall', 'sess-t1', '--agent', 'codex', '--related-sessions', '2')
+    dig = rb['digest']
+    assert run('recall-verify', 'sess-t1', '--digest', dig, '--agent', 'codex', '--related-sessions', '2')['fresh'] is True
+    # A newly ingested matching session is real context drift -> digest goes stale.
+    _sess_w('sess-later.jsonl', [
+        json.dumps({"role": "user", "content": "auth module login redirect followup from review", "timestamp": "2026-08-21T09:00:00Z"}),
+    ])
+    run('session-ingest', '--source', 'claude-code', '--root', str(sess_root), '--project', 'Auth', '--apply', '--redact')
+    assert run('recall-verify', 'sess-t1', '--digest', dig, '--agent', 'codex', '--related-sessions', '2')['fresh'] is False
+    # Changed source file re-indexes atomically instead of duplicating.
+    clean.open('a').write(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": "update: redirect cookie fix merged"}, "timestamp": "2026-08-21T11:00:00Z"}) + "\n")
+    src_hashes[clean.name] = _hl.sha256(clean.read_bytes()).hexdigest()  # our own edit
+    ing3 = run('session-ingest', '--source', 'claude-code', '--root', str(sess_root), '--project', 'Auth', '--apply', '--redact')
+    assert ing3['applied_files'] == 1
+    m = run('metrics')
+    assert m['sessions_indexed'] == 3 and m['session_messages_indexed'] == 6, m
+    # --since skips older files at the plan level.
+    fut = run('session-ingest', '--source', 'claude-code', '--root', str(sess_root), '--since', '2099-01-01T00:00:00+00:00')
+    assert fut['totals']['skipped_older_than'] == 4 and fut['totals']['indexable'] == 0
+    # Sources were never mutated by any ingest.
+    src_hashes['sess-later.jsonl'] = _hl.sha256((sess_root / 'sess-later.jsonl').read_bytes()).hexdigest()
+    for p in sess_root.iterdir():
+        assert _hl.sha256(p.read_bytes()).hexdigest() == src_hashes[p.name], f'source mutated: {p.name}'
+    # Doctor's FTS drift sweep covers the session index too (the DB carries
+    # deliberate problems from earlier failure-injection stages, so filter).
+    doc = ops('doctor')
+    assert not any(p['kind'] == 'fts_index_drift' and p['table'] == 'session_messages'
+                   for p in doc['problems']), doc
+
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

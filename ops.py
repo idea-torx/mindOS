@@ -861,8 +861,11 @@ def doctor(args=None):
         for r in c.execute(
             "SELECT task_id,COUNT(*) n FROM handoffs WHERE superseded_by='' GROUP BY task_id HAVING n>1"):
             problems.append({'kind': 'multiple_live_handoffs', 'task_id': r['task_id'], 'count': r['n']})
-        for table, fts in (('notes', 'notes_fts'), ('tasks', 'tasks_fts'), ('handoffs', 'handoffs_fts')):
-            ready = autopilot._handoffs_fts_ready(c) if fts == 'handoffs_fts' else autopilot._fts_ready(c)
+        for table, fts in (('notes', 'notes_fts'), ('tasks', 'tasks_fts'), ('handoffs', 'handoffs_fts'),
+                           ('session_messages', 'session_messages_fts')):
+            ready = (autopilot._handoffs_fts_ready(c) if fts == 'handoffs_fts'
+                     else autopilot._sessions_fts_ready(c) if fts == 'session_messages_fts'
+                     else autopilot._fts_ready(c))
             if not ready:
                 continue
             src = {r[0] for r in c.execute(f'SELECT rowid FROM {table}')}
@@ -1537,7 +1540,11 @@ def migrate_inventory(args=None):
                 'healthy': sum(1 for s in sources if s['status'] == 'ok'),
                 'blocked': sum(1 for s in sources if s['status'] != 'ok'),
                 'secret_kinds': sorted({k for s in sources for k in s['secret_kinds']})}}
-    digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    # The seal excludes created_at so identical trees reproduce a byte-identical
+    # manifest (modulo the timestamp), letting interrupted migrations resume
+    # against the same sealed plan; every content field is still covered.
+    digest = hashlib.sha256(json.dumps(
+        {k: v for k, v in body.items() if k != 'created_at'}, sort_keys=True).encode()).hexdigest()
     doc = {**body, 'sha256': digest}
     autopilot.ensure()
     with db() as c:
@@ -1577,7 +1584,10 @@ def _load_inventory(path: Path):
     body = {k: v for k, v in doc.items() if k != 'sha256'}
     if body.get('format') != MIGRATION_INVENTORY_FORMAT:
         raise SystemExit('unrecognized inventory format')
-    actual = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    # Mirror the sealing rule: created_at is outside the seal (see
+    # migrate_inventory), so re-verification excludes it too.
+    actual = hashlib.sha256(json.dumps(
+        {k: v for k, v in body.items() if k != 'created_at'}, sort_keys=True).encode()).hexdigest()
     if actual != expected:
         raise SystemExit('inventory integrity check failed; refusing a tampered manifest')
     body['sha256'] = expected   # re-attach the verified seal for provenance

@@ -121,6 +121,34 @@ CREATE TABLE IF NOT EXISTS handoffs (
   superseded_by TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_handoffs_task ON handoffs(task_id);
+-- Session-ingestion cache (read-only adapter over external agent session
+-- stores). Derived data only: the source stores are never mutated and raw
+-- conversations are never execution truth; rows are rebuildable from source.
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  source TEXT NOT NULL DEFAULT '',
+  profile TEXT NOT NULL DEFAULT '',
+  project TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  file_hash TEXT NOT NULL DEFAULT '',
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  message_count INTEGER NOT NULL DEFAULT 0,
+  tool_results_skipped INTEGER NOT NULL DEFAULT 0,
+  first_at TEXT NOT NULL DEFAULT '',
+  last_at TEXT NOT NULL DEFAULT '',
+  ingested_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
+CREATE TABLE IF NOT EXISTS session_messages (
+  session_row TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  content TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  at TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (session_row, seq)
+);
 """
 # Full-text retrieval (FTS5, stdlib sqlite3): external-content indexes over
 # notes/tasks kept in sync by triggers. Applied only when the SQLite build
@@ -167,6 +195,17 @@ END;
 CREATE TRIGGER IF NOT EXISTS handoffs_fts_ad AFTER DELETE ON handoffs BEGIN
   INSERT INTO handoffs_fts(handoffs_fts,rowid,objective,status,from_agent,to_agent)
   VALUES('delete',old.rowid,old.objective,old.status,old.from_agent,old.to_agent);
+END;
+-- Ingested session messages are immutable once written (a changed source file
+-- is re-indexed as delete+insert), so no UPDATE trigger is needed.
+CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(
+  content, role, content='session_messages', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS session_messages_fts_ai AFTER INSERT ON session_messages BEGIN
+  INSERT INTO session_messages_fts(rowid,content,role) VALUES(new.rowid,new.content,new.role);
+END;
+CREATE TRIGGER IF NOT EXISTS session_messages_fts_ad AFTER DELETE ON session_messages BEGIN
+  INSERT INTO session_messages_fts(session_messages_fts,rowid,content,role) VALUES('delete',old.rowid,old.content,old.role);
 END;
 """
 STATUSES = {"queued", "claimed", "running", "waiting_for_agent", "waiting_for_user", "waiting_for_review", "ready_to_merge", "ready_to_deploy", "blocked", "completed", "failed", "cancelled"}
@@ -240,16 +279,23 @@ def _handoffs_fts_ready(db) -> bool:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='handoffs_fts'")}
     return "handoffs_fts" in names
 
+def _sessions_fts_ready(db) -> bool:
+    """True when the ingested-session-message FTS index exists."""
+    names = {r[0] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='session_messages_fts'")}
+    return "session_messages_fts" in names
+
 def _ensure_fts(db) -> None:
     """Create FTS indexes when supported; rebuild once on first creation so
     pre-existing rows become searchable. Silently skips on non-FTS5 builds."""
     try:
-        complete = _fts_ready(db) and _handoffs_fts_ready(db)
+        complete = _fts_ready(db) and _handoffs_fts_ready(db) and _sessions_fts_ready(db)
         db.executescript(FTS_SCHEMA)
         if not complete:
             db.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')")
             db.execute("INSERT INTO tasks_fts(tasks_fts) VALUES('rebuild')")
             db.execute("INSERT INTO handoffs_fts(handoffs_fts) VALUES('rebuild')")
+            db.execute("INSERT INTO session_messages_fts(session_messages_fts) VALUES('rebuild')")
     except sqlite3.OperationalError:
         pass  # FTS5 unavailable: search falls back to LIKE
 
@@ -1195,7 +1241,7 @@ def _dep_context_cost(entry: dict) -> int:
 def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
                 rerank: bool = False, recency_half_life_hours: float = 168.0,
                 pinned_boost: float = 0.5, rel_handoffs: int = 0,
-                dep_context: int = 0) -> dict:
+                dep_context: int = 0, rel_sessions: int = 0) -> dict:
     """Assemble the prompt-ready context bundle for a task within a char budget.
 
     Shared by `context` and `recall`: task summary header + unsatisfied
@@ -1212,6 +1258,9 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
     contribute their verified evidence (live handoff + latest sealed receipt)
     after related handoffs within the same budget; the same flag-gated key
     rule keeps legacy packs byte-identical.
+    With rel_sessions > 0, up to that many ingested session-message snippets
+    (matching this task's text) pack after dep context under the same rules —
+    raw conversation is the freshest record of what agents actually tried.
     """
     budget = max(0, budget)
     rel_limit = max(0, rel_limit)
@@ -1239,6 +1288,8 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
     related_handoffs = _related_handoff_candidates(
         db, task_id, pack_text, max(0, rel_handoffs), rel_scope) if rel_handoffs > 0 else []
     dep_ctx = _dep_context_candidates(db, task_id, max(0, dep_context)) if dep_context > 0 else []
+    rel_sessions_list = (_related_session_candidates(db, task_id, pack_text,
+                          max(0, rel_sessions), rel_scope) if rel_sessions > 0 else [])
     hrow = _live_handoff(db, task_id)
     # Stable sort: pinned notes first, original (oldest→newest) order within groups.
     ordered = sorted(rows, key=lambda r: not r["pinned"])
@@ -1292,6 +1343,14 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
             truncated = True
             continue
         dc_packed.append(e); used += cost
+    rs_packed = []
+    for m in rel_sessions_list:
+        cost = (len(m["content"]) + len(m["role"]) + len(m["at"])
+                + len(m["source"]) + len(m["session_id"]) + 16)
+        if used + cost > budget:
+            truncated = True
+            continue
+        rs_packed.append(m); used += cost
     out = {"task_id": task_id, "budget": budget, "used_chars": used,
             "truncated": truncated, "task": summary,
             "unsatisfied_dependencies": pending,
@@ -1314,6 +1373,11 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
         out["dep_context_matched"] = len(dep_ctx)
         out["dep_context_packed"] = len(dc_packed)
         out["dep_context"] = dc_packed
+    if rel_sessions > 0:
+        out["related_sessions_requested"] = max(0, rel_sessions)
+        out["related_sessions_matched"] = len(rel_sessions_list)
+        out["related_sessions_packed"] = len(rs_packed)
+        out["related_sessions"] = rs_packed
     if rerank:
         # Reported only when enabled so packs built without rerank stay
         # byte-identical to the legacy shape (and digest-compatible).
@@ -1336,17 +1400,17 @@ def task_context(args):
     with conn() as db:
         json_out(_build_pack(db, args.task_id, args.budget,
                              getattr(args, "related", 0),
-                             getattr(args, "related_scope", "project"),
-                             rerank=bool(getattr(args, "rerank", False)),
+                             getattr(args, "related_scope", "project"),                             rerank=bool(getattr(args, "rerank", False)),
                              recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
                              pinned_boost=getattr(args, "pinned_boost", 0.5),
                              rel_handoffs=getattr(args, "related_handoffs", 0),
-                             dep_context=getattr(args, "dep_context", 0)))
+                             dep_context=getattr(args, "dep_context", 0),
+                                      rel_sessions=getattr(args, "related_sessions", 0)))
 
 def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: int, rel_scope: str,
                          rerank: bool = False, recency_half_life_hours: float = 168.0,
                          pinned_boost: float = 0.5, rel_handoffs: int = 0,
-                         dep_context: int = 0) -> dict:
+                         dep_context: int = 0, rel_sessions: int = 0) -> dict:
     """Assemble the recall bundle and its deterministic digest (no audit write).
 
     Shared by `recall` (which audits the digest) and `recall-verify` (which
@@ -1358,7 +1422,7 @@ def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: i
     pack = _build_pack(db, task_id, budget, rel_limit, rel_scope or "project",
                        rerank=rerank, recency_half_life_hours=recency_half_life_hours,
                        pinned_boost=pinned_boost, rel_handoffs=rel_handoffs,
-                       dep_context=dep_context)
+                       dep_context=dep_context, rel_sessions=rel_sessions)
     lease_live = bool(row["lease_owner"]) and row["lease_expires_at"] > t
     bundle = {
         **pack,
@@ -1427,6 +1491,9 @@ def _bundle_sections(bundle: dict) -> dict:
         sections["related_handoffs"] = [x["id"] for x in bundle["related_handoffs"]]
     if "dep_context" in bundle:
         sections["dep_context"] = [e["id"] for e in bundle["dep_context"]]
+    if "related_sessions" in bundle:
+        sections["related_sessions"] = [
+            f"{x['session_id']}:{x['seq']}" for x in bundle["related_sessions"]]
     return sections
 
 def _diff_sections(old: dict, new: dict) -> dict:
@@ -1468,6 +1535,9 @@ def _diff_sections(old: dict, new: dict) -> dict:
     odc, ndc = set(old.get("dep_context") or []), set(new.get("dep_context") or [])
     if odc != ndc:
         changes["dep_context"] = {"added": sorted(ndc - odc), "removed": sorted(odc - ndc)}
+    ors, nrs = set(old.get("related_sessions") or []), set(new.get("related_sessions") or [])
+    if ors != nrs:
+        changes["related_sessions"] = {"added": sorted(nrs - ors), "removed": sorted(ors - nrs)}
     if old["lease"] != new["lease"]:
         changes["lease"] = {"from": old["lease"], "to": new["lease"]}
     orec, nrec = set(old["receipts"]), set(new["receipts"])
@@ -1495,7 +1565,8 @@ def recall(args):
                                       recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
                                       pinned_boost=getattr(args, "pinned_boost", 0.5),
                                       rel_handoffs=getattr(args, "related_handoffs", 0),
-                                      dep_context=getattr(args, "dep_context", 0))
+                                      dep_context=getattr(args, "dep_context", 0),
+                                      rel_sessions=getattr(args, "related_sessions", 0))
         # Record the bundle parameters alongside the digest so fleet sweeps
         # (ops.py recall-stale) can recompute the digest exactly as recalled.
         audit(db, "task", args.task_id, "context_recalled",
@@ -1508,6 +1579,7 @@ def recall(args):
                "pinned_boost": getattr(args, "pinned_boost", 0.5),
                "related_handoffs": getattr(args, "related_handoffs", 0),
                "dep_context": getattr(args, "dep_context", 0),
+                "related_sessions": getattr(args, "related_sessions", 0),
                "sections": _bundle_sections(bundle)})
     json_out(bundle)
 
@@ -1534,7 +1606,8 @@ def recall_verify(args):
                                       recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
                                       pinned_boost=getattr(args, "pinned_boost", 0.5),
                                       rel_handoffs=getattr(args, "related_handoffs", 0),
-                                      dep_context=getattr(args, "dep_context", 0))
+                                      dep_context=getattr(args, "dep_context", 0),
+                                      rel_sessions=getattr(args, "related_sessions", 0))
     json_out({"ok": True, "task_id": args.task_id,
               "fresh": bundle["digest"] == digest,
               "recalled_digest": digest, "current_digest": bundle["digest"]})
@@ -1667,7 +1740,8 @@ def resume(args):
                                       recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
                                       pinned_boost=getattr(args, "pinned_boost", 0.5),
                                       rel_handoffs=getattr(args, "related_handoffs", 0),
-                                      dep_context=getattr(args, "dep_context", 0))
+                                      dep_context=getattr(args, "dep_context", 0),
+                                      rel_sessions=getattr(args, "related_sessions", 0))
         # session_resumed doubles as recall provenance: the digest is recorded
         # with its bundle parameters so a handoff citing a resume digest passes
         # the handoff-check lint and fleet sweeps can recompute it exactly.
@@ -1681,6 +1755,7 @@ def resume(args):
                "pinned_boost": getattr(args, "pinned_boost", 0.5),
                "related_handoffs": getattr(args, "related_handoffs", 0),
                "dep_context": getattr(args, "dep_context", 0),
+                "related_sessions": getattr(args, "related_sessions", 0),
                "sections": _bundle_sections(bundle)})
     json_out({"ok": True, "task_id": args.task_id, "action": action, **bundle})
 
@@ -1800,6 +1875,368 @@ def search_handoffs(args):
             " AND ".join(clauses) + " ORDER BY h.created_at DESC, h.rowid DESC LIMIT ?",
             [*vals, pat, pat, pat, pat, pat, limit]).fetchall()]
     json_out(rows)
+
+# ---------------------------------------------------------------------------
+# Session ingestion: a read-only adapter over external agent session stores
+# (Hermes/Claude Code-style JSONL transcripts). The ingested rows are a
+# disposable, rebuildable cache — never execution truth — and the source
+# stores are only ever opened for reading. Raw conversation becomes searchable
+# shared context through the same FTS/context-pack protocol as notes and
+# handoffs, with provenance (source/profile/project/session/role) on every
+# message and the shared-memory secret guard applied before anything lands.
+# ---------------------------------------------------------------------------
+
+SESSION_ROLES = ("user", "assistant")
+SESSION_SNIPPET_CHARS = 400
+DEFAULT_SESSION_MAX_FILE_BYTES = 64 * 1024 * 1024
+
+def _session_row_id(source: str, path: str) -> str:
+    """Stable cache-row id for one source store file on this machine."""
+    return hashlib.sha256(f"{source}\x00{path}".encode()).hexdigest()
+
+def _session_discover(root: Path) -> list:
+    """Candidate transcript files under an explicit root, deterministically.
+
+    Symlinks are never followed (and symlinked files never indexed) so a
+    planted link cannot smuggle unrelated private context into shared memory.
+    """
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dp = Path(dirpath)
+        dirnames[:] = sorted(d for d in dirnames if not (dp / d).is_symlink())
+        for name in sorted(filenames):
+            p = dp / name
+            if name.endswith(".jsonl") and not p.is_symlink() and p.is_file():
+                out.append(p)
+    return out
+
+def _parse_session_file(path: Path, max_bytes: int) -> dict:
+    """Read-only parse of one JSONL transcript into normalized messages.
+
+    Recognizes the Claude Code shape (`{"type":"user"|"assistant",
+    "message":{"role","content": str | [{"type":"text","text":...}]},
+    "timestamp": iso}`) and the generic `{role, content, timestamp}` line;
+    everything else (tool calls/results, system lines, unknown vendor shapes)
+    is counted and skipped rather than guessed at, so an unstable format
+    degrades into an honest report instead of silent garbage. Consecutive
+    exact-duplicate lines (retry artifacts) collapse into one message.
+    """
+    st = path.stat()
+    out = {"status": "indexed", "messages": [], "tool_results_skipped": 0,
+           "malformed_lines": 0, "duplicates_collapsed": 0,
+           "size_bytes": st.st_size}
+    if st.st_size > max_bytes:
+        out["status"] = "too_large"
+        return out
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as e:
+        out.update(status="error", error=str(e))
+        return out
+    prev_hash = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            out["malformed_lines"] += 1
+            continue
+        at = ""
+        for k in ("timestamp", "ts", "at", "created_at"):
+            v = obj.get(k) if isinstance(obj, dict) else None
+            if isinstance(v, str) and v:
+                try:
+                    at = _normalize_iso(v, "timestamp")
+                except SystemExit:
+                    at = ""
+                break
+        msg = obj.get("message") if isinstance(obj, dict) and isinstance(obj.get("message"), dict) else obj
+        role = ""
+        content = None
+        if isinstance(msg, dict):
+            role = str(msg.get("role") or obj.get("type") or "").lower()
+            content = msg.get("content")
+        non_text = 0
+        if isinstance(content, list):
+            texts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                    texts.append(item["text"])
+                else:
+                    non_text += 1
+            content = "\n".join(t for t in texts if t.strip())
+        if not isinstance(content, str):
+            out["malformed_lines"] += 1
+            continue
+        if role not in SESSION_ROLES or not content.strip():
+            # Tool calls/results, system lines, and unrecognized roles are
+            # agent/tool output — recorded as a count, never stored.
+            out["tool_results_skipped"] += 1 + non_text
+            continue
+        out["tool_results_skipped"] += non_text
+        ch = hashlib.sha256((role + "\x00" + content).encode()).hexdigest()
+        if ch == prev_hash:
+            out["duplicates_collapsed"] += 1
+            continue
+        prev_hash = ch
+        out["messages"].append({"role": role, "content": content, "at": at})
+    if not out["messages"]:
+        out["status"] = "unsupported"
+    stamps = sorted(m["at"] for m in out["messages"] if m["at"])
+    out["first_at"] = stamps[0] if stamps else ""
+    out["last_at"] = stamps[-1] if stamps else ""
+    return out
+
+def _session_file_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _session_plan(args) -> dict:
+    """Shared discovery/plan core for session-scan and session-ingest."""
+    root = Path(args.root).expanduser().resolve()
+    if not root.is_dir():
+        raise SystemExit(f"--root is not a directory: {args.root}")
+    source = (getattr(args, "source", "") or "").strip()
+    if getattr(args, "apply", False) and not source:
+        raise SystemExit("--source is required")
+    since = _normalize_iso(getattr(args, "since", ""), "--since")
+    max_bytes = max(1, int(getattr(args, "max_file_bytes", DEFAULT_SESSION_MAX_FILE_BYTES)))
+    profile = (getattr(args, "profile", "") or "").strip()
+    project = (getattr(args, "project", "") or "").strip()
+    files = []
+    with conn() as db:
+        for p in _session_discover(root):
+            rel = str(p.relative_to(root))
+            st = p.stat()
+            entry = {"path": rel, "session_id": p.stem, "size_bytes": st.st_size}
+            if since and datetime.fromtimestamp(st.st_mtime, timezone.utc).replace(microsecond=0).isoformat() < since:
+                entry.update(status="skipped_older_than")
+                files.append(entry)
+                continue
+            parsed = _parse_session_file(p, max_bytes)
+            entry.update(status=parsed["status"],
+                         message_count=len(parsed["messages"]),
+                         tool_results_skipped=parsed["tool_results_skipped"],
+                         malformed_lines=parsed["malformed_lines"],
+                         duplicates_collapsed=parsed["duplicates_collapsed"],
+                         first_at=parsed.get("first_at", ""), last_at=parsed.get("last_at", ""))
+            if "error" in parsed:
+                entry["error"] = parsed["error"]
+            row_id = _session_row_id(source, str(p))
+            row = db.execute("SELECT file_hash FROM sessions WHERE id=?", (row_id,)).fetchone()
+            fh = _session_file_hash(p)
+            entry["unchanged"] = bool(row) and row["file_hash"] == fh
+            if parsed["status"] == "indexed":
+                entry["secret_kinds"] = sorted({f["kind"] for m in parsed["messages"]
+                                                for f in _secret_findings(m["content"])})
+                files.append(entry)
+                files[-1]["_parsed"] = parsed
+                files[-1]["_row_id"] = row_id
+                files[-1]["_file_hash"] = fh
+            else:
+                files.append(entry)
+    plan = {"source": source, "profile": profile, "project": project, "root": str(root),
+            "since": since, "files": [{k: v for k, v in f.items() if not k.startswith("_")} for f in files]}
+    plan["totals"] = {
+        "discovered": len(files),
+        "indexable": sum(1 for f in files if f["status"] == "indexed"),
+        "unchanged": sum(1 for f in files if f.get("unchanged")),
+        "unsupported": sum(1 for f in files if f["status"] == "unsupported"),
+        "too_large": sum(1 for f in files if f["status"] == "too_large"),
+        "errored": sum(1 for f in files if f["status"] == "error"),
+        "skipped_older_than": sum(1 for f in files if f["status"] == "skipped_older_than"),
+        "messages": sum(f.get("message_count", 0) for f in files),
+        "tool_results_skipped": sum(f.get("tool_results_skipped", 0) for f in files),
+        "malformed_lines": sum(f.get("malformed_lines", 0) for f in files),
+        "duplicates_collapsed": sum(f.get("duplicates_collapsed", 0) for f in files),
+        "secret_kinds": sorted({k for f in files for k in f.get("secret_kinds", [])}),
+    }
+    return plan, files
+
+def session_scan(args):
+    """Redacted dry-run inventory of discoverable session transcripts.
+
+    Read-only by construction: nothing is written to the control plane and
+    message content never leaves this process — the report carries counts and
+    kind-only secret findings so an operator can decide what may be ingested
+    before any bytes move.
+    """
+    plan, _ = _session_plan(args)
+    plan["dry_run"] = True
+    json_out(plan)
+
+def session_ingest(args):
+    """Incrementally index external agent sessions into the disposable cache.
+
+    Without --apply this is exactly the redacted inventory (`session-scan`)
+    plus what would change. With --apply, each new or changed transcript is
+    re-indexed atomically (delete+insert keyed by the file's sha256, so
+    interrupted runs resume by simply re-running and unchanged files cost one
+    hash read). The shared-memory secret guard applies to every message before
+    anything lands: refuse by default, --redact stores [REDACTED:<kind>]
+    copies, --allow-secret is audited. Source stores are opened read-only and
+    never mutated; raw conversation stays derived cache, never execution truth.
+    """
+    apply_mode = bool(getattr(args, "apply", False))
+    plan, files = _session_plan(args)
+    indexable = [f for f in files if f["status"] == "indexed" and not f.get("unchanged")]
+    # The guard gates what THIS run would write: unchanged files were already
+    # settled at their original ingest (possibly redacted there), so flagging
+    # them forever would make every later incremental run refuse without any
+    # new bytes moving. Fresh/changed transcripts are always scanned.
+    kinds = sorted({k for f in indexable for k in f.get("secret_kinds", [])})
+    redact, allow = bool(getattr(args, "redact", False)), bool(getattr(args, "allow_secret", False))
+    if apply_mode:
+        # The guard verdict is audited on its own connection so a refusal
+        # survives its own SystemExit (the apply transaction rolls back).
+        if kinds:
+            with conn() as db:
+                audit(db, "session", plan["source"],
+                      "secret_blocked" if not (redact or allow) else
+                      ("secret_redacted" if redact else "secret_allowed"),
+                      {"files": len(indexable), "kinds": kinds})
+            if not (redact or allow):
+                raise SystemExit(
+                    f"refusing to ingest credential-shaped session content ({', '.join(kinds)}); "
+                    "re-run with --redact to store redacted copies or --allow-secret to override")
+        with conn() as db:
+            applied = 0
+            t = now()
+            for f in indexable:
+                parsed = f["_parsed"]
+                msgs = parsed["messages"]
+                if redact:
+                    msgs = [{**m, "content": _redact_secrets(m["content"])} for m in msgs]
+                row_id = f["_row_id"]
+                db.execute("DELETE FROM session_messages WHERE session_row=?", (row_id,))
+                db.execute(
+                    "INSERT INTO sessions(id,source,profile,project,session_id,path,file_hash,"
+                    "size_bytes,message_count,tool_results_skipped,first_at,last_at,ingested_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET source=excluded.source,profile=excluded.profile,"
+                    "project=excluded.project,session_id=excluded.session_id,path=excluded.path,"
+                    "file_hash=excluded.file_hash,size_bytes=excluded.size_bytes,"
+                    "message_count=excluded.message_count,"
+                    "tool_results_skipped=excluded.tool_results_skipped,"
+                    "first_at=excluded.first_at,last_at=excluded.last_at,ingested_at=excluded.ingested_at",
+                    (row_id, plan["source"], plan["profile"], plan["project"], f["session_id"],
+                     str(Path(plan["root"]) / f["path"]), f["_file_hash"], f["size_bytes"],
+                     len(msgs), f["tool_results_skipped"], f["first_at"], f["last_at"], t))
+                for seq, m in enumerate(msgs):
+                    db.execute(
+                        "INSERT INTO session_messages(session_row,seq,role,content,content_hash,at) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (row_id, seq, m["role"], m["content"],
+                         hashlib.sha256((m["role"] + "\x00" + m["content"]).encode()).hexdigest(),
+                         m["at"]))
+                audit(db, "session", row_id, "session_ingested",
+                      {"source": plan["source"], "path": f["path"],
+                       "messages": len(msgs), "tool_results_skipped": f["tool_results_skipped"],
+                       "malformed_lines": f["malformed_lines"],
+                       "duplicates_collapsed": f["duplicates_collapsed"],
+                       "redacted": redact})
+                applied += 1
+            plan["applied_files"] = applied
+    plan["dry_run"] = not apply_mode
+    json_out(plan)
+
+def search_sessions(args):
+    """Keyword retrieval over ingested session messages with full provenance.
+
+    The same retrieval contract as notes/handoffs: BM25-ranked FTS5 when the
+    index exists (with --rank), substring LIKE fallback otherwise, every hit
+    carrying its source/profile/project/session/role provenance so raw
+    conversation is always traceable back to its transcript — and always
+    readable as cache, never as execution truth.
+    """
+    role = getattr(args, "role", "") or ""
+    if role and role not in SESSION_ROLES:
+        raise SystemExit(f"--role must be one of: {', '.join(SESSION_ROLES)}")
+    clauses, vals = [], []
+    if getattr(args, "source", ""):
+        clauses.append("s.source=?"); vals.append(args.source)
+    if getattr(args, "project", ""):
+        clauses.append("s.project=?"); vals.append(args.project)
+    if role:
+        clauses.append("sm.role=?"); vals.append(role)
+    limit = max(0, args.limit)
+    where = " AND ".join(["session_messages_fts MATCH ?", *clauses])
+    with conn() as db:
+        if getattr(args, "rank", False) and _sessions_fts_ready(db):
+            match = _fts_query(args.query)
+            if not match:
+                json_out([])
+                return
+            rows = [dict(r) for r in db.execute(
+                "SELECT sm.session_row,s.session_id,s.source,s.profile,s.project,"
+                "sm.seq,sm.role,sm.at,sm.content,bm25(session_messages_fts) AS score "
+                "FROM session_messages_fts f JOIN session_messages sm ON sm.rowid=f.rowid "
+                "JOIN sessions s ON s.id=sm.session_row WHERE " + where +
+                " ORDER BY score LIMIT ?",
+                [match, *vals, limit]).fetchall()]
+            json_out(rows)
+            return
+        pat = "%" + args.query + "%"
+        lvals = [pat, pat] + vals
+        rows = [dict(r) for r in db.execute(
+            "SELECT sm.session_row,s.session_id,s.source,s.profile,s.project,"
+            "sm.seq,sm.role,sm.at,sm.content "
+            "FROM session_messages sm JOIN sessions s ON s.id=sm.session_row WHERE " +
+            " AND ".join(["(sm.content LIKE ? OR sm.role LIKE ?)", *clauses]) +
+            " ORDER BY sm.at DESC, sm.session_row ASC, sm.seq ASC LIMIT ?",
+            [*lvals, limit]).fetchall()]
+    json_out(rows)
+
+def _related_session_candidates(db, task_id: str, text: str, limit: int, scope: str) -> list:
+    """Cross-task retrieval: ingested session messages matching this task's text.
+
+    Session transcripts are the freshest record of what agents actually said
+    and tried — context packs that only see distilled notes miss the reasoning.
+    Deterministic ordering (at DESC, then session/seq) keeps recall digests
+    stable; snippets are bounded so one long transcript cannot eat the budget;
+    scope 'project' restricts to the task's own project, 'global' searches all.
+    """
+    if limit <= 0 or not text.strip():
+        return []
+    toks = []
+    for raw in text.split():
+        tok = raw.replace('"', "")
+        if tok and any(c.isalnum() for c in tok):
+            toks.append(tok)
+    if not toks:
+        return []
+    scope_sql, scope_vals = "", []
+    if scope != "global":
+        scope_sql = " AND s.project=(SELECT project FROM tasks WHERE id=?)"
+        scope_vals = [task_id]
+    cols = ("SELECT sm.session_row,s.session_id,s.source,s.profile,s.project,"
+            "sm.seq,sm.role,sm.at,sm.content")
+    def snippet(c: str) -> str:
+        return c if len(c) <= SESSION_SNIPPET_CHARS else c[:SESSION_SNIPPET_CHARS - 1] + "…"
+    if _sessions_fts_ready(db):
+        match = " OR ".join('"%s"' % t for t in toks)
+        sql = (cols + " FROM session_messages_fts f JOIN session_messages sm ON sm.rowid=f.rowid "
+               "JOIN sessions s ON s.id=sm.session_row "
+               "WHERE session_messages_fts MATCH ?" + scope_sql +
+               " ORDER BY sm.at DESC, sm.session_row ASC, sm.seq ASC LIMIT ?")
+        vals = [match, *scope_vals, limit]
+    else:
+        likes = " OR ".join("sm.content LIKE ?" for _ in toks)
+        sql = (cols + " FROM session_messages sm JOIN sessions s ON s.id=sm.session_row "
+               "WHERE (" + likes + ")" + scope_sql +
+               " ORDER BY sm.at DESC, sm.session_row ASC, sm.seq ASC LIMIT ?")
+        vals = [*( "%" + t + "%" for t in toks), *scope_vals, limit]
+    rows = []
+    for r in db.execute(sql, vals).fetchall():
+        d = dict(r)
+        d["content"] = snippet(d["content"])
+        rows.append(d)
+    return rows
 
 def release(args):
     """Voluntarily give up a live lease without consuming retry budget."""
@@ -2926,7 +3363,8 @@ def next_task(args):
                                               recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
                                               pinned_boost=getattr(args, "pinned_boost", 0.5),
                                               rel_handoffs=getattr(args, "related_handoffs", 0),
-                                      dep_context=getattr(args, "dep_context", 0))
+                                      dep_context=getattr(args, "dep_context", 0),
+                                      rel_sessions=getattr(args, "related_sessions", 0))
                 # Same provenance contract as `recall`: the digest is recorded
                 # with its bundle parameters so handoffs/completions can cite
                 # it and fleet sweeps can recompute it exactly.
@@ -2940,6 +3378,7 @@ def next_task(args):
                        "pinned_boost": getattr(args, "pinned_boost", 0.5),
                        "related_handoffs": getattr(args, "related_handoffs", 0),
                        "dep_context": getattr(args, "dep_context", 0),
+                "related_sessions": getattr(args, "related_sessions", 0),
                        "sections": _bundle_sections(bundle),
                        "via": "next"})
                 out["recall"] = bundle
@@ -3068,6 +3507,8 @@ def metrics(args):
         completed_no_receipt = db.execute(
             "SELECT COUNT(*) n FROM tasks t WHERE t.status='completed' AND NOT EXISTS("
             "SELECT 1 FROM receipts r WHERE r.task_id=t.id)").fetchone()["n"]
+        sessions = db.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(message_count),0) m FROM sessions").fetchone()
     json_out({
         "generated_at": t,
         "tasks_total": sum(by_status.values()),
@@ -3101,6 +3542,8 @@ def metrics(args):
         "handoffs_with_recall_proof": handoffs["proven"] or 0,
         "handoffs_acked_total": handoffs["acked"] or 0,
         "completions_without_receipt": completed_no_receipt,
+        "sessions_indexed": sessions["n"],
+        "session_messages_indexed": sessions["m"],
     })
 
 def list_tasks(args):
@@ -3310,17 +3753,20 @@ def main():
     p=sub.add_parser("tag"); p.add_argument("id"); p.add_argument("--tag",action="append",required=True,help="capability/scope tag (repeatable)"); p.set_defaults(fn=tag_task)
     p=sub.add_parser("untag"); p.add_argument("id"); p.add_argument("--tag",required=True); p.set_defaults(fn=untag_task)
     p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
-    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); p.add_argument("--prefer-unblocking",dest="prefer_unblocking",action="store_true",help="tie-break equal-priority candidates by queued dependents freed (critical-path scheduling)"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); p.add_argument("--prefer-unblocking",dest="prefer_unblocking",action="store_true",help="tie-break equal-priority candidates by queued dependents freed (critical-path scheduling)"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.add_argument("--tag",default=""); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=supersede_note)
-    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
-    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
-    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
+    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
+    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
+    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
     p=sub.add_parser("recall-diff"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.set_defaults(fn=recall_diff)
     p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--include-expired",dest="include_expired",action="store_true"); _add_rerank_flags(p); p.set_defaults(fn=search_notes)
     p=sub.add_parser("search-handoffs"); p.add_argument("query"); p.add_argument("--task",default=""); p.add_argument("--from-agent",dest="from_agent",default=""); p.add_argument("--to-agent",dest="to_agent",default=""); p.add_argument("--project",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=search_handoffs)
+    p=sub.add_parser("session-scan"); p.add_argument("--root",required=True,help="directory tree of session transcripts to inventory (read-only)"); p.add_argument("--profile",default=""); p.add_argument("--project",default=""); p.add_argument("--since",default="",help="only files modified at/after this ISO timestamp"); p.add_argument("--max-file-bytes",dest="max_file_bytes",type=int,default=DEFAULT_SESSION_MAX_FILE_BYTES); p.set_defaults(fn=session_scan)
+    p=sub.add_parser("session-ingest"); p.add_argument("--source",required=True,help="provenance label for the session store (e.g. claude-code)"); p.add_argument("--root",required=True); p.add_argument("--profile",default=""); p.add_argument("--project",default=""); p.add_argument("--since",default=""); p.add_argument("--max-file-bytes",dest="max_file_bytes",type=int,default=DEFAULT_SESSION_MAX_FILE_BYTES); p.add_argument("--apply",action="store_true",help="without this flag the command is a read-only dry-run plan"); p.add_argument("--redact",action="store_true"); p.add_argument("--allow-secret",dest="allow_secret",action="store_true"); p.set_defaults(fn=session_ingest)
+    p=sub.add_parser("search-sessions"); p.add_argument("query"); p.add_argument("--source",default=""); p.add_argument("--project",default=""); p.add_argument("--role",default="",help="user or assistant"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_sessions)
     p=sub.add_parser("note-history"); p.add_argument("note_id"); p.set_defaults(fn=note_history)
     p=sub.add_parser("handoff-history"); p.add_argument("handoff_id"); p.set_defaults(fn=handoff_history)
     p=sub.add_parser("handoff"); p.add_argument("task_id"); p.add_argument("--from-agent",required=True); p.add_argument("--to-agent",default=""); p.add_argument("--status",default=""); p.add_argument("--objective",default=""); p.add_argument("--evidence",action="append",default=[]); p.add_argument("--constraint",dest="constraints",action="append",default=[]); p.add_argument("--decision",dest="decisions",action="append",default=[]); p.add_argument("--file",dest="files",action="append",default=[]); p.add_argument("--commit",dest="commit_ref",default=""); p.add_argument("--next-action",dest="next_actions",action="append",default=[]); p.add_argument("--risk",dest="risks",action="append",default=[]); p.add_argument("--recall-digest",dest="recall_digest",default=""); _add_secret_flags(p); p.set_defaults(fn=add_handoff)
@@ -3331,7 +3777,7 @@ def main():
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)
     p=sub.add_parser("renew"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=renew)
     p=sub.add_parser("transfer"); p.add_argument("id"); p.add_argument("--from-owner",required=True,dest="from_owner"); p.add_argument("--to-owner",required=True,dest="to_owner"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=transfer)
-    p=sub.add_parser("resume"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=resume)
+    p=sub.add_parser("resume"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=resume)
     p=sub.add_parser("leases"); p.add_argument("--owner"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=leases)
     args=ap.parse_args(); args.fn(args)
 

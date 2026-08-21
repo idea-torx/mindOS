@@ -46,6 +46,14 @@ This report separates **fixed issues**, **accepted risks**, and **merge blockers
    fts5vocab is unavailable.
 10. **`ops.py` was not importable** — module-level `parse_args()` consumed the
     importer's argv. Now guarded by `__main__`, enabling in-process testing.
+11. **Migration-inventory seal covered `created_at`, breaking its own resume
+    contract** (found by `verify.py` failing at HEAD) — the sha256 seal was
+    computed over a body that included the run timestamp, so two runs over
+    identical trees produced different seals and could never "reproduce an
+    identical manifest modulo created_at" as documented; every re-run looked
+    tampered to strict byte comparison. Both sealing (`migrate_inventory`) and
+    verification (`_load_inventory`) now exclude `created_at` from the digest;
+    all content fields remain covered and the tamper-refusal test still passes.
 
 ## Accepted risks (documented, not fixed)
 
@@ -67,9 +75,14 @@ This report separates **fixed issues**, **accepted risks**, and **merge blockers
   live-system boundary holds because rounds never invoke them.
 - **FTS5 absence degrades to LIKE search** everywhere (unchanged); BM25 scores
   and digests are only comparable within the same engine mode.
-- **SQLite single-writer serialization** is assumed; `busy_timeout=10000`
-  absorbs contention, but very long transactions (migration import) can still
+- **SQLite single-writer serialization** is assumed; `busy_timeout=10000`  absorbs contention, but very long transactions (migration import) can still
   starve concurrent writers for their duration.
+- **The session cache grows without TTL** — ingested transcripts stay until a
+  future consolidation/retention pass. This is bounded by explicit `--root`
+  ingestion choices and the rows are disposable by design (`DELETE FROM
+  sessions` cascades messages and the FTS triggers keep the index in sync);
+  no automatic retention was added because deleting conversation history
+  silently is exactly the kind of false-success behavior this runtime avoids.
 
 ## Merge blockers
 
@@ -86,3 +99,13 @@ checkpoint divergence, tampered manifests/result docs, redaction bypass attempts
   `complete`/`fail`/`release` proving the thief's claim survives; recover
   skipping a mid-sweep fresh claim; escalate skipping a task that settled
   mid-sweep; tag compare-and-swap refusal.
+- Session-ingestion adapter (black-box, isolated fixture store): redacted
+  scan inventory with kind-only findings and value-never-leaves assertion;
+  dry-run writes nothing; credential refusal fail-closed; `--redact` stores
+  placeholders with the raw value provably absent from the cache; tool-result
+  skipping / duplicate collapse / malformed counting; idempotent re-run;
+  atomic re-index of a changed source; role-filtered FTS search; flag-gated
+  context-pack integration with digest staleness on newly ingested sessions;
+  `--since` plan filtering; byte-level proof that sources are never mutated.
+- Inventory seal fix: determinism assertion (identical trees → identical
+  manifest modulo created_at) now passes; tampered manifests still refused.

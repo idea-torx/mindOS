@@ -1500,6 +1500,56 @@ The full installer lifecycle is therefore: `init` → `migrate-inventory` →
 `migrate-import --apply --out` → (verify) → optional `migrate-rollback`,
 each stage dry-run-first, sealed, and independently re-runnable.
 
+## Session ingestion (read-only transcript adapter)
+
+Agents' raw conversation transcripts are the freshest record of what was
+actually tried and decided — but they live in vendor-specific stores outside
+the control plane. The session-ingestion adapter indexes them into a
+disposable, rebuildable cache and exposes them through the same retrieval and
+context-pack protocol as notes and handoffs:
+
+```bash
+python3 "$A" session-scan --root ~/library-session-store            # redacted dry-run inventory
+python3 "$A" session-ingest --source claude-code --root ~/.../proj-a \
+    --project Auth --apply --redact                                 # incremental index
+python3 "$A" search-sessions "redirect cookie" --role assistant --rank
+python3 "$A" context <task-id> --related-sessions 3                 # packs matching snippets
+```
+
+Design properties:
+
+- **Read-only by construction**: source stores are opened for reading only,
+  never mutated; symlinked files/directories are never followed, so a planted
+  link cannot smuggle unrelated private context into shared memory.
+- **Cache, not truth**: ingested rows are derived data keyed by each file's
+  sha256 — a changed transcript re-indexes atomically (delete+insert), an
+  unchanged one costs a single hash read, and an interrupted run resumes by
+  re-running. Raw conversation is never execution truth.
+- **Redacted inventory first**: `session-scan` / dry-run `session-ingest`
+  report counts and kind-only secret findings; message content never leaves
+  the process before an explicit `--apply`.
+- **Secret guard**: credential-shaped content is refused by default;
+  `--redact` stores `[REDACTED:<kind>]` copies; `--allow-secret` is audited.
+  The guard gates what a run would *write* — unchanged files already settled
+  at their original ingest never block later incremental runs.
+- **Honest format handling**: Claude Code-style JSONL (`type`/`message`/
+  timestamp) and generic `{role, content, timestamp}` lines are recognized;
+  tool calls/results and unknown roles are counted and skipped, malformed
+  lines counted, files with zero recognizable messages reported as
+  `unsupported` — unstable formats degrade into a report, not garbage.
+- **Provenance on every message**: `source`, `profile`, `project`, session
+  id, sequence, role, and timestamp travel with every hit in search results
+  and context packs.
+- **Context-pack integration**: `--related-sessions N` (on `context`,
+  `recall`, `recall-verify`, `resume`, `next`) appends bounded snippets of
+  ingested messages matching the task's text after dep context, under the
+  same budget and flag-gated digest rules as related handoffs — packs built
+  without the flag stay byte-identical. Ordering is deterministic
+  (`at DESC, session, seq`), so digests stay stable until real context drift.
+- **Observability & hygiene**: `metrics` reports `sessions_indexed` /
+  `session_messages_indexed`; `ops.py doctor` includes the session FTS index
+  in its fts5vocab drift sweep.
+
 ## Audit & hardening (stability round)
 
 A full runtime audit (see `STABILITY.md` for the complete report) fixed the
