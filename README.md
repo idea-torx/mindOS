@@ -291,6 +291,32 @@ retry budget is exhausted (`retry_count > max-retries`, default 3) transition to
 `--dry-run` reports `would_recover` / `would_fail` without touching state,
 making it safe to run from monitoring cron before committing to a real pass.
 
+## Recovery backoff (dispatch cooldown)
+
+A task whose lease just went stale is requeued by `recover`, but redispatching
+it instantly lets a repeatedly failing task hot-loop through its retry budget.
+Recovered tasks therefore enter a deterministic exponential cooldown:
+`recover_after = now + backoff_base * 2^(retry_count-1)` seconds (default base
+60s, capped at 3600s via `--backoff-cap`; `--backoff-base 0` disables the
+cooldown entirely for the old instant-redispatch behavior):
+
+```bash
+python3 "$O" recover --backoff-base 60 --backoff-cap 3600
+python3 "$O" recover --dry-run     # previews the cooldown per task in "backoff"
+```
+
+Design properties:
+
+- **Dispatch-level enforcement**: `next` never picks a queued task whose
+  `recover_after` is in the future; `next --explain` reports those candidates
+  with reason `recovery_backoff` and their deadline.
+- **Explicit override preserved**: a direct `claim` of a cooling-down task is
+  still allowed as a deliberate operator action, and any successful lease
+  acquisition clears the cooldown.
+- **Audited**: the `lease_recovered` audit event records the applied
+  `recover_after`.
+- **Observable**: `metrics` reports `tasks_in_backoff`.
+
 ## Archival & retention
 
 Terminal tasks accumulate forever without a retention path. `ops.py archive`

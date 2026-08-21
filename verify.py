@@ -526,6 +526,43 @@ with tempfile.TemporaryDirectory() as td:
     run('update','dag-2','--status','completed')
     nx = run('next','--project','ExplainTest','--explain')
     assert nx['task']['id'] == 'exp-1' and nx['skipped'] == [], nx
+    # Recovery backoff: recovered tasks cool down before redispatch instead of hot-looping.
+    run('create','--project','Backoff','--title','thrash me','--id','bo-1')
+    run('claim','bo-1','--owner','tester','--minutes','0')
+    out = ops('recover','--max-retries','3')
+    assert out['recovered'] == ['bo-1'] and out['backoff']['bo-1'], out
+    row = next(r for r in run('list') if r['id'] == 'bo-1')
+    assert row['status'] == 'queued' and row['recover_after'] == out['backoff']['bo-1'], row
+    m = run('metrics'); assert m['tasks_in_backoff'] >= 1, m
+    nx = run('next','--project','Backoff','--explain')
+    assert not (nx['task'] and nx['task']['id'] == 'bo-1'), 'backoff task must not be dispatched'
+    skip = next(s for s in nx['skipped'] if s['task_id'] == 'bo-1')
+    assert skip['reason'] == 'recovery_backoff' and skip['recover_after'] == row['recover_after'], nx
+    # Explicit claim stays allowed as a deliberate override; acquiring clears the cooldown.
+    run('claim','bo-1','--owner','tester','--minutes','5')
+    row = next(r for r in run('list') if r['id'] == 'bo-1')
+    assert row['recover_after'] == '', 'acquire must clear the backoff'
+    # Dry-run previews the cooldown without mutating anything.
+    run('create','--project','Verify','--title','chill preview','--id','bo-2')
+    run('claim','bo-2','--owner','tester','--minutes','0')
+    out = ops('recover','--dry-run')
+    assert out['dry_run'] is True and 'bo-2' in out['backoff'], out
+    row = next(r for r in run('list') if r['id'] == 'bo-2')
+    assert row['status'] == 'claimed' and row['recover_after'] == '', 'dry-run must not mutate'
+    # --backoff-base 0 restores instant redispatch (backward-compatible mode).
+    run('create','--project','Verify','--title','no chill','--id','bo-3')
+    run('claim','bo-3','--owner','tester','--minutes','0')
+    out = ops('recover','--max-retries','3','--backoff-base','0')
+    assert 'bo-3' in out['recovered'] and out['backoff'] == {}, out
+    row = next(r for r in run('list') if r['id'] == 'bo-3')
+    assert row['recover_after'] == ''
+    # Failed tasks get no cooldown — they are terminal.
+    run('create','--project','Verify','--title','fail fast','--id','bo-4')
+    run('claim','bo-4','--owner','tester','--minutes','0')
+    out = ops('recover','--max-retries','0')
+    assert out['failed'] == ['bo-4'], out
+    row = next(r for r in run('list') if r['id'] == 'bo-4')
+    assert row['status'] == 'failed' and row['recover_after'] == ''
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

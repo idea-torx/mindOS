@@ -2,7 +2,7 @@
 """Autopilot v1.1 safe operations: recovery, approvals, reconciliation, reports."""
 from __future__ import annotations
 import json, os, re, sqlite3, subprocess, sys, tempfile, urllib.request, hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import autopilot
@@ -17,10 +17,20 @@ def run(cmd, cwd=None):
         return p.returncode,p.stdout.strip(),p.stderr.strip()
     except Exception as e: return 1,"",str(e)
 
+def _backoff_deadline(retry_count: int, base: int, cap: int) -> str:
+    """Deterministic exponential cooldown after the Nth recovery: base * 2^(N-1), capped."""
+    if base <= 0:
+        return ''
+    delay = min(base * (2 ** (retry_count - 1)), cap)
+    dt = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    return dt.replace(microsecond=0).isoformat()
+
 def recover(args=None):
     now=utc(); recovered=[]; failed=[]
     max_retries = getattr(args, 'max_retries', 3) if args is not None else 3
     dry_run = bool(getattr(args, 'dry_run', False))
+    backoff_base = getattr(args, 'backoff_base', 60)
+    backoff_cap = getattr(args, 'backoff_cap', 3600)
     plan = []
     with db() as c:
         rows=c.execute("SELECT id,lease_owner,lease_expires_at,status,retry_count FROM tasks WHERE lease_expires_at!='' AND lease_expires_at<=? AND status IN ('claimed','running','waiting_for_agent')",(now,)).fetchall()
@@ -28,26 +38,32 @@ def recover(args=None):
             new_retry = r['retry_count'] + 1
             if new_retry > max_retries:
                 # Retry budget exhausted: fail the task instead of looping forever.
-                plan.append(('failed', r, new_retry))
+                plan.append(('failed', r, new_retry, ''))
             else:
-                plan.append(('recovered', r, new_retry))
+                # Exponential cooldown so a repeatedly failing task cannot
+                # hot-loop through dispatch; --backoff-base 0 disables it.
+                plan.append(('recovered', r, new_retry,
+                             _backoff_deadline(new_retry, backoff_base, backoff_cap)))
         if dry_run:
             # Non-destructive preview: report what the next real pass would do.
             print(json.dumps({'ok':True,'dry_run':True,
-                'would_recover':[r['id'] for kind,r,_ in plan if kind=='recovered'],
-                'would_fail':[r['id'] for kind,r,_ in plan if kind=='failed'],
+                'would_recover':[r['id'] for kind,r,_,_ in plan if kind=='recovered'],
+                'would_fail':[r['id'] for kind,r,_,_ in plan if kind=='failed'],
+                'backoff':{r['id']:ra for kind,r,_,ra in plan if kind=='recovered' and ra},
                 'count':len(plan)}))
             return
-        for kind, r, new_retry in plan:
+        for kind, r, new_retry, ra in plan:
             if kind == 'failed':
                 c.execute("UPDATE tasks SET status='failed',lease_owner='',lease_expires_at='',retry_count=?,blocked_reason='max lease retries exceeded',updated_at=? WHERE id=?",(new_retry,now,r['id']))
                 autopilot.audit(c, 'task', r['id'], 'lease_failed', {'previous_owner': r['lease_owner'], 'previous_status': r['status'], 'retry_count': new_retry})
                 failed.append(r['id'])
             else:
-                c.execute("UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',retry_count=?,blocked_reason='stale lease recovered',updated_at=? WHERE id=?",(new_retry,now,r['id']))
-                autopilot.audit(c, 'task', r['id'], 'lease_recovered', {'previous_owner': r['lease_owner'], 'previous_status': r['status'], 'retry_count': new_retry})
+                c.execute("UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',retry_count=?,recover_after=?,blocked_reason='stale lease recovered',updated_at=? WHERE id=?",(new_retry,ra,now,r['id']))
+                autopilot.audit(c, 'task', r['id'], 'lease_recovered', {'previous_owner': r['lease_owner'], 'previous_status': r['status'], 'retry_count': new_retry, 'recover_after': ra})
                 recovered.append(r['id'])
-    print(json.dumps({'ok':True,'recovered':recovered,'failed':failed,'count':len(recovered)+len(failed)}))
+    print(json.dumps({'ok':True,'recovered':recovered,'failed':failed,
+                      'backoff':{r['id']:ra for kind,r,_,ra in plan if kind=='recovered' and ra},
+                      'count':len(recovered)+len(failed)}))
 
 def approval(args):
     status={'approve':'waiting_for_review','reject':'blocked','block':'blocked'}[args.action]
@@ -427,7 +443,7 @@ import argparse
 p=argparse.ArgumentParser(); s=p.add_subparsers(dest='cmd',required=True)
 for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning),('doctor',doctor)]:
  x=s.add_parser(name); x.set_defaults(fn=fn)
-x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
+x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--backoff-base',type=int,default=60); x.add_argument('--backoff-cap',type=int,default=3600); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)
 x=s.add_parser('snapshot-check'); x.add_argument('path'); x.set_defaults(fn=snapshot_check)
 x=s.add_parser('snapshot-restore'); x.add_argument('path'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=snapshot_restore)

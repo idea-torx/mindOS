@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS tasks (
    lease_expires_at TEXT NOT NULL DEFAULT '',
    lease_epoch INTEGER NOT NULL DEFAULT 0,
    retry_count INTEGER NOT NULL DEFAULT 0,
+   recover_after TEXT NOT NULL DEFAULT '',
    due_at TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
@@ -201,6 +202,8 @@ def _migrate(db) -> None:
         db.execute("ALTER TABLE tasks ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0")
     if "due_at" not in task_cols:
         db.execute("ALTER TABLE tasks ADD COLUMN due_at TEXT NOT NULL DEFAULT ''")
+    if "recover_after" not in task_cols:
+        db.execute("ALTER TABLE tasks ADD COLUMN recover_after TEXT NOT NULL DEFAULT ''")
     prev = ""
     for row in db.execute("SELECT id,prev_hash,hash FROM audit_events ORDER BY id").fetchall():
         if row[2]:
@@ -568,7 +571,7 @@ def _acquire(db, task_id: str, owner: str, minutes: int, max_active: int = 0):
     exp = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + minutes * 60, timezone.utc).replace(microsecond=0).isoformat()
     t = now()
     cur = db.execute(
-        "UPDATE tasks SET status='claimed', lease_owner=?, lease_expires_at=?, lease_epoch=lease_epoch+1, updated_at=? "
+        "UPDATE tasks SET status='claimed', lease_owner=?, lease_expires_at=?, lease_epoch=lease_epoch+1, recover_after='', updated_at=? "
         "WHERE id=? AND (lease_owner=? OR lease_owner='' OR lease_expires_at='' OR lease_expires_at<=?) "
         "AND (?<=0 OR (SELECT COUNT(*) FROM tasks o WHERE o.lease_owner=? AND o.id!=tasks.id "
         "AND o.lease_expires_at!='' AND o.lease_expires_at>?)<?)",
@@ -793,12 +796,19 @@ def add_dep(args):
 def next_task(args):
     """Dispatch: highest-priority queued task whose dependencies are all completed.
 
+    Tasks in recovery backoff (recover_after in the future, set by ops.py
+    recover after a stale lease) are skipped so failing work cannot hot-loop
+    through dispatch; an explicit claim remains allowed as a deliberate
+    operator override.
+
     With --explain, the result also reports how many queued candidates were
-    considered and why each skipped candidate was not picked (currently
-    unsatisfied_dependencies with the blocking ids), giving dispatchers
-    visibility into why work is not flowing.
+    considered and why each skipped candidate was not picked
+    (unsatisfied_dependencies with the blocking ids, or recovery_backoff with
+    its cooldown deadline), giving dispatchers visibility into why work is not
+    flowing.
     """
     explain = bool(getattr(args, "explain", False))
+    t_now = now()
     with conn() as db:
         q = "SELECT * FROM tasks WHERE status='queued'"
         vals = []
@@ -814,6 +824,11 @@ def next_task(args):
                 if explain:
                     skipped.append({"task_id": r["id"], "reason": "unsatisfied_dependencies",
                                     "blocked_by": [d["id"] for d in pending]})
+                continue
+            if r["recover_after"] and r["recover_after"] > t_now:
+                if explain:
+                    skipped.append({"task_id": r["id"], "reason": "recovery_backoff",
+                                    "recover_after": r["recover_after"]})
                 continue
             picked = r
             break
@@ -914,6 +929,9 @@ def metrics(args):
         blocked_by_deps = db.execute(
             "SELECT COUNT(*) n FROM tasks t WHERE t.status='queued' AND EXISTS("
             "SELECT 1 FROM task_deps d JOIN tasks dt ON dt.id=d.depends_on WHERE d.task_id=t.id AND dt.status!='completed')").fetchone()["n"]
+        in_backoff = db.execute(
+            "SELECT COUNT(*) n FROM tasks WHERE status='queued' AND recover_after!='' AND recover_after>?",
+            (t,)).fetchone()["n"]
         leases_by_owner = {r["lease_owner"]: r["n"] for r in db.execute(
             "SELECT lease_owner,COUNT(*) n FROM tasks WHERE lease_owner!='' AND lease_expires_at!='' AND lease_expires_at>? GROUP BY lease_owner",
             (t,))}
@@ -936,6 +954,7 @@ def metrics(args):
         "stale_leases": stale,
         "active_leases_by_owner": leases_by_owner,
         "queued_blocked_by_deps": blocked_by_deps,
+        "tasks_in_backoff": in_backoff,
         "overdue_tasks": [r["id"] for r in overdue],
         "due_within_24h": due_soon,
         "total_retries": retries["s"],
