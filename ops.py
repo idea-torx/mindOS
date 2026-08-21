@@ -2,6 +2,8 @@
 """Autopilot v1.1 safe operations: recovery, approvals, reconciliation, reports."""
 from __future__ import annotations
 import json, os, re, sqlite3, subprocess, sys, tempfile, urllib.request, hashlib
+import contextlib, io
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -1631,15 +1633,17 @@ _MIGRATION_BOOKKEEPING_SECRET_ACTIONS = ('secret_blocked', 'secret_redacted', 's
 def _foreign_audit_total(c):
     """Count target audit events that are genuine local history.
 
-    System-scoped migration bookkeeping (inventory seals, this migrator's own
-    secret decisions) never makes a home "lived-in" — the canonical
-    init -> migrate-inventory -> migrate-import flow must work with no special
-    flags. Any other event is operator/agent history that demands the explicit
+    System-scoped migration/onboarding bookkeeping (inventory seals, this
+    migrator's own secret decisions, onboarding reports) never makes a home
+    "lived-in" — the canonical init -> migrate-inventory -> onboard flow must
+    work with no special flags, including the dry-run -> apply progression.
+    Any other event is operator/agent history that demands the explicit
     --relink-audit decision before a foreign chain can be merged.
     """
     return c.execute(
         "SELECT COUNT(*) FROM audit_events WHERE NOT (entity_type='system' AND ("
-        "(action LIKE 'migration\\_%' ESCAPE '\\') OR action IN (?,?,?)))",
+        "(action LIKE 'migration\\_%' ESCAPE '\\') OR (action LIKE 'onboarding\\_%' ESCAPE '\\') "
+        "OR action IN (?,?,?)))",
         _MIGRATION_BOOKKEEPING_SECRET_ACTIONS).fetchone()[0]
 
 def _migration_secret_policy(rows_by_table, redact, allow, source_id, applying):
@@ -2145,6 +2149,221 @@ def migrate_rollback(args=None):
     finally:
         c.close()
 
+ONBOARDING_FORMAT = 'autopilot-onboarding-v1'
+_ONBOARD_PROBE_ID = 'onboard-probe'
+
+def _capture_json(fn, fn_args=None):
+    """Run an ops stage in-process and parse the JSON it prints."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        fn(fn_args)
+    try:
+        return json.loads(buf.getvalue())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f'{getattr(fn, "__name__", "stage")} returned non-JSON output: {e}')
+
+def _onboard_preflight():
+    con = sqlite3.connect(':memory:')
+    try:
+        fts5 = bool(con.execute("SELECT sqlite_compileoption_used('ENABLE_FTS5')").fetchone()[0])
+    finally:
+        con.close()
+    root = autopilot.ROOT
+    writable = os.access(root if root.exists() else root.parent, os.W_OK)
+    warnings = []
+    if not writable:
+        problems = [f'autopilot home is not writable: {root}']
+    else:
+        problems = []
+    if not fts5:
+        # Graceful degradation is supported everywhere; onboarding proceeds
+        # but the report records that ranked retrieval runs in LIKE mode.
+        warnings.append('sqlite build lacks FTS5; ranked retrieval degrades to substring search')
+    return {'python': sys.version.split()[0], 'sqlite': sqlite3.sqlite_version,
+            'fts5': fts5, 'home': str(root), 'home_writable': bool(writable),
+            'warnings': warnings, 'problems': problems}
+
+def _onboard_probe():
+    """Prove the cross-agent protocol end-to-end through the real CLI surface.
+
+    Two distinct agent identities (hermes hands off, codex picks up) exercise
+    handoff -> recall -> ack -> resume -> receipt -> complete against a
+    dedicated probe task, so "all agents can recall and hand off the same
+    context" is verified execution, not a claim. Idempotent: an already-done
+    probe task from a prior onboarding is skipped, and an interrupted probe
+    resumes (handoff dedupes, resume reclaims) instead of duplicating.
+    """
+    script = Path(autopilot.__file__).resolve()
+
+    def cli(*a):
+        code, out, err = run([sys.executable, str(script), *a])
+        if code != 0:
+            raise SystemExit(f"probe step '{a[0]}' failed: {err or out}")
+        return json.loads(out)
+
+    with db() as c:
+        row = c.execute('SELECT status FROM tasks WHERE id=?', (_ONBOARD_PROBE_ID,)).fetchone()
+    if row and row['status'] == 'completed':
+        return {'status': 'skipped', 'reason': f'{_ONBOARD_PROBE_ID} already done by a prior onboarding'}
+    if not row:
+        cli('create', '--project', 'meta', '--title', 'onboarding protocol probe',
+            '--description', 'created by ops.py onboard --probe; safe to archive afterwards',
+            '--id', _ONBOARD_PROBE_ID)
+    h = cli('handoff', _ONBOARD_PROBE_ID, '--from-agent', 'hermes', '--to-agent', 'codex',
+            '--objective', 'onboarding cross-agent protocol probe')
+    bundle = cli('recall', _ONBOARD_PROBE_ID, '--agent', 'codex')
+    digest = bundle['digest']
+    cli('ack', _ONBOARD_PROBE_ID, '--agent', 'codex', '--recall-digest', digest)
+    cli('resume', _ONBOARD_PROBE_ID, '--agent', 'codex')
+    rec = cli('receipt', _ONBOARD_PROBE_ID, '--kind', 'verification',
+              '--payload', '{"probe": "cross-agent-handoff"}')
+    cli('complete', _ONBOARD_PROBE_ID, '--owner', 'codex',
+        '--note', 'protocol probe: hermes handed off, codex recalled, acked, completed with evidence',
+        '--receipt', rec['receipt_id'])
+    with db() as c:
+        done = c.execute("SELECT status FROM tasks WHERE id=?", (_ONBOARD_PROBE_ID,)).fetchone()
+        acked = c.execute(
+            "SELECT acked_by FROM handoffs WHERE id=? AND superseded_by=''", (h['id'],)).fetchone()
+    if not done or done['status'] != 'completed':
+        raise SystemExit('protocol probe completed its steps but the task did not settle to completed')
+    if not acked or acked['acked_by'] != 'codex':
+        raise SystemExit('protocol probe handoff was not acknowledged by codex')
+    return {'status': 'ok', 'task_id': _ONBOARD_PROBE_ID, 'handoff_id': h['id'],
+            'deduplicated': h.get('deduplicated', False), 'recall_digest': digest,
+            'receipt_id': rec['receipt_id']}
+
+def onboard(args):
+    """One command from sealed inventory to a verified working Autopilot home.
+
+    The installer's front door: preflight environment checks, idempotent
+    control-plane initialization, seal verification of the stage-one manifest
+    with fail-closed refusal, unambiguous source selection, a dry-run import
+    plan, then — only under `--apply` — the real import, doctor's full
+    consistency sweep, and optionally (`--probe`) an end-to-end cross-agent
+    protocol exercise through the real CLI. Every stage lands in a sealed
+    autopilot-onboarding-v1 report; any failure stops onboarding before later
+    stages run and exits non-zero naming what failed.
+
+    Dry-run writes nothing but its own bookkeeping (the same convention as
+    migrate-inventory), so `--probe` requires `--apply`: a probe mutates the
+    target home by design. Re-running is safe — init, import, doctor, and the
+    probe are all idempotent, which makes an interrupted onboarding resumable
+    by simply running the same command again.
+    """
+    t = utc()
+    stages = []
+    inv = None
+    sid = ''
+    abort_msg = ''
+    ok = True
+    try:
+        pre = _onboard_preflight()
+        problems = pre.pop('problems')
+        stages.append({'stage': 'preflight', 'status': 'failed' if problems else 'ok',
+                       **pre, **({'problems': problems} if problems else {})})
+        if problems:
+            raise SystemExit('; '.join(problems))
+        autopilot.ensure()
+        stages.append({'stage': 'init_control_plane', 'status': 'ok'})
+        inv = _load_inventory(Path(args.inventory))
+        if inv.get('fail_closed'):
+            raise SystemExit('inventory failed closed; resolve blocked sources before onboarding')
+        candidates = [s_ for s_ in inv.get('sources', [])
+                      if s_['kind'] == 'autopilot_sqlite' and s_['status'] == 'ok']
+        sid = getattr(args, 'source_id', '') or (candidates[0]['id'] if len(candidates) == 1 else '')
+        if not sid:
+            known = ', '.join(s_['id'] for s_ in inv.get('sources', [])
+                              if s_['kind'] == 'autopilot_sqlite')
+            raise SystemExit(
+                f'{len(candidates)} healthy autopilot_sqlite source(s): ambiguous; pass '
+                f'--source-id explicitly (candidates: {known or "none"})')
+        if not any(s_['id'] == sid for s_ in candidates):
+            raise SystemExit(f'source {sid} is not a healthy autopilot_sqlite source in this inventory')
+        stages.append({'stage': 'select_source', 'status': 'ok', 'source_id': sid})
+        ns = SimpleNamespace(inventory=args.inventory, source_id=sid, apply=False, out=None,
+                             redact=getattr(args, 'redact', False),
+                             allow_secret=getattr(args, 'allow_secret', False),
+                             relink_audit=getattr(args, 'relink_audit', False))
+        plan = _capture_json(migrate_import, ns)
+        stages.append({'stage': 'import_plan', 'status': 'ok', 'tables': plan.get('tables'),
+                       'secret_kinds': plan.get('secret_kinds', []),
+                       'sanitized_tasks': plan.get('sanitized_tasks', [])})
+        result_doc = ''
+        if getattr(args, 'apply', False):
+            result_doc = str(autopilot.ROOT / 'migrations' /
+                             f'migration-result-{inv["sha256"][:8]}.json')
+            ns.apply = True
+            ns.out = result_doc
+            applied = _capture_json(migrate_import, ns)
+            hp = applied.get('health', {}).get('problems', [])
+            result_doc = applied.get('result_doc', result_doc)
+            stages.append({'stage': 'import_apply', 'status': 'failed' if hp else 'ok',
+                           'inserted': applied.get('inserted'),
+                           'skipped_existing': applied.get('skipped_existing'),
+                           'deduplicated': applied.get('deduplicated'),
+                           'audit_events_imported': applied.get('audit_events_imported'),
+                           'result_doc': result_doc,
+                           **({'health_problems': hp} if hp else {})})
+            if hp:
+                raise SystemExit('import failed its post-apply health check')
+        doc_report = _capture_json(doctor, None)
+        dp = doc_report.get('problems', [])
+        stages.append({'stage': 'doctor', 'status': 'failed' if dp else 'ok',
+                       'problem_count': len(dp),
+                       **({'problems': dp[:20]} if dp else {})})
+        if dp:
+            raise SystemExit(f'doctor found {len(dp)} problem(s); fix them before relying on this home')
+        if getattr(args, 'probe', False):
+            if not getattr(args, 'apply', False):
+                raise SystemExit('--probe requires --apply: a probe mutates the home by design')
+            stages.append({'stage': 'protocol_probe', **_onboard_probe()})
+    except SystemExit as e:
+        ok = False
+        abort_msg = str(e)
+        if not stages or stages[-1].get('status') != 'failed':
+            stages.append({'stage': 'aborted', 'status': 'failed', 'error': abort_msg})
+    summary = {
+        'stages_total': len(stages),
+        'stages_ok': sum(1 for s in stages if s.get('status') in ('ok', 'skipped')),
+        'applied': bool(getattr(args, 'apply', False)),
+        'probed': any(s.get('stage') == 'protocol_probe' for s in stages)}
+    body = {'format': ONBOARDING_FORMAT, 'created_at': t, 'home': str(autopilot.ROOT),
+            'inventory_path': str(args.inventory),
+            'inventory_sha256': inv['sha256'] if inv else '',
+            'source_id': sid, 'stages': stages, 'summary': summary}
+    # Same sealing convention as the inventory: created_at stays outside the
+    # digest so identical onboarding states reproduce an identical report.
+    digest = hashlib.sha256(json.dumps(
+        {k: v for k, v in body.items() if k != 'created_at'}, sort_keys=True).encode()).hexdigest()
+    doc = {**body, 'sha256': digest}
+    try:
+        autopilot.ensure()
+        with db() as c:
+            autopilot.audit(c, 'system', 'onboarding',
+                            'onboarding_completed' if ok else 'onboarding_failed',
+                            {'sha256': digest, 'source_id': sid, 'applied': summary['applied'],
+                             'stages': [s['stage'] for s in stages]})
+    except Exception:
+        pass   # reporting must never mask the stage outcome it describes
+    out = getattr(args, 'out', None)
+    compact = {'ok': ok, 'sha256': digest, 'home': str(autopilot.ROOT), 'summary': summary,
+               'stages': [{'stage': s.get('stage'), 'status': s.get('status')} for s in stages]}
+    if out:
+        out_path = Path(out); out_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix='.onboarding.', dir=str(out_path.parent))
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(json.dumps(doc, sort_keys=True)); f.flush(); os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, str(out_path))
+        finally:
+            if os.path.exists(tmp): os.unlink(tmp)
+        print(json.dumps({**compact, 'path': str(out_path)}, sort_keys=True))
+    else:
+        print(json.dumps(doc, sort_keys=True))
+    if not ok:
+        sys.exit('onboarding failed:\n  ' + abort_msg)
+
 def policy(args):
     # Resolve through autopilot.POLICIES so HERMES_AUTOPILOT_HOME is honored —
     # a hardcoded live-home path would read (or miss) the wrong policies in
@@ -2184,5 +2403,6 @@ x=s.add_parser('migrate-inventory'); x.add_argument('--root',required=True); x.a
 x=s.add_parser('migrate-inventory-check'); x.add_argument('path'); x.set_defaults(fn=migrate_inventory_check)
 x=s.add_parser('migrate-import'); x.add_argument('--inventory',required=True); x.add_argument('--source-id',dest='source_id',required=True); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--out',default=None,help='write a sealed autopilot-migration-result-v1 document'); x.add_argument('--redact',action='store_true'); x.add_argument('--allow-secret',action='store_true'); x.add_argument('--relink-audit',dest='relink_audit',action='store_true',help='merge into a non-empty audit ledger and relink the combined chain'); x.set_defaults(fn=migrate_import)
 x=s.add_parser('migrate-rollback'); x.add_argument('result'); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--force',action='store_true',help='cascade away drifted rows and local dependents of imported tasks'); x.set_defaults(fn=migrate_rollback)
+x=s.add_parser('onboard'); x.add_argument('--inventory',required=True,help='sealed autopilot-migration-inventory-v1 manifest from migrate-inventory'); x.add_argument('--source-id',dest='source_id',default='',help='autopilot_sqlite source to import; auto-selected when exactly one is healthy'); x.add_argument('--apply',action='store_true',help='without this flag onboarding plans and verifies but does not import'); x.add_argument('--out',default=None,help='write a sealed autopilot-onboarding-v1 report document'); x.add_argument('--redact',action='store_true'); x.add_argument('--allow-secret',action='store_true'); x.add_argument('--relink-audit',dest='relink_audit',action='store_true',help='merge into a non-empty audit ledger and relink the combined chain (forwarded to migrate-import)'); x.add_argument('--probe',action='store_true',help='run the end-to-end cross-agent handoff/recall/ack/complete probe (requires --apply)'); x.set_defaults(fn=onboard)
 if __name__ == '__main__':
     args=p.parse_args(); args.fn(args)

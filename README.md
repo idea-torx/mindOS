@@ -1073,6 +1073,7 @@ python3 "$O" archive-check <file>      # verify an archive's integrity hash
 python3 "$O" archive-restore <file> [--force]  # re-import archived tasks
 python3 "$O" notes-expired             # list live notes past their TTL (read-only)
 python3 "$O" consolidate [--task ID] [--dry-run]   # merge near-duplicate notes into canonical facts
+python3 "$O" onboard --inventory inv.json [--apply] [--probe]   # one-command installer: init + import + doctor + protocol proof
 ```
 
 `snapshot` writes an atomic, `autopilot-snapshot-v1` JSON document (default
@@ -1499,6 +1500,53 @@ Design rules, enforced and tested:
 The full installer lifecycle is therefore: `init` → `migrate-inventory` →
 `migrate-import --apply --out` → (verify) → optional `migrate-rollback`,
 each stage dry-run-first, sealed, and independently re-runnable.
+
+## One-command onboarding (`ops.py onboard`)
+
+The installer's front door: one command that takes a sealed stage-one
+inventory and turns a fresh machine into a verified working Autopilot home —
+no manual file choreography:
+
+```bash
+python3 "$O" onboard --inventory inventory.json                       # plan + verify, nothing imported
+python3 "$O" onboard --inventory inventory.json --apply               # import + doctor
+python3 "$O" onboard --inventory inventory.json --apply --probe       # + cross-agent protocol proof
+python3 "$O" onboard --inventory inventory.json --apply --out report.json   # sealed onboarding report
+```
+
+Stages run in order and any failure stops the run before later stages,
+exiting non-zero naming what failed:
+
+1. **preflight** — python/sqlite versions, FTS5 availability (recorded as a
+   warning when absent: ranked retrieval degrades to LIKE), home writability.
+2. **init_control_plane** — idempotent `init`; a bare directory is enough.
+3. **select_source** — verifies the manifest seal, refuses fail-closed
+   inventories outright, auto-selects the single healthy `autopilot_sqlite`
+   source; several candidates without an explicit `--source-id` is ambiguous
+   and refuses listing them.
+4. **import_plan** — the migrate-import dry-run always runs first, so the
+   report shows exactly what would move before anything does. Secret policy
+   flags (`--redact`, `--allow-secret`) and `--relink-audit` forward to the
+   import unchanged.
+5. **import_apply** (only under `--apply`) — the real import; its sealed
+   rollback journal lands in `<home>/migrations/`, so every onboard is undoable
+   by the stage-three tooling.
+6. **doctor** — the full consistency sweep must come back clean or onboarding
+   fails closed.
+7. **protocol_probe** (`--probe`, requires `--apply`) — execution proof of the
+   contract's cross-agent requirement: two distinct identities (`hermes` hands
+   off, `codex` picks up) exercise handoff → recall → ack → resume → receipt →
+   complete against a dedicated `onboard-probe` task through the real CLI.
+
+Everything is idempotent, so an interrupted onboarding resumes by running the
+same command again: init re-runs harmlessly, imports deduplicate to nothing,
+the probe skips when its task has already settled. Dry-run writes nothing but
+its own bookkeeping audit events (the same convention as `migrate-inventory`,
+and such bookkeeping never makes a home "lived-in" for a later import) — which
+is why `--probe` refuses to run without `--apply`: a probe mutates by design.
+With `--out`, a sha256-sealed `autopilot-onboarding-v1` report (0600, seal
+excluding only `created_at`) records every stage for audit; the stdout summary
+is a compact view of it.
 
 ## Session ingestion (read-only transcript adapter)
 

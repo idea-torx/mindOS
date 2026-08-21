@@ -2187,6 +2187,69 @@ with tempfile.TemporaryDirectory() as td:
                           str(oldfmt)], env=tenv, text=True, capture_output=True)
     assert err.returncode != 0 and 'no rollback journal' in err.stdout + err.stderr
 
+    # Onboarding: one command from a sealed stage-one inventory to a verified
+    # working home. Dry-run plans and verifies but imports nothing; --apply
+    # imports, sweeps doctor, and (--probe) exercises the cross-agent protocol
+    # end-to-end through the real CLI; re-runs are idempotent; ambiguous or
+    # fail-closed inventories refuse before anything moves.
+    ob_home = Path(td) / 'onboard-home'
+    obenv = os.environ.copy(); obenv['HERMES_AUTOPILOT_HOME'] = str(ob_home)
+    def oops(*a, fail=False):
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=obenv, text=True, capture_output=True)
+        if fail:
+            assert p.returncode != 0, ('expected refusal', a, p.stdout, p.stderr)
+            return p.stdout + p.stderr
+        assert p.returncode == 0, (a, p.stdout, p.stderr)
+        return json.loads(p.stdout)
+    ob_rep = Path(td) / 'onboard-dry.json'
+    ob_inv = Path(td) / 'inventory-onboard.json'   # fresh seal: the earlier
+    # post-seal-drift test deliberately mutated impsrc after inv2 was sealed.
+    ops('migrate-inventory', '--root', str(Path(td) / 'impsrc'), '--out', str(ob_inv))
+    dry = oops('onboard', '--inventory', str(ob_inv), '--out', str(ob_rep))
+    assert dry['ok'] is True and [s['stage'] for s in dry['stages']] == \
+        ['preflight', 'init_control_plane', 'select_source', 'import_plan', 'doctor'], dry
+    assert ob_rep.stat().st_mode & 0o077 == 0                          # sealed report is 0600
+    with sqlite3.connect(ob_home / 'state.db') as db:                   # init ran...
+        assert db.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0   # ...but nothing imported
+    err = oops('onboard', '--inventory', str(ob_inv), '--probe', fail=True)
+    assert '--probe requires --apply' in err, err                       # probe mutates by design
+    ob_rep2 = Path(td) / 'onboard-apply.json'
+    rep = oops('onboard', '--inventory', str(ob_inv), '--apply', '--probe', '--out', str(ob_rep2))
+    assert [s['stage'] for s in rep['stages']] == \
+        ['preflight', 'init_control_plane', 'select_source', 'import_plan',
+         'import_apply', 'doctor', 'protocol_probe'], rep
+    assert all(s['status'] == 'ok' for s in rep['stages']), rep
+    assert rep['stages'] == [{'stage': s['stage'], 'status': s['status']} for s in
+                             json.loads(ob_rep2.read_text())['stages']], rep   # stdout is a compact view
+    rdoc = json.loads(ob_rep2.read_text())
+    probe_stage = next(s for s in rdoc['stages'] if s['stage'] == 'protocol_probe')
+    assert probe_stage['handoff_id'] and len(probe_stage['recall_digest']) == 64, probe_stage
+    # seal convention: created_at outside
+    body = {k: v for k, v in rdoc.items() if k not in ('created_at', 'sha256')}
+    assert hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest() == rdoc['sha256']
+    with sqlite3.connect(ob_home / 'state.db') as db:
+        assert db.execute("SELECT status FROM tasks WHERE id='mig-1'").fetchone()[0] == 'completed'
+        assert db.execute("SELECT status FROM tasks WHERE id='mig-2'").fetchone()[0] == 'queued'  # lease sanitized
+        assert db.execute("SELECT status FROM tasks WHERE id='onboard-probe'").fetchone()[0] == 'completed'
+        assert db.execute("SELECT acked_by FROM handoffs WHERE id=?",
+                          (probe_stage['handoff_id'],)).fetchone()[0] == 'codex'
+    result_doc = Path(next(s for s in rdoc['stages']
+                           if s['stage'] == 'import_apply')['result_doc'])
+    assert result_doc.exists() and result_doc.parent.name == 'migrations'   # undo path is durable
+    rerun = oops('onboard', '--inventory', str(ob_inv), '--apply', '--probe', '--out', str(ob_rep2))
+    assert rerun['ok'] is True, rerun
+    rdoc2 = json.loads(ob_rep2.read_text())
+    by_name = {s['stage']: s for s in rdoc2['stages']}
+    assert by_name['import_apply']['deduplicated'] is True, rdoc2          # import dedupes to nothing
+    assert by_name['protocol_probe']['status'] == 'skipped', rdoc2         # probe does not duplicate
+    amb_home_a = mkhome(Path(td) / 'amb/a/autopilot'); amb_home_b = mkhome(Path(td) / 'amb/b/autopilot')
+    amb_inv = ops('migrate-inventory', '--root', str(Path(td) / 'amb'), '--out',
+                  str(Path(td) / 'amb-inv.json'))
+    err = oops('onboard', '--inventory', str(Path(td) / 'amb-inv.json'), '--apply', fail=True)
+    assert 'ambiguous' in err and '--source-id' in err and 'candidates:' in err, err
+    err = oops('onboard', '--inventory', str(fc_path), '--apply', fail=True)
+    assert 'failed closed' in err, err                                  # blocked sources never import
+
     # --- Audit & hardening round: regression coverage ---
     # ops policy must resolve policies under HERMES_AUTOPILOT_HOME; a hardcoded
     # live-home path would report gate decisions about the wrong fleet.
