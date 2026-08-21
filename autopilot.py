@@ -184,6 +184,46 @@ def receipt(args):
         if os.path.exists(tmp): os.unlink(tmp)
     json_out({"ok": True, "receipt_id": rid, "task_id": args.task_id, "sha256": hashlib.sha256(data.encode()).hexdigest()})
 
+def show(args):
+    with conn() as db:
+        out = dict(task_row(db, args.id))
+        receipts = [dict(r) for r in db.execute(
+            "SELECT id,kind,payload_json,created_at FROM receipts WHERE task_id=? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (args.id, args.limit)).fetchall()]
+        events = [dict(r) for r in db.execute(
+            "SELECT action,payload_json,created_at FROM audit_events WHERE entity_type='task' AND entity_id=? ORDER BY id DESC LIMIT ?",
+            (args.id, args.limit)).fetchall()]
+    for r in receipts:
+        r["payload"] = json.loads(r.pop("payload_json"))
+    for e in events:
+        e["payload"] = json.loads(e.pop("payload_json"))
+    out["receipts"] = receipts
+    out["audit"] = events
+    json_out(out)
+
+def metrics(args):
+    t = now()
+    with conn() as db:
+        by_status = {r["status"]: r["n"] for r in db.execute("SELECT status,COUNT(*) n FROM tasks GROUP BY status")}
+        by_project = {r["project"]: r["n"] for r in db.execute("SELECT project,COUNT(*) n FROM tasks GROUP BY project")}
+        stale = db.execute(
+            "SELECT COUNT(*) n FROM tasks WHERE lease_expires_at!='' AND lease_expires_at<? AND status IN ('claimed','running','waiting_for_agent')",
+            (t,)).fetchone()["n"]
+        retries = db.execute("SELECT COALESCE(SUM(retry_count),0) s,COALESCE(MAX(retry_count),0) m FROM tasks").fetchone()
+        receipts = db.execute("SELECT COUNT(*) n FROM receipts").fetchone()["n"]
+        events = db.execute("SELECT COUNT(*) n FROM audit_events").fetchone()["n"]
+    json_out({
+        "generated_at": t,
+        "tasks_total": sum(by_status.values()),
+        "tasks_by_status": by_status,
+        "tasks_by_project": by_project,
+        "stale_leases": stale,
+        "total_retries": retries["s"],
+        "max_retries_seen": retries["m"],
+        "receipts": receipts,
+        "audit_events": events,
+    })
+
 def list_tasks(args):
     with conn() as db:
         q = "SELECT * FROM tasks"
@@ -228,6 +268,8 @@ def main():
     p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.set_defaults(fn=heartbeat)
     p=sub.add_parser("receipt"); p.add_argument("task_id"); p.add_argument("--kind",required=True); p.add_argument("--payload",default="{}"); p.set_defaults(fn=receipt)
     p=sub.add_parser("list"); p.add_argument("--status"); p.add_argument("--project"); p.set_defaults(fn=list_tasks)
+    p=sub.add_parser("show"); p.add_argument("id"); p.add_argument("--limit",type=int,default=20); p.set_defaults(fn=show)
+    p=sub.add_parser("metrics"); p.set_defaults(fn=metrics)
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
     args=ap.parse_args(); args.fn(args)
 

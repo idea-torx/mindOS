@@ -18,14 +18,22 @@ def run(cmd, cwd=None):
     except Exception as e: return 1,"",str(e)
 
 def recover(args=None):
-    now=utc(); recovered=[]
+    now=utc(); recovered=[]; failed=[]
+    max_retries = getattr(args, 'max_retries', 3) if args is not None else 3
     with db() as c:
-        rows=c.execute("SELECT id,lease_owner,lease_expires_at,status FROM tasks WHERE lease_expires_at!='' AND lease_expires_at<? AND status IN ('claimed','running','waiting_for_agent')",(now,)).fetchall()
+        rows=c.execute("SELECT id,lease_owner,lease_expires_at,status,retry_count FROM tasks WHERE lease_expires_at!='' AND lease_expires_at<=? AND status IN ('claimed','running','waiting_for_agent')",(now,)).fetchall()
         for r in rows:
-            c.execute("UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',retry_count=retry_count+1,blocked_reason='stale lease recovered',updated_at=? WHERE id=?",(now,r['id']))
-            autopilot.audit(c, 'task', r['id'], 'lease_recovered', {'previous_owner': r['lease_owner'], 'previous_status': r['status']})
-            recovered.append(r['id'])
-    print(json.dumps({'ok':True,'recovered':recovered,'count':len(recovered)}))
+            new_retry = r['retry_count'] + 1
+            if new_retry > max_retries:
+                # Retry budget exhausted: fail the task instead of looping forever.
+                c.execute("UPDATE tasks SET status='failed',lease_owner='',lease_expires_at='',retry_count=?,blocked_reason='max lease retries exceeded',updated_at=? WHERE id=?",(new_retry,now,r['id']))
+                autopilot.audit(c, 'task', r['id'], 'lease_failed', {'previous_owner': r['lease_owner'], 'previous_status': r['status'], 'retry_count': new_retry})
+                failed.append(r['id'])
+            else:
+                c.execute("UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',retry_count=?,blocked_reason='stale lease recovered',updated_at=? WHERE id=?",(new_retry,now,r['id']))
+                autopilot.audit(c, 'task', r['id'], 'lease_recovered', {'previous_owner': r['lease_owner'], 'previous_status': r['status'], 'retry_count': new_retry})
+                recovered.append(r['id'])
+    print(json.dumps({'ok':True,'recovered':recovered,'failed':failed,'count':len(recovered)+len(failed)}))
 
 def approval(args):
     status={'approve':'waiting_for_review','reject':'blocked','block':'blocked'}[args.action]
@@ -95,8 +103,9 @@ def policy(args):
 
 import argparse
 p=argparse.ArgumentParser(); s=p.add_subparsers(dest='cmd',required=True)
-for name,fn in [('recover',recover),('processes',processes),('github',github),('sentry',sentry),('morning',morning)]:
+for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning)]:
  x=s.add_parser(name); x.set_defaults(fn=fn)
+x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.set_defaults(fn=recover)
 x=s.add_parser('approval'); x.add_argument('action',choices=['approve','reject','block']); x.add_argument('id'); x.add_argument('--by',default='leo'); x.add_argument('--reason',default=''); x.add_argument('--next-action',default=''); x.set_defaults(fn=approval)
 x=s.add_parser('policy'); x.add_argument('project'); x.add_argument('action'); x.set_defaults(fn=policy)
 args=p.parse_args(); args.fn(args)

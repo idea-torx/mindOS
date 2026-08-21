@@ -32,4 +32,36 @@ with tempfile.TemporaryDirectory() as td:
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
         assert db.execute('select count(*) from audit_events').fetchone()[0] >= 4
+    # Concurrency: exactly one of N simultaneous claimers wins the lease.
+    run('create','--project','Verify','--title','race','--id','race-1')
+    procs = [subprocess.Popen(
+        [sys.executable, str(ROOT / 'autopilot.py'), 'claim', 'race-1', '--owner', f'worker-{i}', '--minutes', '5'],
+        env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for i in range(8)]
+    results = [p.communicate() + (p.returncode,) for p in procs]
+    assert [r[2] for r in results].count(0) == 1, ('expected exactly one winner', results)
+    winner = json.loads(next(r[0] for r in results if r[2] == 0))
+    assert winner['lease_owner'].startswith('worker-')
+    # Recovery: an expired lease is requeued and its retry budget consumed.
+    run('create','--project','Verify','--title','recover smoke','--id','rec-1')
+    run('claim','rec-1','--owner','tester','--minutes','0')
+    def ops(*a):
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=env, text=True, capture_output=True)
+        assert p.returncode == 0, (a, p.stdout, p.stderr)
+        return json.loads(p.stdout)
+    out = ops('recover','--max-retries','1')
+    assert out['recovered'] == ['rec-1'] and out['failed'] == []
+    row = next(r for r in run('list') if r['id'] == 'rec-1')
+    assert row['status'] == 'queued' and row['retry_count'] == 1
+    # Retry budget exhausted: the next stale lease fails the task permanently.
+    run('claim','rec-1','--owner','tester','--minutes','0')
+    out = ops('recover','--max-retries','1')
+    assert out['failed'] == ['rec-1']
+    detail = run('show','rec-1')
+    assert detail['status'] == 'failed' and detail['blocked_reason'] == 'max lease retries exceeded'
+    assert any(e['action'] == 'lease_failed' for e in detail['audit'])
+    # Observability: metrics reflect the exercised state.
+    m = run('metrics')
+    assert m['tasks_by_status'].get('failed') == 1
+    assert m['tasks_by_status'].get('claimed') == 1
+    assert m['stale_leases'] == 0 and m['receipts'] >= 1 and m['audit_events'] >= 4
 print('autopilot verification: PASS')
