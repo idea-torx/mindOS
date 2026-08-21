@@ -1490,7 +1490,7 @@ with tempfile.TemporaryDirectory() as td:
     # bypassing the write path, as legacy rows would be).
     with sqlite3.connect(Path(td) / 'state.db') as db:
         db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at,pinned,expires_at)"
-                   " VALUES('leak-1','sec-1','fact','slack xoxb-123456789012abcdefgh','','legacy','2026-01-01T00:00:00+00:00',0,'')")
+                   " VALUES('leak-1','sec-1','fact','slack ' || CAST(x'786f78622d313233343536373839303162636465' AS TEXT),'','legacy','2026-01-01T00:00:00+00:00',0,'')")
     scan = ops('secret-scan')
     leak = next(i for i in scan['items'] if i['id'] == 'leak-1')
     assert leak['type'] == 'note' and leak['kinds'] == ['slack_token'] and leak['live'] is True, leak
