@@ -202,8 +202,8 @@ def morning(args=None):
     autopilot.dashboard(argparse.Namespace())
     print('\nSAFE AUTOMATION: read-only reconciliation, no deploy/merge/external submission.')
 
-SNAPSHOT_TABLES = ('tasks', 'heartbeats', 'receipts', 'notes', 'handoffs', 'task_deps', 'audit_events')
-RESTORE_ORDER = ('tasks', 'task_deps', 'heartbeats', 'receipts', 'notes', 'handoffs', 'audit_events')
+SNAPSHOT_TABLES = ('tasks', 'heartbeats', 'receipts', 'notes', 'handoffs', 'facts', 'task_deps', 'audit_events')
+RESTORE_ORDER = ('tasks', 'task_deps', 'heartbeats', 'receipts', 'notes', 'handoffs', 'facts', 'audit_events')
 
 def _snapshot_doc():
     data = {}
@@ -403,19 +403,27 @@ def archive(args=None):
         audit_retained = c.execute(
             f"SELECT COUNT(*) n FROM audit_events WHERE entity_type='task' AND entity_id IN ({ph})",
             ids).fetchone()['n']
+        # Fact-graph provenance is detached, not deleted: fleet knowledge
+        # survives the task's retirement, with the affected rows recorded in
+        # the archive document for auditability.
+        facts_detached = [dict(r) for r in c.execute(
+            f"SELECT * FROM facts WHERE task_id IN ({ph})", ids).fetchall()]
     receipt_files = {}
     for r in tables['receipts']:
         p = autopilot.RECEIPTS / (r['id'] + '.json')
         receipt_files[r['id']] = p.read_text() if p.exists() else None
     doc = {'format': ARCHIVE_FORMAT, 'created_at': utc(), 'before': before,
            'tables': tables, 'receipt_files': receipt_files,
+           'facts_detached': facts_detached,
            'audit_events_retained': audit_retained}
     digest = hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()
     doc['sha256'] = digest
     counts = {t: len(tables[t]) for t in ARCHIVE_TABLES}
     if dry:
         print(json.dumps({'ok': True, 'dry_run': True, 'task_ids': ids, 'counts': counts,
-                          'receipt_files': len(receipt_files), 'audit_events_retained': audit_retained}))
+                          'receipt_files': len(receipt_files),
+                          'facts_detached': len(facts_detached),
+                          'audit_events_retained': audit_retained}))
         return
     if getattr(args, 'out', None):
         out_path = Path(args.out); out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -436,6 +444,8 @@ def archive(args=None):
         c.execute(f'DELETE FROM task_deps WHERE task_id IN ({ph}) OR depends_on IN ({ph})', (*ids, *ids))
         for t in ('heartbeats', 'receipts', 'notes', 'handoffs'):
             c.execute(f'DELETE FROM {t} WHERE task_id IN ({ph})', ids)
+        # Facts are fleet knowledge: detach provenance instead of deleting.
+        c.execute(f"UPDATE facts SET task_id='' WHERE task_id IN ({ph})", ids)
         c.execute(f'DELETE FROM tasks WHERE id IN ({ph})', ids)
     removed = 0
     for rid, text in receipt_files.items():
@@ -444,6 +454,7 @@ def archive(args=None):
             p.unlink(); removed += 1
     print(json.dumps({'ok': True, 'archived': ids, 'path': str(out_path), 'sha256': digest,
                       'counts': counts, 'receipt_files_removed': removed,
+                      'facts_detached': len(facts_detached),
                       'audit_events_retained': audit_retained}))
 
 def _load_archive(path: Path):
@@ -863,10 +874,17 @@ def doctor(args=None):
         for r in c.execute(
             "SELECT task_id,COUNT(*) n FROM handoffs WHERE superseded_by='' GROUP BY task_id HAVING n>1"):
             problems.append({'kind': 'multiple_live_handoffs', 'task_id': r['task_id'], 'count': r['n']})
+        # Fact-graph soft references: archive detaches task provenance when a
+        # task retires, so a dangling ref means out-of-band surgery happened.
+        for r in c.execute(
+            "SELECT f.id,f.task_id FROM facts f LEFT JOIN tasks t ON t.id=f.task_id "
+            "WHERE f.task_id!='' AND t.id IS NULL"):
+            problems.append({'kind': 'fact_task_missing', 'fact_id': r['id'], 'task_id': r['task_id']})
         for table, fts in (('notes', 'notes_fts'), ('tasks', 'tasks_fts'), ('handoffs', 'handoffs_fts'),
-                           ('session_messages', 'session_messages_fts')):
+                           ('session_messages', 'session_messages_fts'), ('facts', 'facts_fts')):
             ready = (autopilot._handoffs_fts_ready(c) if fts == 'handoffs_fts'
                      else autopilot._sessions_fts_ready(c) if fts == 'session_messages_fts'
+                     else autopilot._facts_fts_ready(c) if fts == 'facts_fts'
                      else autopilot._fts_ready(c))
             if not ready:
                 continue
@@ -1022,6 +1040,10 @@ def recall_stale(args=None):
                 # --dep-context is optional the same way; absent means the
                 # original bundle was built without prerequisite evidence.
                 dep_ctx_n = payload.get('dep_context') or 0
+                # --related-sessions / --related-facts are optional the same
+                # way; absent means the original bundle was built without them.
+                rel_sess_n = payload.get('related_sessions') or 0
+                rel_facts_n = payload.get('related_facts') or 0
                 # Rerank parameters are optional (feature added after the
                 # provenance loop); absent keys mean the original bundle was
                 # built without rerank, which is exactly how it must be
@@ -1043,7 +1065,9 @@ def recall_stale(args=None):
                         recency_half_life_hours=168.0 if half_life is None else half_life,
                         pinned_boost=0.5 if boost is None else boost,
                         rel_handoffs=rel_handoffs,
-                        dep_context=dep_ctx_n)
+                        dep_context=dep_ctx_n,
+                        rel_sessions=rel_sess_n,
+                        rel_facts=rel_facts_n)
                     item['state'] = ('fresh' if bundle['core_digest'] == payload['core_digest']
                                      else 'stale')
                     item['current_digest'] = bundle['digest']

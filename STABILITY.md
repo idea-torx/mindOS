@@ -46,7 +46,18 @@ This report separates **fixed issues**, **accepted risks**, and **merge blockers
    fts5vocab is unavailable.
 10. **`ops.py` was not importable** — module-level `parse_args()` consumed the
     importer's argv. Now guarded by `__main__`, enabling in-process testing.
-11. **Migration-inventory seal covered `created_at`, breaking its own resume
+11. **Flag-gated recall sections were dropped on recompute (false staleness)**
+    — `recall-diff` and `ops.py recall-stale` both rebuild the cited recall
+    bundle from the audited parameters but never passed
+    `--related-sessions` through, so any recall made with that flag recomputed
+    a *different* bundle: `recall-diff` reported fresh recalls as stale, and
+    `recall-stale` flagged live handoffs as drifted with zero real context
+    change. Both paths now pass every flag-gated section parameter
+    (`related_sessions`, and the new temporal-fact `related_facts`) exactly
+    as recorded; regression coverage proves a `--related-sessions` +
+    `--related-facts` recall diffs `fresh` immediately after being taken and
+    only turns stale when genuinely new matching context arrives.
+12. **Migration-inventory seal covered `created_at`, breaking its own resume
     contract** (found by `verify.py` failing at HEAD) — the sha256 seal was
     computed over a body that included the run timestamp, so two runs over
     identical trees produced different seals and could never "reproduce an
@@ -83,6 +94,12 @@ This report separates **fixed issues**, **accepted risks**, and **merge blockers
   sessions` cascades messages and the FTS triggers keep the index in sync);
   no automatic retention was added because deleting conversation history
   silently is exactly the kind of false-success behavior this runtime avoids.
+- **Fact-graph rows are not yet carried by migration import or work orders**
+  — `migrate-import` and `export-task`/`import-task` predate the temporal
+  fact graph, so cross-home transfers move execution truth but not sidecar
+  facts. Snapshots and archives do carry/detach them correctly; extending the
+  migration documents to include `facts` (with validity windows intact) is
+  the natural next slice rather than a rushed afterthought.
 
 ## Merge blockers
 

@@ -2543,6 +2543,117 @@ with tempfile.TemporaryDirectory() as td:
     assert not any(p['kind'] == 'fts_index_drift' and p['table'] == 'session_messages'
                    for p in doc['problems']), doc
 
+    # -----------------------------------------------------------------------
+    # Temporal fact graph: assert/dedupe/retract/query/search, context-pack
+    # integration, flag-gated recall recomputation, doctor guard, archive
+    # detachment.
+    # -----------------------------------------------------------------------
+    run('create','--project','Facts','--title','postgres migration followups','--id','fact-t2')
+    f_a = run('fact-assert','--subject','service-auth','--predicate','uses',
+              '--object','postgres-14','--source','codex','--task','fact-t2')
+    assert f_a['deduplicated'] is False and f_a['valid_until'] == '' and f_a['task_id'] == 'fact-t2'
+    # An identical triple still inside its window deduplicates to the same row.
+    dup = run('fact-assert','--subject','service-auth','--predicate','uses',
+              '--object','postgres-14','--source','opencode')
+    assert dup['deduplicated'] is True and dup['id'] == f_a['id']
+    # Token charset is structural privacy: credential shapes cannot enter.
+    err = run_fail('fact-assert','--subject','service-auth','--predicate','password',
+                   '--object','hunter2!')
+    assert 'invalid tag' in err
+    # Provenance must point at real work.
+    run_fail('fact-assert','--subject','x','--predicate','uses','--object','y','--task','no-such-task')
+    f_exp = run('fact-assert','--subject','deploy-api','--predicate','reads',
+                '--object','redis-cache','--source','hermes','--valid-hours','48')
+    assert f_exp['valid_until'], 'validity window must be set'
+    # Retraction closes the window now; a second retract is idempotent.
+    ret = run('fact-retract', f_a['id'], '--reason', 'migrated to postgres-16')
+    assert ret['retracted'] is True
+    ret2 = run('fact-retract', f_a['id'])
+    assert ret2.get('already_closed') is True
+    # Default listing shows only live triples; --all keeps history with a live flag.
+    live_rows = run('facts','--subject','service-auth')
+    assert all(r['id'] != f_a['id'] for r in live_rows)
+    hist = [r for r in run('facts','--subject','service-auth','--all') if r['id'] == f_a['id']]
+    assert len(hist) == 1 and hist[0]['live'] is False
+    # Re-asserting after closure records a fresh row; the old window stays as history.
+    f_a2 = run('fact-assert','--subject','service-auth','--predicate','uses',
+               '--object','postgres-14','--source','codex')
+    assert f_a2['deduplicated'] is False and f_a2['id'] != f_a['id']
+    # Retrieval: substring fallback and BM25 ranking both find the graph.
+    hits = run('search-facts','postgres')
+    assert any(h['id'] == f_a2['id'] for h in hits) and all(h['live'] for h in hits)
+    ranked = run('search-facts','postgres','--rank')
+    assert any(h['id'] == f_a2['id'] for h in ranked)
+    # Context-pack integration: matching live facts pack under --related-facts;
+    # legacy packs stay byte-compatible (flag-gated key absent).
+    pack = run('context','fact-t2','--related-facts','3')
+    assert pack['related_facts_packed'] >= 1 and pack['related_facts_matched'] >= 1
+    assert any(x['id'] in (f_a2['id'], f_exp['id']) for x in pack['related_facts'])
+    legacy_pack = run('context','fact-t2')
+    assert 'related_facts' not in legacy_pack, 'flag-gated key leaked into legacy shape'
+    # Recall provenance: flag-gated sections travel in the audited parameters so
+    # recall-diff / recall-stale recompute exactly (regression: dropped flags
+    # made fresh recalls report stale).
+    rb = run('recall','fact-t2','--agent','hermes','--related-sessions','1','--related-facts','2')
+    dig = rb['digest']
+    assert rb['related_facts_packed'] >= 1
+    assert run('recall-verify','fact-t2','--digest',dig,'--agent','hermes',
+               '--related-sessions','1','--related-facts','2')['fresh'] is True
+    diff = run('recall-diff','fact-t2','--digest',dig)
+    assert diff['fresh'] is True, diff
+    # A newly asserted matching fact is real context drift -> digest goes stale.
+    run('fact-assert','--subject','pgbouncer','--predicate','pools-for','--object','postgres',
+        '--source','ops','--task','fact-t2')
+    assert run('recall-verify','fact-t2','--digest',dig,'--agent','hermes',
+               '--related-sessions','1','--related-facts','2')['fresh'] is False
+    # Metrics expose the graph's size and window split.
+    m = run('metrics')
+    assert m['facts_total'] >= 4 and m['facts_live'] >= 3
+    assert m['facts_closed'] == m['facts_total'] - m['facts_live']
+    # Audit provenance for every lifecycle action.
+    ev = run('events','--entity-type','fact','--limit','50')
+    acts = {e['action'] for e in ev['events']}
+    assert {'fact_asserted','fact_deduplicated','fact_retracted'} <= acts, acts
+    # Doctor flags dangling task provenance as out-of-band surgery.
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        db.execute("UPDATE facts SET task_id='ghost-task' WHERE id=?", (f_a2['id'],))
+    doc = ops('doctor')
+    assert any(p['kind'] == 'fact_task_missing' and p['fact_id'] == f_a2['id']
+               for p in doc['problems']), doc
+    # Archive detaches fact provenance instead of destroying fleet knowledge:
+    # dry-run reports it first, then the rows survive with task_id cleared.
+    # Live dependents left by earlier DAG stages keep the archival guard shut,
+    # so settle them first (the guard names exactly what blocks the sweep).
+    import re as _re
+    err = ops_fail('archive','--before','2030-01-01T00:00:00+00:00','--dry-run')
+    assert 'still depend' in err, err
+    # Long-lived fixture leases from earlier stages would refuse cancellation;
+    # this is our own scratch home, so drop them as test setup.
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        db.execute("UPDATE tasks SET lease_owner='', lease_expires_at='' WHERE lease_owner!=''")
+    for _ in range(12):
+        pr = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'archive',
+                             '--before', '2030-01-01T00:00:00+00:00', '--dry-run'],
+                            env=env, text=True, capture_output=True)
+        if pr.returncode == 0:
+            break
+        blockers = [m.strip(',.') for m in _re.findall(r'(\S+)\s*->', pr.stderr)]
+        assert blockers, pr.stderr
+        for did in blockers:
+            run('cancel', did, '--owner', 'leo', '--reason', 'settle for fact-graph archival stage')
+    else:
+        raise AssertionError('archival guard never settled')
+    run('cancel','fact-t2','--owner','leo','--reason','settle fact host for archival stage')
+    dry_arc = ops('archive','--before','2030-01-01T00:00:00+00:00','--dry-run')
+    assert dry_arc['facts_detached'] >= 2, dry_arc
+    arc_path = Path(td) / 'arc-facts.json'
+    arc2 = ops('archive','--before','2030-01-01T00:00:00+00:00','--out',str(arc_path))
+    assert arc2['ok'] is True and arc2['facts_detached'] >= 2
+    survivors = run('facts','--all','--limit','200')
+    detached = {r['id']: r for r in survivors}
+    assert f_a['id'] in detached and detached[f_a['id']]['task_id'] == ''
+    assert any(r['subject'] == 'pgbouncer' for r in survivors), 'facts must survive archival'
+
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

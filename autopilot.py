@@ -150,6 +150,25 @@ CREATE TABLE IF NOT EXISTS session_messages (
   at TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (session_row, seq)
 );
+-- Temporal fact graph (the sidecar): fleet-level evolving facts and
+-- relationships with validity windows. Subject/predicate/object are
+-- restricted tokens (the tag charset), so credential-shaped values cannot
+-- enter by construction. task_id is a deliberate soft reference: facts are
+-- fleet knowledge and must survive task archival (archive detaches the ref);
+-- doctor flags any dangling ref as evidence of out-of-band surgery.
+CREATE TABLE IF NOT EXISTS facts (
+  id TEXT PRIMARY KEY,
+  subject TEXT NOT NULL,
+  predicate TEXT NOT NULL,
+  object TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
+  task_id TEXT NOT NULL DEFAULT '',
+  valid_from TEXT NOT NULL,
+  valid_until TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject, predicate);
+CREATE INDEX IF NOT EXISTS idx_facts_object ON facts(object);
 """
 # Full-text retrieval (FTS5, stdlib sqlite3): external-content indexes over
 # notes/tasks kept in sync by triggers. Applied only when the SQLite build
@@ -207,6 +226,17 @@ CREATE TRIGGER IF NOT EXISTS session_messages_fts_ai AFTER INSERT ON session_mes
 END;
 CREATE TRIGGER IF NOT EXISTS session_messages_fts_ad AFTER DELETE ON session_messages BEGIN
   INSERT INTO session_messages_fts(session_messages_fts,rowid,content,role) VALUES('delete',old.rowid,old.content,old.role);
+END;
+-- Fact tokens are immutable once written (a changed world asserts a new fact
+-- and retracts the old one), so no UPDATE trigger is needed.
+CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+  subject, predicate, object, source, content='facts', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS facts_fts_ai AFTER INSERT ON facts BEGIN
+  INSERT INTO facts_fts(rowid,subject,predicate,object,source) VALUES(new.rowid,new.subject,new.predicate,new.object,new.source);
+END;
+CREATE TRIGGER IF NOT EXISTS facts_fts_ad AFTER DELETE ON facts BEGIN
+  INSERT INTO facts_fts(facts_fts,rowid,subject,predicate,object,source) VALUES('delete',old.rowid,old.subject,old.predicate,old.object,old.source);
 END;
 """
 STATUSES = {"queued", "claimed", "running", "waiting_for_agent", "waiting_for_user", "waiting_for_review", "ready_to_merge", "ready_to_deploy", "blocked", "completed", "failed", "cancelled"}
@@ -314,17 +344,25 @@ def _sessions_fts_ready(db) -> bool:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='session_messages_fts'")}
     return "session_messages_fts" in names
 
+def _facts_fts_ready(db) -> bool:
+    """True when the temporal-fact FTS index exists."""
+    names = {r[0] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='facts_fts'")}
+    return "facts_fts" in names
+
 def _ensure_fts(db) -> None:
     """Create FTS indexes when supported; rebuild once on first creation so
     pre-existing rows become searchable. Silently skips on non-FTS5 builds."""
     try:
-        complete = _fts_ready(db) and _handoffs_fts_ready(db) and _sessions_fts_ready(db)
+        complete = (_fts_ready(db) and _handoffs_fts_ready(db)
+                    and _sessions_fts_ready(db) and _facts_fts_ready(db))
         db.executescript(FTS_SCHEMA)
         if not complete:
             db.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')")
             db.execute("INSERT INTO tasks_fts(tasks_fts) VALUES('rebuild')")
             db.execute("INSERT INTO handoffs_fts(handoffs_fts) VALUES('rebuild')")
             db.execute("INSERT INTO session_messages_fts(session_messages_fts) VALUES('rebuild')")
+            db.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
     except sqlite3.OperationalError:
         pass  # FTS5 unavailable: search falls back to LIKE
 
@@ -1272,7 +1310,7 @@ def _dep_context_cost(entry: dict) -> int:
 def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
                 rerank: bool = False, recency_half_life_hours: float = 168.0,
                 pinned_boost: float = 0.5, rel_handoffs: int = 0,
-                dep_context: int = 0, rel_sessions: int = 0) -> dict:
+                dep_context: int = 0, rel_sessions: int = 0, rel_facts: int = 0) -> dict:
     """Assemble the prompt-ready context bundle for a task within a char budget.
 
     Shared by `context` and `recall`: task summary header + unsatisfied
@@ -1292,6 +1330,10 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
     With rel_sessions > 0, up to that many ingested session-message snippets
     (matching this task's text) pack after dep context under the same rules —
     raw conversation is the freshest record of what agents actually tried.
+    With rel_facts > 0, up to that many currently-valid temporal facts from
+    the sidecar graph (matching this task's text) pack last under the same
+    flag-gated rules; every related-fact output key is present only when the
+    flag is used, so legacy packs stay byte-identical and digest-compatible.
     """
     budget = max(0, budget)
     rel_limit = max(0, rel_limit)
@@ -1321,6 +1363,8 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
     dep_ctx = _dep_context_candidates(db, task_id, max(0, dep_context)) if dep_context > 0 else []
     rel_sessions_list = (_related_session_candidates(db, task_id, pack_text,
                           max(0, rel_sessions), rel_scope) if rel_sessions > 0 else [])
+    rel_facts_list = (_related_fact_candidates(db, task_id, pack_text,
+                      max(0, rel_facts)) if rel_facts > 0 else [])
     hrow = _live_handoff(db, task_id)
     # Stable sort: pinned notes first, original (oldest→newest) order within groups.
     ordered = sorted(rows, key=lambda r: not r["pinned"])
@@ -1382,6 +1426,15 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
             truncated = True
             continue
         rs_packed.append(m); used += cost
+    rf_packed = []
+    for ft in rel_facts_list:
+        cost = (len(ft["id"]) + len(ft["subject"]) + len(ft["predicate"])
+                + len(ft["object"]) + len(ft["valid_from"]) + len(ft["valid_until"])
+                + len(ft["source"]) + 16)
+        if used + cost > budget:
+            truncated = True
+            continue
+        rf_packed.append(ft); used += cost
     out = {"task_id": task_id, "budget": budget, "used_chars": used,
             "truncated": truncated, "task": summary,
             "unsatisfied_dependencies": pending,
@@ -1409,6 +1462,11 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
         out["related_sessions_matched"] = len(rel_sessions_list)
         out["related_sessions_packed"] = len(rs_packed)
         out["related_sessions"] = rs_packed
+    if rel_facts > 0:
+        out["related_facts_requested"] = max(0, rel_facts)
+        out["related_facts_matched"] = len(rel_facts_list)
+        out["related_facts_packed"] = len(rf_packed)
+        out["related_facts"] = rf_packed
     if rerank:
         # Reported only when enabled so packs built without rerank stay
         # byte-identical to the legacy shape (and digest-compatible).
@@ -1436,12 +1494,13 @@ def task_context(args):
                              pinned_boost=getattr(args, "pinned_boost", 0.5),
                              rel_handoffs=getattr(args, "related_handoffs", 0),
                              dep_context=getattr(args, "dep_context", 0),
-                                      rel_sessions=getattr(args, "related_sessions", 0)))
+                                      rel_sessions=getattr(args, "related_sessions", 0),
+                             rel_facts=getattr(args, "related_facts", 0)))
 
 def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: int, rel_scope: str,
                          rerank: bool = False, recency_half_life_hours: float = 168.0,
                          pinned_boost: float = 0.5, rel_handoffs: int = 0,
-                         dep_context: int = 0, rel_sessions: int = 0) -> dict:
+                         dep_context: int = 0, rel_sessions: int = 0, rel_facts: int = 0) -> dict:
     """Assemble the recall bundle and its deterministic digest (no audit write).
 
     Shared by `recall` (which audits the digest) and `recall-verify` (which
@@ -1453,7 +1512,8 @@ def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: i
     pack = _build_pack(db, task_id, budget, rel_limit, rel_scope or "project",
                        rerank=rerank, recency_half_life_hours=recency_half_life_hours,
                        pinned_boost=pinned_boost, rel_handoffs=rel_handoffs,
-                       dep_context=dep_context, rel_sessions=rel_sessions)
+                       dep_context=dep_context, rel_sessions=rel_sessions,
+                       rel_facts=rel_facts)
     lease_live = bool(row["lease_owner"]) and row["lease_expires_at"] > t
     bundle = {
         **pack,
@@ -1525,6 +1585,8 @@ def _bundle_sections(bundle: dict) -> dict:
     if "related_sessions" in bundle:
         sections["related_sessions"] = [
             f"{x['session_id']}:{x['seq']}" for x in bundle["related_sessions"]]
+    if "related_facts" in bundle:
+        sections["related_facts"] = [x["id"] for x in bundle["related_facts"]]
     return sections
 
 def _diff_sections(old: dict, new: dict) -> dict:
@@ -1569,6 +1631,9 @@ def _diff_sections(old: dict, new: dict) -> dict:
     ors, nrs = set(old.get("related_sessions") or []), set(new.get("related_sessions") or [])
     if ors != nrs:
         changes["related_sessions"] = {"added": sorted(nrs - ors), "removed": sorted(ors - nrs)}
+    orf, nrf = set(old.get("related_facts") or []), set(new.get("related_facts") or [])
+    if orf != nrf:
+        changes["related_facts"] = {"added": sorted(nrf - orf), "removed": sorted(orf - nrf)}
     if old["lease"] != new["lease"]:
         changes["lease"] = {"from": old["lease"], "to": new["lease"]}
     orec, nrec = set(old["receipts"]), set(new["receipts"])
@@ -1597,7 +1662,8 @@ def recall(args):
                                       pinned_boost=getattr(args, "pinned_boost", 0.5),
                                       rel_handoffs=getattr(args, "related_handoffs", 0),
                                       dep_context=getattr(args, "dep_context", 0),
-                                      rel_sessions=getattr(args, "related_sessions", 0))
+                                      rel_sessions=getattr(args, "related_sessions", 0),
+                                      rel_facts=getattr(args, "related_facts", 0))
         # Record the bundle parameters alongside the digest so fleet sweeps
         # (ops.py recall-stale) can recompute the digest exactly as recalled.
         audit(db, "task", args.task_id, "context_recalled",
@@ -1611,6 +1677,7 @@ def recall(args):
                "related_handoffs": getattr(args, "related_handoffs", 0),
                "dep_context": getattr(args, "dep_context", 0),
                 "related_sessions": getattr(args, "related_sessions", 0),
+               "related_facts": getattr(args, "related_facts", 0),
                "sections": _bundle_sections(bundle)})
     json_out(bundle)
 
@@ -1638,7 +1705,8 @@ def recall_verify(args):
                                       pinned_boost=getattr(args, "pinned_boost", 0.5),
                                       rel_handoffs=getattr(args, "related_handoffs", 0),
                                       dep_context=getattr(args, "dep_context", 0),
-                                      rel_sessions=getattr(args, "related_sessions", 0))
+                                      rel_sessions=getattr(args, "related_sessions", 0),
+                                      rel_facts=getattr(args, "related_facts", 0))
     json_out({"ok": True, "task_id": args.task_id,
               "fresh": bundle["digest"] == digest,
               "recalled_digest": digest, "current_digest": bundle["digest"]})
@@ -1687,6 +1755,11 @@ def recall_diff(args):
         # bundle was built without it, which recomputes the digest exactly.
         rel_handoffs = payload.get("related_handoffs") or 0
         dep_ctx_n = payload.get("dep_context") or 0
+        # Flag-gated sections added after the provenance loop; absent means
+        # the original bundle was built without them, which recomputes the
+        # digest exactly.
+        rel_sess_n = payload.get("related_sessions") or 0
+        rel_facts_n = payload.get("related_facts") or 0
         rerank = bool(payload.get("rerank"))
         half_life = payload.get("recency_half_life_hours")
         boost = payload.get("pinned_boost")
@@ -1700,7 +1773,9 @@ def recall_diff(args):
                                       recency_half_life_hours=168.0 if half_life is None else half_life,
                                       pinned_boost=0.5 if boost is None else boost,
                                       rel_handoffs=rel_handoffs,
-                                      dep_context=dep_ctx_n)
+                                      dep_context=dep_ctx_n,
+                                      rel_sessions=rel_sess_n,
+                                      rel_facts=rel_facts_n)
         fresh = bundle["digest"] == digest
         out["current_digest"] = bundle["digest"]
         out["fresh"] = fresh
@@ -1772,7 +1847,8 @@ def resume(args):
                                       pinned_boost=getattr(args, "pinned_boost", 0.5),
                                       rel_handoffs=getattr(args, "related_handoffs", 0),
                                       dep_context=getattr(args, "dep_context", 0),
-                                      rel_sessions=getattr(args, "related_sessions", 0))
+                                      rel_sessions=getattr(args, "related_sessions", 0),
+                                      rel_facts=getattr(args, "related_facts", 0))
         # session_resumed doubles as recall provenance: the digest is recorded
         # with its bundle parameters so a handoff citing a resume digest passes
         # the handoff-check lint and fleet sweeps can recompute it exactly.
@@ -1787,6 +1863,7 @@ def resume(args):
                "related_handoffs": getattr(args, "related_handoffs", 0),
                "dep_context": getattr(args, "dep_context", 0),
                 "related_sessions": getattr(args, "related_sessions", 0),
+               "related_facts": getattr(args, "related_facts", 0),
                "sections": _bundle_sections(bundle)})
     json_out({"ok": True, "task_id": args.task_id, "action": action, **bundle})
 
@@ -1902,10 +1979,184 @@ def search_handoffs(args):
         rows = [dict(r) for r in db.execute(
             "SELECT h.id,h.task_id,t.project,t.title AS task_title,h.from_agent,"
             "h.to_agent,h.status,h.objective,h.commit_ref,h.created_at,"
-            "h.superseded_by FROM handoffs h JOIN tasks t ON t.id=h.task_id WHERE " +
+            "            h.superseded_by FROM handoffs h JOIN tasks t ON t.id=h.task_id WHERE " +
             " AND ".join(clauses) + " ORDER BY h.created_at DESC, h.rowid DESC LIMIT ?",
             [*vals, pat, pat, pat, pat, pat, limit]).fetchall()]
     json_out(rows)
+
+# ---------------------------------------------------------------------------
+# Temporal fact graph (the sidecar): fleet-level evolving facts and
+# relationships with validity windows. Where notes are task-scoped prose, the
+# fact graph is the machine-queryable layer: `subject predicate object`
+# triples (e.g. `service-auth uses postgres-14`) that agents assert with
+# provenance and retract or let expire as the world changes. Validity windows
+# make time a first-class query dimension — retrieval packs only what is
+# currently true, while history stays auditable.
+# ---------------------------------------------------------------------------
+
+def _valid_fact_token(value: str, flag: str) -> str:
+    """Validate a subject/predicate/object token.
+
+    The tag charset keeps facts safe inside CLI flags and LIKE filters across
+    every agent adapter — and because credential shapes (mixed case, spaces,
+    assignment syntax) cannot survive it, the secret guard is structural here
+    rather than pattern-based.
+    """
+    return _valid_tag(value)
+
+def _fact_live_sql(alias: str = "") -> str:
+    c = f"{alias}." if alias else ""
+    return f"({c}valid_until='' OR {c}valid_until>?)"
+
+def fact_assert(args):
+    """Assert a temporal fact: `subject predicate object` with provenance.
+
+    An identical triple that is still within its validity window deduplicates
+    to the existing row instead of growing the store; asserting after expiry
+    records a fresh row (the old window stays as history). Every assertion is
+    audited (`fact_asserted` / `fact_deduplicated`).
+    """
+    subject = _valid_fact_token(args.subject, "--subject")
+    predicate = _valid_fact_token(args.predicate, "--predicate")
+    obj = _valid_fact_token(args.object, "--object")
+    source = (args.source or "").strip()
+    task_id = getattr(args, "task", "") or ""
+    valid_until = _expires_at(_ttl_hours(getattr(args, "valid_hours", None)))
+    t = now()
+    with conn() as db:
+        if task_id:
+            task_row(db, task_id)  # must exist: provenance points at real work
+        existing = db.execute(
+            "SELECT * FROM facts WHERE subject=? AND predicate=? AND object=? AND "
+            + _fact_live_sql() + " ORDER BY created_at DESC LIMIT 1",
+            (subject, predicate, obj, t)).fetchone()
+        if existing:
+            audit(db, "fact", existing["id"], "fact_deduplicated",
+                  {"subject": subject, "predicate": predicate, "object": obj,
+                   "source": source})
+            json_out({**dict(existing), "deduplicated": True})
+            return
+        fid = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO facts(id,subject,predicate,object,source,task_id,valid_from,valid_until,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (fid, subject, predicate, obj, source, task_id, t, valid_until, t))
+        audit(db, "fact", fid, "fact_asserted",
+              {"subject": subject, "predicate": predicate, "object": obj,
+               "source": source, "task_id": task_id, "valid_until": valid_until})
+        row = dict(db.execute("SELECT * FROM facts WHERE id=?", (fid,)).fetchone())
+    json_out({**row, "deduplicated": False})
+
+def fact_retract(args):
+    """Close a fact's validity window now (idempotent on already-closed rows)."""
+    with conn() as db:
+        row = db.execute("SELECT * FROM facts WHERE id=?", (args.fact_id,)).fetchone()
+        if not row:
+            raise SystemExit(f"unknown fact id: {args.fact_id}")
+        t = now()
+        if row["valid_until"] and row["valid_until"] <= t:
+            json_out({**dict(row), "already_closed": True})
+            return
+        db.execute("UPDATE facts SET valid_until=? WHERE id=?", (t, args.fact_id))
+        audit(db, "fact", args.fact_id, "fact_retracted",
+              {"reason": args.reason or "", "subject": row["subject"],
+               "predicate": row["predicate"], "object": row["object"]})
+        out = dict(db.execute("SELECT * FROM facts WHERE id=?", (args.fact_id,)).fetchone())
+    json_out({**out, "retracted": True})
+
+def list_facts(args):
+    """Query the fact graph. Default returns only currently-valid triples;
+    --all includes closed windows tagged with their liveness."""
+    t = now()
+    clauses, vals = [], []
+    for flag, col in (("subject", "subject"), ("predicate", "predicate"),
+                      ("object", "object")):
+        v = getattr(args, flag, "")
+        if v:
+            clauses.append(f"{col}=?")
+            vals.append(_valid_fact_token(v, f"--{flag}"))
+    if getattr(args, "task", ""):
+        clauses.append("task_id=?")
+        vals.append(args.task)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    live_sql = "" if getattr(args, "all", False) else \
+        (" AND " if clauses else " WHERE ") + _fact_live_sql()
+    live_val = [] if getattr(args, "all", False) else [t]
+    with conn() as db:
+        rows = [dict(r) for r in db.execute(
+            "SELECT * FROM facts" + where + live_sql +
+            " ORDER BY created_at DESC, id DESC LIMIT ?",
+            [*vals, *live_val, max(0, args.limit)]).fetchall()]
+    for r in rows:
+        r["live"] = not (r["valid_until"] and r["valid_until"] <= t)
+    json_out(rows)
+
+def search_facts(args):
+    """Keyword retrieval over the fact graph (BM25 via FTS5 with --rank,
+    substring LIKE fallback otherwise). Live triples only unless --all."""
+    limit = max(0, args.limit)
+    live_only = not getattr(args, "all", False)
+    t = now()
+    live_sql = (" AND " + _fact_live_sql("f")) if live_only else ""
+    live_val = [t] if live_only else []
+    cols = ("SELECT f.id,f.subject,f.predicate,f.object,f.source,f.task_id,"
+            "f.valid_from,f.valid_until,f.created_at")
+    with conn() as db:
+        if getattr(args, "rank", False) and _facts_fts_ready(db):
+            match = _fts_query(args.query)
+            if not match:
+                json_out([])
+                return
+            rows = [dict(r) for r in db.execute(
+                cols + ",bm25(facts_fts) AS score FROM facts_fts x "
+                "JOIN facts f ON f.rowid=x.rowid WHERE facts_fts MATCH ?" + live_sql +
+                " ORDER BY score LIMIT ?", [match, *live_val, limit]).fetchall()]
+        else:
+            pat = "%" + args.query + "%"
+            rows = [dict(r) for r in db.execute(
+                cols + " FROM facts f WHERE (f.subject LIKE ? OR f.predicate LIKE ? "
+                "OR f.object LIKE ? OR f.source LIKE ?)" + live_sql +
+                " ORDER BY f.created_at DESC, f.id DESC LIMIT ?",
+                [pat, pat, pat, pat, *live_val, limit]).fetchall()]
+    for r in rows:
+        r["live"] = not (r["valid_until"] and r["valid_until"] <= t)
+    json_out(rows)
+
+def _related_fact_candidates(db, task_id: str, text: str, limit: int) -> list:
+    """Fleet-level temporal facts whose tokens match this task's text.
+
+    The sidecar's context-pack surface: facts asserted anywhere in the fleet
+    that look relevant to this work pack after dep context and sessions.
+    Only currently-valid triples are candidates — a pack must carry what is
+    true *now*. Deterministic ordering (valid_from DESC, id) with no relevance
+    score emitted, mirroring related handoffs: BM25 scores drift whenever any
+    fact joins the index, which would falsely stale sealed digests.
+    """
+    if limit <= 0 or not text.strip():
+        return []
+    toks = []
+    for raw in text.split():
+        tok = raw.replace('"', "")
+        if tok and any(c.isalnum() for c in tok):
+            toks.append(tok)
+    if not toks:
+        return []
+    t = now()
+    cols = ("SELECT f.id,f.subject,f.predicate,f.object,f.valid_from,f.valid_until,f.source")
+    live_sql = " AND " + _fact_live_sql("f")
+    order = " ORDER BY f.valid_from DESC, f.id ASC LIMIT ?"
+    vals_tail = [t, limit]
+    if _facts_fts_ready(db):
+        match = " OR ".join('"%s"' % tk for tk in toks)
+        sql = (cols + " FROM facts_fts x JOIN facts f ON f.rowid=x.rowid "
+               "WHERE facts_fts MATCH ?" + live_sql + order)
+        vals = [match, *vals_tail]
+    else:
+        likes = " OR ".join("(f.subject LIKE ? OR f.predicate LIKE ? OR f.object LIKE ?)"
+                            for _ in toks)
+        sql = cols + " FROM facts f WHERE (" + likes + ")" + live_sql + order
+        vals = [v for tk in toks for v in ("%"+tk+"%", "%"+tk+"%", "%"+tk+"%")] + vals_tail
+    return [dict(r) for r in db.execute(sql, vals).fetchall()]
 
 # ---------------------------------------------------------------------------
 # Session ingestion: a read-only adapter over external agent session stores
@@ -3421,7 +3672,8 @@ def next_task(args):
                                               pinned_boost=getattr(args, "pinned_boost", 0.5),
                                               rel_handoffs=getattr(args, "related_handoffs", 0),
                                       dep_context=getattr(args, "dep_context", 0),
-                                      rel_sessions=getattr(args, "related_sessions", 0))
+                                      rel_sessions=getattr(args, "related_sessions", 0),
+                                      rel_facts=getattr(args, "related_facts", 0))
                 # Same provenance contract as `recall`: the digest is recorded
                 # with its bundle parameters so handoffs/completions can cite
                 # it and fleet sweeps can recompute it exactly.
@@ -3436,6 +3688,7 @@ def next_task(args):
                        "related_handoffs": getattr(args, "related_handoffs", 0),
                        "dep_context": getattr(args, "dep_context", 0),
                 "related_sessions": getattr(args, "related_sessions", 0),
+                       "related_facts": getattr(args, "related_facts", 0),
                        "sections": _bundle_sections(bundle),
                        "via": "next"})
                 out["recall"] = bundle
@@ -3577,6 +3830,9 @@ def metrics(args):
             "SELECT COUNT(*) n FROM audit_events WHERE action='completion_blocked_evidence'").fetchone()["n"]
         sessions = db.execute(
             "SELECT COUNT(*) n, COALESCE(SUM(message_count),0) m FROM sessions").fetchone()
+        facts = db.execute(
+            "SELECT COUNT(*) total, COALESCE(SUM(CASE WHEN valid_until='' OR valid_until>? "
+            "THEN 1 ELSE 0 END),0) live FROM facts", (t,)).fetchone()
     json_out({
         "generated_at": t,
         "tasks_total": sum(by_status.values()),
@@ -3614,6 +3870,9 @@ def metrics(args):
         "completions_blocked_by_evidence": completions_blocked,
         "sessions_indexed": sessions["n"],
         "session_messages_indexed": sessions["m"],
+        "facts_total": facts["total"],
+        "facts_live": facts["live"],
+        "facts_closed": facts["total"] - facts["live"],
     })
 
 def list_tasks(args):
@@ -3823,20 +4082,24 @@ def main():
     p=sub.add_parser("tag"); p.add_argument("id"); p.add_argument("--tag",action="append",required=True,help="capability/scope tag (repeatable)"); p.set_defaults(fn=tag_task)
     p=sub.add_parser("untag"); p.add_argument("id"); p.add_argument("--tag",required=True); p.set_defaults(fn=untag_task)
     p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
-    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); p.add_argument("--prefer-unblocking",dest="prefer_unblocking",action="store_true",help="tie-break equal-priority candidates by queued dependents freed (critical-path scheduling)"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); p.add_argument("--prefer-unblocking",dest="prefer_unblocking",action="store_true",help="tie-break equal-priority candidates by queued dependents freed (critical-path scheduling)"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.add_argument("--tag",default=""); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=supersede_note)
-    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
-    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
-    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
+    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
+    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
+    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
     p=sub.add_parser("recall-diff"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.set_defaults(fn=recall_diff)
     p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--include-expired",dest="include_expired",action="store_true"); _add_rerank_flags(p); p.set_defaults(fn=search_notes)
     p=sub.add_parser("search-handoffs"); p.add_argument("query"); p.add_argument("--task",default=""); p.add_argument("--from-agent",dest="from_agent",default=""); p.add_argument("--to-agent",dest="to_agent",default=""); p.add_argument("--project",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=search_handoffs)
     p=sub.add_parser("session-scan"); p.add_argument("--root",required=True,help="directory tree of session transcripts to inventory (read-only)"); p.add_argument("--profile",default=""); p.add_argument("--project",default=""); p.add_argument("--since",default="",help="only files modified at/after this ISO timestamp"); p.add_argument("--max-file-bytes",dest="max_file_bytes",type=int,default=DEFAULT_SESSION_MAX_FILE_BYTES); p.set_defaults(fn=session_scan)
     p=sub.add_parser("session-ingest"); p.add_argument("--source",required=True,help="provenance label for the session store (e.g. claude-code)"); p.add_argument("--root",required=True); p.add_argument("--profile",default=""); p.add_argument("--project",default=""); p.add_argument("--since",default=""); p.add_argument("--max-file-bytes",dest="max_file_bytes",type=int,default=DEFAULT_SESSION_MAX_FILE_BYTES); p.add_argument("--apply",action="store_true",help="without this flag the command is a read-only dry-run plan"); p.add_argument("--redact",action="store_true"); p.add_argument("--allow-secret",dest="allow_secret",action="store_true"); p.set_defaults(fn=session_ingest)
     p=sub.add_parser("search-sessions"); p.add_argument("query"); p.add_argument("--source",default=""); p.add_argument("--project",default=""); p.add_argument("--role",default="",help="user or assistant"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_sessions)
+    p=sub.add_parser("fact-assert"); p.add_argument("--subject",required=True,help="entity token (lowercase tag charset)"); p.add_argument("--predicate",required=True,help="relationship token (lowercase tag charset)"); p.add_argument("--object",required=True,help="entity token (lowercase tag charset)"); p.add_argument("--source",default="",help="agent/operator asserting the fact"); p.add_argument("--task",default="",help="task providing provenance (must exist)"); p.add_argument("--valid-hours",dest="valid_hours",type=float,default=None,help="validity window in hours (omit = valid until retracted)"); p.set_defaults(fn=fact_assert)
+    p=sub.add_parser("fact-retract"); p.add_argument("fact_id"); p.add_argument("--reason",default=""); p.set_defaults(fn=fact_retract)
+    p=sub.add_parser("facts"); p.add_argument("--subject",default=""); p.add_argument("--predicate",default=""); p.add_argument("--object",default=""); p.add_argument("--task",default=""); p.add_argument("--all",action="store_true",help="include closed validity windows (tagged with live flag)"); p.add_argument("--limit",type=int,default=100); p.set_defaults(fn=list_facts)
+    p=sub.add_parser("search-facts"); p.add_argument("query"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--all",action="store_true",help="include closed validity windows"); p.set_defaults(fn=search_facts)
     p=sub.add_parser("note-history"); p.add_argument("note_id"); p.set_defaults(fn=note_history)
     p=sub.add_parser("handoff-history"); p.add_argument("handoff_id"); p.set_defaults(fn=handoff_history)
     p=sub.add_parser("handoff"); p.add_argument("task_id"); p.add_argument("--from-agent",required=True); p.add_argument("--to-agent",default=""); p.add_argument("--status",default=""); p.add_argument("--objective",default=""); p.add_argument("--evidence",action="append",default=[]); p.add_argument("--constraint",dest="constraints",action="append",default=[]); p.add_argument("--decision",dest="decisions",action="append",default=[]); p.add_argument("--file",dest="files",action="append",default=[]); p.add_argument("--commit",dest="commit_ref",default=""); p.add_argument("--next-action",dest="next_actions",action="append",default=[]); p.add_argument("--risk",dest="risks",action="append",default=[]); p.add_argument("--recall-digest",dest="recall_digest",default=""); _add_secret_flags(p); p.set_defaults(fn=add_handoff)
@@ -3847,7 +4110,7 @@ def main():
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)
     p=sub.add_parser("renew"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=renew)
     p=sub.add_parser("transfer"); p.add_argument("id"); p.add_argument("--from-owner",required=True,dest="from_owner"); p.add_argument("--to-owner",required=True,dest="to_owner"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=transfer)
-    p=sub.add_parser("resume"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=resume)
+    p=sub.add_parser("resume"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=resume)
     p=sub.add_parser("leases"); p.add_argument("--owner"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=leases)
     args=ap.parse_args(); args.fn(args)
 

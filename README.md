@@ -33,6 +33,10 @@ python3 "$A" plan [--project P] [--tag T]   # parallel dispatch-wave schedule
 python3 "$A" show <task-id>          # task detail + receipts + audit trail + dependencies
 python3 "$A" search "deploy"         # substring search over task text fields
 python3 "$A" search "audit" --status queued --project Trove --priority P1
+python3 "$A" session-scan --root ~/library-session-store            # redacted dry-run inventory
+python3 "$A" fact-assert --subject service-auth --predicate uses --object postgres-14 --source codex
+python3 "$A" facts --subject service-auth          # query currently-valid triples
+python3 "$A" search-facts postgres --rank          # BM25 retrieval over the fact graph
 python3 "$A" metrics                 # JSON observability snapshot
 python3 "$A" verify-chain            # recompute the audit hash chain; report tampering
 python3 "$A" events --action claimed --limit 20      # query the global audit stream
@@ -1621,6 +1625,54 @@ Design properties:
 - **Observability & hygiene**: `metrics` reports `sessions_indexed` /
   `session_messages_indexed`; `ops.py doctor` includes the session FTS index
   in its fts5vocab drift sweep.
+
+## Temporal fact graph (the sidecar)
+
+Notes are task-scoped prose; the fact graph is the machine-queryable layer of
+the temporal sidecar: `subject predicate object` triples — `service-auth uses
+postgres-14`, `deploy-api reads redis-cache` — that any agent asserts with
+provenance and retracts (or lets expire) as the world changes. Validity
+windows make time a first-class query dimension: retrieval packs only what is
+*currently* true, while closed windows stay queryable as history:
+
+```bash
+python3 "$A" fact-assert --subject service-auth --predicate uses --object postgres-14 \
+    --source codex --task t1 --valid-hours 48      # provenance + validity window
+python3 "$A" fact-assert ...                        # identical live triple -> deduplicated
+python3 "$A" fact-retract <fact-id> --reason "migrated to postgres-16"
+python3 "$A" facts --subject service-auth           # currently-valid triples only
+python3 "$A" facts --all                            # include closed windows (live flag)
+python3 "$A" search-facts postgres --rank           # BM25 over subject/predicate/object/source
+```
+
+Design properties:
+
+- **Restricted tokens**: subject/predicate/object use the tag charset
+  (`[a-z0-9:_./-]`), so facts are safe as CLI flags and LIKE filters across
+  every agent adapter — and credential shapes cannot survive the charset, so
+  the privacy boundary is structural rather than pattern-based.
+- **Deduplication**: an identical triple still inside its validity window
+  deduplicates to the existing row (audited `fact_deduplicated`) instead of
+  growing the store; re-asserting after expiry records a fresh row and keeps
+  the old window as history.
+- **Provenance**: every fact carries its asserting agent (`--source`) and an
+  optional originating task (`--task`, must exist). The reference is a
+  deliberate *soft* link: archiving a task detaches provenance instead of
+  destroying fleet knowledge, and `ops.py doctor` flags any dangling ref as
+  evidence of out-of-band surgery.
+- **Context-pack integration**: `--related-facts N` (on `context`, `recall`,
+  `recall-verify`, `resume`, and `next --claim --recall`) packs up to N
+  currently-valid facts matching the task's text after dep context and
+  sessions, within the same budget. Flag-gated keys keep legacy packs
+  byte-identical and digest-compatible; the flag value travels in the audited
+  recall/resume provenance so `ops.py recall-stale` recomputes exactly, and
+  `recall-diff` reports a `related_facts` section.
+- **Deterministic retrieval**: pack candidates order by `valid_from DESC, id`
+  with no relevance score emitted — BM25 scores drift whenever any fact joins
+  the index, which would falsely stale sealed digests without real drift.
+- **Observable**: `metrics` reports `facts_total` / `facts_live` /
+  `facts_closed`; `ops.py doctor` includes `facts_fts` in its FTS drift sweep;
+  snapshots carry the `facts` table.
 
 ## Audit & hardening (stability round)
 
