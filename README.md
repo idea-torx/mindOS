@@ -154,6 +154,33 @@ overridden; without the flag, ordering is byte-for-byte unchanged.
 python3 "$A" next --claim --owner codex --prefer-unblocking
 ```
 
+## Critical path (longest unfinished chain)
+
+`blocked-by` looks up from one task and `impact` looks down from one task;
+`critical-path` answers the fleet-level question: what is the longest chain of
+still-unfinished prerequisite work? Its `length` is the minimum number of
+sequential dispatch waves needed to drain the open graph — no schedule can
+finish faster — and its members are the bottleneck chain: slipping on any of
+them slips everything behind it.
+
+```bash
+python3 "$A" critical-path                 # whole fleet
+python3 "$A" critical-path --project Trove # one project's graph
+# { "length": 3, "path": [{"id": ..., "title": ..., "status": ..., "priority": ...}, ...],
+#   "open_tasks": 12, "by_status": {"queued": 9, "running": 2, "blocked": 1} }
+```
+
+Design properties:
+
+- **Open graph only**: completed/cancelled tasks leave the graph entirely; a
+  missing prerequisite referenced by a live edge appears as a `missing` node,
+  because it blocks dispatch exactly like a real task.
+- **Deterministic**: ties at every step break to the lexicographically smallest
+  id, so identical state yields an identical path.
+- **Composable**: pair it with `next --prefer-unblocking` to actually work the
+  chain — the path names what matters, unblocking tie-breaks help drain it.
+- **Observable**: `metrics` reports `critical_path_length` fleet-wide.
+
 ## Lease transfer (cross-agent ownership)
 
 When work moves from one agent to another, ownership moves with it. `transfer`

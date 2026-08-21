@@ -2274,6 +2274,77 @@ def impact(args):
               "by_status": by_status,
               "dependents": rows})
 
+def _critical_path(db, project: str = ""):
+    """Longest chain of unfinished dependency work, root prerequisite first.
+
+    Nodes are non-terminal tasks (plus 'missing' prerequisites referenced by
+    live edges — they block dispatch exactly like real tasks); edges are
+    dependency edges whose prerequisite is not completed. Depth of a node is
+    1 + max(depth of its unfinished prerequisites), so the maximum depth is
+    the minimum number of sequential dispatch waves needed to drain the open
+    graph. Ties break on the lexicographically smallest id at every step, so
+    identical state yields an identical path. The graph is acyclic by
+    construction (would_cycle guards every edge insert), so the memoized walk
+    always terminates.
+    """
+    q = "SELECT id,title,status,priority FROM tasks WHERE status NOT IN ('completed','failed','cancelled')"
+    vals = []
+    if project:
+        q += " AND project=?"; vals.append(project)
+    nodes = {}
+    for r in db.execute(q, vals).fetchall():
+        nodes[r["id"]] = dict(r)
+    prereqs = {}
+    for r in db.execute(
+            "SELECT d.task_id,d.depends_on,COALESCE(t.status,'missing') AS ds "
+            "FROM task_deps d LEFT JOIN tasks t ON t.id=d.depends_on").fetchall():
+        if r["ds"] == "completed" or r["task_id"] not in nodes:
+            continue  # satisfied prerequisites and settled dependents leave the graph
+        prereqs.setdefault(r["task_id"], set()).add(r["depends_on"])
+        if r["depends_on"] not in nodes:
+            nodes[r["depends_on"]] = {"id": r["depends_on"], "title": "",
+                                      "status": "missing", "priority": ""}
+    depth = {}
+    def _depth(n):
+        if n not in depth:
+            depth[n] = 0  # cycle guard; unreachable for cycle-checked edges
+            depth[n] = 1 + max((_depth(p) for p in prereqs.get(n, ())), default=0)
+        return depth[n]
+    for n in nodes:
+        _depth(n)
+    if not depth:
+        return {"length": 0, "path": [], "open_tasks": 0, "by_status": {}}
+    tip = min((n for n in depth if depth[n] == max(depth.values())),
+              key=lambda n: (depth[n], n))
+    path = []
+    cur = tip
+    while True:
+        path.append({"id": cur, **{k: nodes[cur][k] for k in ("title", "status", "priority")}})
+        nxt = [p for p in prereqs.get(cur, ()) if depth[p] == depth[cur] - 1]
+        if not nxt:
+            break
+        cur = min(nxt)
+    path.reverse()
+    by_status = {}
+    for n in nodes.values():
+        by_status[n["status"]] = by_status.get(n["status"], 0) + 1
+    return {"length": len(path), "path": path,
+            "open_tasks": len(nodes), "by_status": by_status}
+
+def critical_path(args):
+    """Critical path across the open dependency DAG.
+
+    `blocked-by` answers what holds one task and `impact` what waits on one;
+    this answers the fleet-level question: what is the longest chain of still-
+    unfinished prerequisite work? Its length is the minimum number of serial
+    dispatch waves to drain the queue, and its members are the bottleneck
+    chain — slipping on any of them slips everything behind it.
+    """
+    with conn() as db:
+        out = _critical_path(db, (args.project or "").strip())
+    json_out({"ok": True, **({"project": args.project} if getattr(args, "project", "") else {}),
+              **out})
+
 def verify_chain(args):
     """Recompute the audit hash chain; optionally pin-check against a sealed
     checkpoint file to also detect tail truncation or history rewriting."""
@@ -2662,6 +2733,7 @@ def metrics(args):
         failures = {a: db.execute(
             "SELECT COUNT(*) n FROM audit_events WHERE action=?", (a,)).fetchone()["n"]
             for a in ("task_failed", "task_failed_terminal")}
+        cp_len = _critical_path(db)["length"]
     json_out({
         "generated_at": t,
         "tasks_total": sum(by_status.values()),
@@ -2670,6 +2742,7 @@ def metrics(args):
         "stale_leases": stale,
         "active_leases_by_owner": leases_by_owner,
         "queued_blocked_by_deps": blocked_by_deps,
+        "critical_path_length": cp_len,
         "tasks_in_backoff": in_backoff,
         "queued_deferred": deferred,
         "overdue_tasks": [r["id"] for r in overdue],
@@ -2885,6 +2958,7 @@ def main():
     p=sub.add_parser("defer"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--until",default=""); p.set_defaults(fn=defer)
     p=sub.add_parser("blocked-by"); p.add_argument("id"); p.set_defaults(fn=blocked_by)
     p=sub.add_parser("impact"); p.add_argument("id"); p.set_defaults(fn=impact)
+    p=sub.add_parser("critical-path"); p.add_argument("--project",default=""); p.set_defaults(fn=critical_path)
     p=sub.add_parser("verify-chain"); p.add_argument("--checkpoint",default=""); p.set_defaults(fn=verify_chain)
     p=sub.add_parser("events"); p.add_argument("--entity-type"); p.add_argument("--entity-id"); p.add_argument("--action"); p.add_argument("--since",default=""); p.add_argument("--until",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--verify",action="store_true"); p.set_defaults(fn=events)
     p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--force",action="store_true",help="claim even if another live lease holds the same worktree/branch seam"); p.set_defaults(fn=claim)

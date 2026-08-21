@@ -1739,6 +1739,41 @@ with tempfile.TemporaryDirectory() as td:
     nx_pref = run('next','--project','Impact','--explain','--prefer-unblocking')
     assert nx_pref['task']['id'] == 'imp-hub' and nx_pref['unblocks'] == 1, nx_pref
     assert nx_pref.get('unblock_scheduling') is True, nx_pref
+    # Critical path: the longest chain of unfinished dependency work, root first.
+    # Graph here (Impact project): imp-mid2 -> imp-hub(claimed) chain length 2;
+    # imp-plain standalone; imp-child blocked behind imp-hub.
+    cp = run('critical-path','--project','Impact')
+    assert cp['ok'] is True and cp['length'] == 2, cp
+    assert [n['id'] for n in cp['path']] == ['imp-hub','imp-child'], cp
+    assert cp['path'][0]['status'] == 'queued' and cp['path'][1]['status'] == 'queued', cp
+    assert cp['open_tasks'] == 5 and cp['by_status'] == {'queued': 5}, cp   # settled work leaves the graph
+    # Completing the bottleneck hub shortens the chain; the depth-1 tie breaks
+    # to the lexicographically smallest id.
+    run('claim','imp-hub','--owner','tester','--minutes','5')
+    run('complete','imp-hub','--owner','tester')
+    cp2 = run('critical-path','--project','Impact')
+    assert cp2['length'] == 1 and [n['id'] for n in cp2['path']] == ['imp-child'], cp2
+    # Fleet-wide view spans projects; metrics exposes the same number.
+    run('create','--project','Chain','--title','a','--id','cp-a')
+    run('create','--project','Chain','--title','b','--id','cp-b')
+    run('create','--project','Chain','--title','c','--id','cp-c')
+    run('dep','cp-b','cp-a'); run('dep','cp-c','cp-b')
+    cpf = run('critical-path')
+    assert cpf['length'] == 3 and [n['id'] for n in cpf['path']] == ['cp-a','cp-b','cp-c'], cpf
+    m = run('metrics')
+    assert m['critical_path_length'] == 3, m
+    # A missing prerequisite blocks dispatch like a real task and surfaces on
+    # the path once it anchors the deepest branch (completed prereqs leave the
+    # graph entirely).
+    import sqlite3 as _sq
+    with _sq.connect(Path(td) / 'state.db') as db:
+        db.execute("INSERT INTO task_deps(task_id,depends_on,created_at) VALUES('cp-c','cp-g1',datetime('now'))")
+        db.execute("INSERT INTO task_deps(task_id,depends_on,created_at) VALUES('cp-g1','cp-g2',datetime('now'))")
+        db.commit()
+    run('dep-remove','cp-c','cp-b')
+    cpg = run('critical-path','--project','Chain')
+    assert cpg['length'] == 3, cpg
+    assert [(n['id'], n['status']) for n in cpg['path']] == [('cp-g2','missing'),('cp-g1','missing'),('cp-c','queued')], cpg
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
