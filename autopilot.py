@@ -77,9 +77,22 @@ CREATE TABLE IF NOT EXISTS task_deps (
   PRIMARY KEY (task_id, depends_on)
 );
 CREATE INDEX IF NOT EXISTS idx_task_deps_dep ON task_deps(depends_on);
+CREATE TABLE IF NOT EXISTS notes (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL DEFAULT 'fact',
+  content TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
+  content_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  superseded_by TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_notes_task ON notes(task_id);
+CREATE INDEX IF NOT EXISTS idx_notes_hash ON notes(task_id, content_hash);
 """
 STATUSES = {"queued", "claimed", "running", "waiting_for_agent", "waiting_for_user", "waiting_for_review", "ready_to_merge", "ready_to_deploy", "blocked", "completed", "failed", "cancelled"}
 PRIORITIES = {"P0", "P1", "P2", "P3"}
+NOTE_KINDS = {"fact", "decision", "observation", "evidence", "constraint"}
 
 def now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -193,6 +206,130 @@ def add_dependency(db, task_id: str, depends_on: str) -> None:
     db.execute("INSERT INTO task_deps(task_id,depends_on,created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING",
                (task_id, depends_on, now()))
     audit(db, "task", task_id, "dependency_added", {"depends_on": depends_on})
+
+def _note_hash(task_id: str, content: str) -> str:
+    """Content hash for exact-duplicate detection scoped to one task."""
+    return hashlib.sha256(f"{task_id}|{content.strip()}".encode()).hexdigest()
+
+def live_note(db, task_id: str, content_hash: str):
+    return db.execute(
+        "SELECT * FROM notes WHERE task_id=? AND content_hash=? AND superseded_by='' ORDER BY created_at DESC LIMIT 1",
+        (task_id, content_hash)).fetchone()
+
+def add_note(args):
+    """Attach a provenance-tagged fact to a task; exact duplicates are deduplicated."""
+    if args.kind not in NOTE_KINDS:
+        raise SystemExit(f"invalid note kind: {args.kind} (choose from {sorted(NOTE_KINDS)})")
+    content = args.content.strip()
+    if not content:
+        raise SystemExit("note content must not be empty")
+    nid = uuid.uuid4().hex
+    t = now()
+    with conn() as db:
+        task_row(db, args.task_id)
+        h = _note_hash(args.task_id, content)
+        existing = live_note(db, args.task_id, h)
+        if existing:
+            audit(db, "task", args.task_id, "note_deduplicated", {"note_id": existing["id"], "kind": args.kind})
+            json_out({"ok": True, "id": existing["id"], "task_id": args.task_id,
+                      "deduplicated": True, "created_at": existing["created_at"]})
+            return
+        db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at) VALUES(?,?,?,?,?,?,?)",
+                   (nid, args.task_id, args.kind, content, args.source, h, t))
+        audit(db, "task", args.task_id, "note_added", {"note_id": nid, "kind": args.kind, "source": args.source})
+    json_out({"ok": True, "id": nid, "task_id": args.task_id, "deduplicated": False, "created_at": t})
+
+def list_notes(args):
+    with conn() as db:
+        task_row(db, args.task_id)
+        q = ("SELECT n.id,n.kind,n.content,n.source,n.created_at,n.superseded_by FROM notes n "
+             "WHERE n.task_id=?")
+        if not getattr(args, "all", False):
+            q += " AND n.superseded_by=''"
+        q += " ORDER BY n.rowid ASC"
+        rows = [dict(r) for r in db.execute(q, (args.task_id,)).fetchall()]
+    json_out(rows)
+
+def supersede_note(args):
+    """Temporal facts: mark an old note superseded by a new one atomically."""
+    if args.kind and args.kind not in NOTE_KINDS:
+        raise SystemExit(f"invalid note kind: {args.kind}")
+    new_content = args.content.strip()
+    if not new_content:
+        raise SystemExit("superseding content must not be empty")
+    old_id = args.note_id
+    new_id = uuid.uuid4().hex
+    t = now()
+    with conn() as db:
+        old = db.execute("SELECT * FROM notes WHERE id=?", (old_id,)).fetchone()
+        if not old:
+            raise SystemExit(f"note not found: {old_id}")
+        if old["superseded_by"]:
+            raise SystemExit(f"note already superseded by {old['superseded_by']}")
+        task_row(db, old["task_id"])
+        kind = args.kind or old["kind"]
+        source = args.source or old["source"]
+        h = _note_hash(old["task_id"], new_content)
+        clash = live_note(db, old["task_id"], h)
+        if clash:
+            raise SystemExit(f"a live note with identical content already exists: {clash['id']}")
+        # Single-statement guard so concurrent supersedes cannot both win.
+        cur = db.execute("UPDATE notes SET superseded_by=? WHERE id=? AND superseded_by=''", (new_id, old_id))
+        if cur.rowcount != 1:
+            raise SystemExit("note was concurrently superseded; retry")
+        db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at,superseded_by) VALUES(?,?,?,?,?,?,?,'')",
+                   (new_id, old["task_id"], kind, new_content, source, h, t))
+        audit(db, "task", old["task_id"], "note_superseded",
+              {"old_note_id": old_id, "new_note_id": new_id, "kind": kind})
+    json_out({"ok": True, "old_note_id": old_id, "new_note_id": new_id, "task_id": old["task_id"]})
+
+def task_context(args):
+    """Pack a task's live notes oldest→newest within a character budget for prompt assembly."""
+    budget = max(0, args.budget)
+    with conn() as db:
+        task_row(db, args.task_id)
+        rows = [dict(r) for r in db.execute(
+            "SELECT id,kind,content,source,created_at FROM notes "
+            "WHERE task_id=? AND superseded_by='' ORDER BY rowid ASC",
+            (args.task_id,)).fetchall()]
+    packed, used, truncated = [], 0, False
+    for r in rows:
+        cost = len(r["content"]) + len(r["kind"]) + len(r["source"]) + len(r["created_at"]) + 8
+        if used + cost > budget:
+            truncated = True
+            continue
+        packed.append(r); used += cost
+    json_out({"task_id": args.task_id, "budget": budget, "used_chars": used,
+              "truncated": truncated, "notes_total": len(rows), "notes_packed": len(packed),
+              "notes": packed})
+
+def search_notes(args):
+    """Keyword retrieval over note content with project/status filters via the task join."""
+    with conn() as db:
+        pat = "%" + args.query + "%"
+        clauses = ["n.content LIKE ?"]
+        vals = [pat]
+        if args.project:
+            clauses.append("t.project=?"); vals.append(args.project)
+        if args.status:
+            clauses.append("t.status=?"); vals.append(args.status)
+        rows = [dict(r) for r in db.execute(
+            "SELECT n.id,n.task_id,t.project,n.kind,n.content,n.source,n.created_at "
+            "FROM notes n JOIN tasks t ON t.id=n.task_id WHERE n.superseded_by='' AND " +
+            " AND ".join(clauses) + " ORDER BY n.created_at DESC LIMIT ?", (*vals, args.limit)).fetchall()]
+    json_out(rows)
+
+def release(args):
+    """Voluntarily give up a live lease without consuming retry budget."""
+    with conn() as db:
+        row = task_row(db, args.id)
+        if row["status"] in {"completed", "cancelled"}:
+            raise SystemExit(f"cannot release terminal task: {row['status']}")
+        _require_live_lease(row, args.owner, "releasing")
+        t = now()
+        db.execute("UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',updated_at=? WHERE id=?", (t, args.id))
+        audit(db, "task", args.id, "lease_released", {"owner": args.owner})
+        json_out(dict(task_row(db, args.id)))
 
 def _acquire(db, task_id: str, owner: str, minutes: int, max_active: int = 0):
     """Atomically acquire/renew a lease; returns (acquired, expires_at).
@@ -425,6 +562,7 @@ def metrics(args):
             (t,))}
         receipts = db.execute("SELECT COUNT(*) n FROM receipts").fetchone()["n"]
         events = db.execute("SELECT COUNT(*) n FROM audit_events").fetchone()["n"]
+        notes = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded FROM notes").fetchone()
     json_out({
         "generated_at": t,
         "tasks_total": sum(by_status.values()),
@@ -437,6 +575,8 @@ def metrics(args):
         "max_retries_seen": retries["m"],
         "receipts": receipts,
         "audit_events": events,
+        "notes_total": notes["total"] or 0,
+        "notes_superseded": notes["superseded"] or 0,
     })
 
 def list_tasks(args):
@@ -509,6 +649,12 @@ def main():
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
     p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.set_defaults(fn=search_tasks)
+    p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.set_defaults(fn=add_note)
+    p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
+    p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.set_defaults(fn=supersede_note)
+    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.set_defaults(fn=task_context)
+    p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.set_defaults(fn=search_notes)
+    p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.set_defaults(fn=release)
     args=ap.parse_args(); args.fn(args)
 
 if __name__ == "__main__": main()

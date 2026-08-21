@@ -137,6 +137,14 @@ def doctor(args=None):
             "SELECT 1 FROM receipts r WHERE r.id=t.last_receipt)").fetchall()
         for r in dangling:
             problems.append({'kind': 'last_receipt_dangling', 'task_id': r['id']})
+        for r in c.execute(
+            "SELECT n.id FROM notes n LEFT JOIN tasks t ON t.id=n.task_id WHERE t.id IS NULL"):
+            problems.append({'kind': 'orphan_note', 'note_id': r['id']})
+        for r in c.execute(
+            "SELECT n.id,n.superseded_by FROM notes n "
+            "LEFT JOIN notes s ON s.id=n.superseded_by "
+            "WHERE n.superseded_by!='' AND s.id IS NULL"):
+            problems.append({'kind': 'supersede_target_missing', 'note_id': r['id'], 'superseded_by': r['superseded_by']})
     print(json.dumps({'ok': not problems, 'problems': problems, 'count': len(problems)}, sort_keys=True))
 
 def policy(args):

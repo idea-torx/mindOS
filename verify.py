@@ -164,7 +164,62 @@ with tempfile.TemporaryDirectory() as td:
     # Doctor: consistency sweep is clean on this exercised environment.
     doc = ops('doctor')
     assert doc['ok'] is True and doc['problems'] == [], doc
-    # Tamper evidence: mutating a historical audit event breaks the chain.
+    # Shared memory: provenance-tagged notes with exact-duplicate dedup.
+    run('create','--project','Verify','--title','memory host','--id','mem-1')
+    n1 = run('note','mem-1','--kind','fact','--content','API rate limit is 60/min','--source','hermes')
+    assert n1['deduplicated'] is False and n1['id']
+    dup = run('note','mem-1','--kind','fact','--content','  API rate limit is 60/min ','--source','other-agent')
+    assert dup['deduplicated'] is True and dup['id'] == n1['id'], 'exact duplicate must reuse the live note'
+    err = run_fail('note','mem-1','--kind','gossip','--content','x')
+    assert 'invalid note kind' in err
+    err = run_fail('note','no-such-task','--content','x')
+    assert 'task not found' in err
+    # Temporal facts: supersede swaps old->new atomically; old stays queryable with --all.
+    sup = run('supersede-note',n1['id'],'--content','API rate limit raised to 120/min','--source','hermes')
+    assert sup['old_note_id'] == n1['id'] and sup['new_note_id']
+    err = run_fail('supersede-note',n1['id'],'--content','double supersede')
+    assert 'already superseded' in err
+    live = run('notes','mem-1')
+    assert [n['content'] for n in live] == ['API rate limit raised to 120/min']
+    allnotes = run('notes','mem-1','--all')
+    assert len(allnotes) == 2 and allnotes[0]['superseded_by'] == sup['new_note_id']
+    # Superseding onto identical live content is rejected (would be a no-op duplicate).
+    err = run_fail('supersede-note',sup['new_note_id'],'--content','API rate limit raised to 120/min')
+    assert 'identical content' in err
+    # Context budget: packing respects the char budget and reports truncation.
+    for i in range(4):
+        run('note','mem-1','--kind','observation','--content','observation-%s %s' % (i, 'x'*40))
+    ctx = run('context','mem-1','--budget','100000')
+    assert ctx['truncated'] is False and ctx['notes_packed'] == ctx['notes_total'] == 5
+    assert ctx['notes'][0]['created_at'] <= ctx['notes'][-1]['created_at'], 'oldest-first packing'
+    small = run('context','mem-1','--budget','80')
+    assert small['truncated'] is True and small['used_chars'] <= 80 and small['notes_packed'] < 5
+    zero = run('context','mem-1','--budget','0')
+    assert zero['notes_packed'] == 0 and zero['truncated'] is True
+    # Note retrieval: keyword search joins task filters; superseded notes are hidden.
+    hits = run('search-notes','rate limit')
+    assert {h['id'] for h in hits} == {sup['new_note_id']}
+    hits = run('search-notes','observation-1','--project','Verify')
+    assert len(hits) == 1 and hits[0]['task_id'] == 'mem-1'
+    assert run('search-notes','rate limit','--status','completed') == []
+    m = run('metrics')
+    assert m['notes_total'] == 6 and m['notes_superseded'] == 1
+    # Voluntary lease release: holder requeues without consuming retry budget.
+    run('create','--project','Verify','--title','hand back','--id','rel-1')
+    run('claim','rel-1','--owner','worker-r','--minutes','5')
+    err = run_fail('release','rel-1','--owner','someone-else')
+    assert 'lease owned by worker-r' in err
+    rel = run('release','rel-1','--owner','worker-r')
+    assert rel['status'] == 'queued' and rel['lease_owner'] == '' and rel['retry_count'] == 0
+    row = next(r for r in run('list') if r['id'] == 'rel-1')
+    assert row['status'] == 'queued'
+    detail = run('show','rel-1')
+    assert any(e['action'] == 'lease_released' for e in detail['audit'])
+    run_fail('release','fin-1','--owner','worker-a')  # terminal tasks cannot be released
+    # Doctor: shared-memory sweep stays clean after the note exercises above.
+    doc = ops('doctor')
+    assert doc['ok'] is True and doc['problems'] == [], doc
+    # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
         db.execute("UPDATE audit_events SET action='tampered' WHERE id=(SELECT MIN(id) FROM audit_events)")
