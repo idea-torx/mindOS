@@ -1393,7 +1393,8 @@ def unverified_completions(args=None):
 
 MIGRATION_INVENTORY_FORMAT = 'autopilot-migration-inventory-v1'
 # Bounded discovery: an inventory sweep must never run away on a huge tree.
-_SCAN_SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv'}
+_SCAN_SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv',
+                   '.curator_backups', 'cache', 'logs', 'output'}
 _SCAN_TEXT_EXTS = {'.md', '.json', '.txt', '.yaml', '.yml'}
 _SCAN_MAX_FILE_BYTES = 512 * 1024
 _SCAN_MAX_FILES_PER_SOURCE = 500
@@ -1422,6 +1423,33 @@ def _scan_sha256(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+def _open_source_sqlite(path: Path):
+    """Open a durable SQLite source without ever taking a write lock.
+
+    Normal read-only SQLite is preferred because it can see a live WAL. Some
+    sandboxed macOS runners deny the lock operation even for `mode=ro`; when
+    there is no WAL/SHM sidecar (therefore no uncheckpointed transactional
+    state to miss), immutable read-only mode is an equally read-only snapshot
+    fallback. A live WAL refuses rather than risking an inconsistent view.
+    """
+    uri = f'file:{path}?mode=ro'
+    try:
+        c = sqlite3.connect(uri, uri=True, timeout=5)
+        # sqlite3 opens read-only URIs lazily on this platform: force a schema
+        # read here so a denied lock is caught before callers classify a source.
+        c.execute('PRAGMA schema_version').fetchone()
+        return c
+    except sqlite3.Error as first:
+        try:
+            c.close()
+        except (UnboundLocalError, sqlite3.Error):
+            pass
+        if any(Path(str(path) + suffix).exists() for suffix in ('-wal', '-shm')):
+            raise first
+        c = sqlite3.connect(f'file:{path}?mode=ro&immutable=1', uri=True, timeout=5)
+        c.execute('PRAGMA schema_version').fetchone()
+        return c
+
 def _classify_sqlite(path: Path):
     """Open a candidate database strictly read-only and classify it.
 
@@ -1431,7 +1459,7 @@ def _classify_sqlite(path: Path):
     fails closed on anything other than 'ok'.
     """
     try:
-        c = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=5)
+        c = _open_source_sqlite(path)
     except sqlite3.Error as e:
         return 'corrupted', [f'{type(e).__name__}: {e}'], {}
     try:
@@ -1451,7 +1479,7 @@ def _classify_sqlite(path: Path):
     finally:
         c.close()
 
-def _scan_source_files(base: Path, target: Path):
+def _scan_source_files(base: Path, target: Path, include=None):
     """Checksum every file under `target`, secret-scanning readable text.
 
     Bounded (file count and size caps) so a giant vault cannot stall the sweep;
@@ -1462,15 +1490,27 @@ def _scan_source_files(base: Path, target: Path):
     if target.is_file():
         candidates = [target]
     else:
-        candidates = sorted(p for p in target.rglob('*') if p.is_file() and not p.is_symlink())
+        candidates = []
+        for dirpath, dirnames, filenames in os.walk(target):
+            d = Path(dirpath)
+            dirnames[:] = sorted(x for x in dirnames
+                                 if x not in _SCAN_SKIP_DIRS and not (d / x).is_symlink())
+            candidates.extend(d / name for name in sorted(filenames)
+                              if (d / name).is_file() and not (d / name).is_symlink())
     files, truncated = [], False
     for p in candidates:
+        try:
+            relative = p.relative_to(base)
+        except ValueError:
+            continue
+        if include and not include(relative):
+            continue
         if len(files) >= _SCAN_MAX_FILES_PER_SOURCE:
             truncated = True
             break
         try:
             size = p.stat().st_size
-            entry = {'path': str(p.relative_to(base)), 'bytes': size,
+            entry = {'path': str(relative), 'bytes': size,
                      'sha256': _scan_sha256(p), 'secret_kinds': []}
         except OSError:
             continue
@@ -1762,7 +1802,7 @@ def migrate_import(args=None):
     dry = not getattr(args, 'apply', False)
     autopilot.ensure()
     try:
-        src = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=5)
+        src = _open_source_sqlite(db_path)
         src.row_factory = sqlite3.Row
         integrity = src.execute('PRAGMA integrity_check').fetchone()[0]
         if integrity != 'ok':
@@ -2553,7 +2593,7 @@ def _brain_classify_temporal(path: Path):
     """Classify the temporal sidecar strictly read-only (mirror of
     _classify_sqlite for the sidecar's own schema)."""
     try:
-        c = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=5)
+        c = _open_source_sqlite(path)
     except sqlite3.Error as e:
         return 'corrupted', [f'{type(e).__name__}: {e}'], {}
     try:
@@ -2579,7 +2619,7 @@ def _brain_ro_counts(path: Path, tables):
     re-run differ from the last — defeating the resume-by-reseal contract.
     """
     try:
-        c = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=5)
+        c = _open_source_sqlite(path)
     except sqlite3.Error:
         return {}
     try:
@@ -2596,13 +2636,13 @@ def _brain_ro_counts(path: Path, tables):
     finally:
         c.close()
 
-def _brain_scan_tree(base: Path, targets, cap=_SCAN_MAX_FILES_PER_SOURCE):
+def _brain_scan_tree(base: Path, targets, cap=_SCAN_MAX_FILES_PER_SOURCE, include=None):
     """Checksum + kind-only secret-scan several subtrees under one budget."""
     files, truncated = [], False
     for target in targets:
         if not target.exists():
             continue
-        batch, more = _scan_source_files(base, target)
+        batch, more = _scan_source_files(base, target, include=include)
         truncated = truncated or more
         for entry in batch:
             if len(files) >= cap:
@@ -2611,10 +2651,10 @@ def _brain_scan_tree(base: Path, targets, cap=_SCAN_MAX_FILES_PER_SOURCE):
     return files, truncated
 
 def _brain_file_source(sid_kind, path: Path, role, targets=None, extra_counts=None,
-                       cap=_SCAN_MAX_FILES_PER_SOURCE):
+                       cap=_SCAN_MAX_FILES_PER_SOURCE, include=None):
     """Shared shape for filesystem-backed sources: checksummed file inventory,
     secret kinds reduced to kinds-only, deterministic ordering."""
-    files, truncated = _brain_scan_tree(path, targets or [path], cap)
+    files, truncated = _brain_scan_tree(path, targets or [path], cap, include=include)
     kinds = sorted({k for f in files for k in f['secret_kinds']})
     problems = []
     if truncated:
@@ -2636,6 +2676,19 @@ def _brain_json_doc(path: Path):
         return None, 'missing'
     except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
         return None, f'{type(e).__name__}: {e}'
+
+_BRAIN_PROFILE_DEFINITION_NAMES = {
+    'profile.yaml', 'profile.yml', 'profile.json', 'profile.toml', 'profile.md',
+    'config.yaml', 'config.yml', 'config.json', 'config.toml',
+}
+
+def _brain_profile_definition(relative: Path):
+    """Only durable profile declarations, never a profile's runtime state."""
+    return relative.name.lower() in _BRAIN_PROFILE_DEFINITION_NAMES
+
+def _brain_skill_definition(relative: Path):
+    """A skill's portable contract is its SKILL.md declaration."""
+    return relative.name == 'SKILL.md'
 
 def brain_inventory(args=None):
     """Dry-run-first end-to-end brain inventory across every durable source.
@@ -2685,6 +2738,7 @@ def brain_inventory(args=None):
     add({'id': 'brain-' + hashlib.sha256(f'autopilot:{adb}'.encode()).hexdigest()[:12],
          'kind': 'autopilot', 'role': _BRAIN_ROLES['autopilot'], 'path': str(adb),
          'status': status, 'problems': problems, 'counts': counts, 'files': [],
+         'sha256': _scan_sha256(adb) if adb.is_file() else '',
          'secret_kinds': []}, blocking=(status == 'ambiguous'))
     # Temporal sidecar: optional by contract ("if present").
     tdb = autopilot.ROOT / 'temporal.db'
@@ -2692,13 +2746,14 @@ def brain_inventory(args=None):
         status, problems, counts = _brain_classify_temporal(tdb)
         add({'id': 'brain-' + hashlib.sha256(f'temporal:{tdb}'.encode()).hexdigest()[:12],
              'kind': 'temporal', 'role': _BRAIN_ROLES['temporal'], 'path': str(tdb),
-             'status': status, 'problems': problems, 'counts': counts, 'files': [],
+             'status': status, 'problems': problems, 'counts': counts,
+             'sha256': _scan_sha256(tdb), 'files': [],
              'secret_kinds': []})
     else:
         add({'id': 'brain-' + hashlib.sha256(f'temporal:{tdb}'.encode()).hexdigest()[:12],
              'kind': 'temporal', 'role': _BRAIN_ROLES['temporal'], 'path': str(tdb),
              'status': 'absent', 'problems': ['temporal sidecar not present'],
-             'counts': {}, 'files': [], 'secret_kinds': []})
+             'counts': {}, 'sha256': '', 'files': [], 'secret_kinds': []})
     # Semantic memory: a shared service, not a file store — verify the binding,
     # never pretend a local copy exists or copy semantics into SQLite.
     add(_brain_hindsight(hs_url, bank, timeout))
@@ -2729,15 +2784,18 @@ def brain_inventory(args=None):
     add(mem_src)
     # Session cache: disposable derived rows in the control plane + raw store.
     sess_dir = hermes / 'sessions'
-    sess_extra = {'raw_store_present': sess_dir.is_dir()}
+    raw_store = sess_dir / 'raw-store'
+    sess_extra = {'raw_store_present': raw_store.is_dir()}
     if adb.exists():
         cache = _brain_ro_counts(adb, ('sessions', 'session_messages'))
         sess_extra.update({f'cache_{k}': v for k, v in cache.items()})
     add(_brain_file_source('sessions', sess_dir, _BRAIN_ROLES['sessions'],
-                           extra_counts=sess_extra))
+                           targets=[raw_store], extra_counts=sess_extra))
     # Profile / skill definitions: agent configuration, checksummed.
-    add(_brain_file_source('profiles', hermes / 'profiles', _BRAIN_ROLES['profiles']))
-    add(_brain_file_source('skills', hermes / 'skills', _BRAIN_ROLES['skills']))
+    add(_brain_file_source('profiles', hermes / 'profiles', _BRAIN_ROLES['profiles'],
+                           include=_brain_profile_definition))
+    add(_brain_file_source('skills', hermes / 'skills', _BRAIN_ROLES['skills'],
+                           include=_brain_skill_definition))
     # Cron definitions: jobs.json is the definition surface; runtime artifacts
     # (executions.db, output/) are counted but never opened as authority.
     cron_dir = hermes / 'cron'
@@ -2754,7 +2812,7 @@ def brain_inventory(args=None):
     else:
         jproblem, cron_extra = 'unrecognized jobs document shape', {}
     cron_src = _brain_file_source('cron', cron_dir, _BRAIN_ROLES['cron'],
-                                  extra_counts=cron_extra)
+                                  targets=[jobs_path], extra_counts=cron_extra)
     if jproblem and jproblem != 'missing':
         cron_src['status'] = 'corrupted'
         cron_src['problems'].append('cron/jobs.json unreadable: ' + jproblem)
@@ -2781,11 +2839,10 @@ def brain_inventory(args=None):
     digest = hashlib.sha256(json.dumps(
         {k: v for k, v in body.items() if k != 'created_at'}, sort_keys=True).encode()).hexdigest()
     doc_out = {**body, 'sha256': digest}
-    autopilot.ensure()
-    with db() as c:
-        autopilot.audit(c, 'system', 'brain-inventory', 'brain_inventory_sealed',
-                        {'sha256': digest, 'sources': len(sources),
-                         'fail_closed': fail_closed})
+    # Unlike the older execution-state inventory, this end-to-end source
+    # sweep must be genuinely read-only: the live Autopilot home is itself a
+    # source and even a digest-only audit event would mutate it. The sealed
+    # manifest is therefore the audit artifact for this stage.
     out = getattr(args, 'out', None)
     compact = {'ok': not fail_closed, 'sha256': digest, 'fail_closed': fail_closed,
                'summary': body['summary'],
@@ -2834,6 +2891,307 @@ def brain_inventory_check(args):
                                    'status': s.get('status')} for s in body.get('sources', [])],
                       'sha256': expected}, sort_keys=True))
 
+BRAIN_IMPORT_FORMAT = 'mindos-brain-import-v1'
+_BRAIN_IMPORT_TEXT_EXTS = _SCAN_TEXT_EXTS | {'.jsonl', '.toml', '.ini', '.cfg'}
+
+def _load_brain_inventory(path: Path):
+    """Load a brain inventory only after verifying its content seal."""
+    if not path.exists():
+        raise SystemExit(f'brain inventory not found: {path}')
+    try:
+        doc = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f'brain inventory is not valid JSON: {e}')
+    if doc.get('format') != BRAIN_INVENTORY_FORMAT:
+        raise SystemExit('unrecognized brain inventory format')
+    body = {k: v for k, v in doc.items() if k != 'sha256'}
+    actual = hashlib.sha256(json.dumps(
+        {k: v for k, v in body.items() if k != 'created_at'}, sort_keys=True).encode()).hexdigest()
+    if actual != doc.get('sha256'):
+        raise SystemExit('brain inventory integrity check failed; refusing a tampered manifest')
+    return doc
+
+def _brain_relative(path: str):
+    """Validate a manifest-relative path before it becomes a target path."""
+    p = Path(path)
+    if p.is_absolute() or '..' in p.parts or path in ('', '.'):
+        raise SystemExit(f'unsafe relative path in brain inventory: {path!r}')
+    return p
+
+def _brain_text_redacted(data: bytes):
+    """Return a redacted text copy, or None when bytes are not safe text."""
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        return None
+    return autopilot._redact_secrets(text).encode()
+
+def _brain_entry_bytes(source: Path, expected_sha: str, label: str):
+    """Read a source byte-for-byte only after detecting inventory drift."""
+    if not source.is_file() or source.is_symlink():
+        raise SystemExit(f'brain source missing or unsafe after inventory: {label}')
+    actual = _scan_sha256(source)
+    if not expected_sha or actual != expected_sha:
+        raise SystemExit(
+            f'brain source drift detected for {label}; expected inventory checksum '
+            f'{expected_sha or "<missing>"}, got {actual}; take a fresh snapshot')
+    return source.read_bytes()
+
+def _brain_target_write(path: Path, data: bytes):
+    """Atomic create-or-verify write. Never replaces local target truth."""
+    digest = hashlib.sha256(data).hexdigest()
+    if path.exists() or path.is_symlink():
+        if not path.is_file() or path.is_symlink() or _scan_sha256(path) != digest:
+            raise SystemExit(f'target conflict at {path}; refusing to overwrite local data')
+        return False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix='.brain-import.', dir=str(path.parent))
+    except OSError as e:
+        raise SystemExit(f'target is not writable at {path.parent}: {type(e).__name__}: {e}')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, str(path))
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+    return True
+
+def _brain_plan_file(src, rel: Path, target_rel: Path, reason=''):
+    """Turn one checksummed manifest file into a safe plan row."""
+    source_root = Path(src['path'])
+    source = source_root / rel
+    expected = next((f.get('sha256') for f in src.get('files', [])
+                     if f.get('path') == str(rel)), '')
+    return {'source_id': src['id'], 'kind': src['kind'], 'source': str(source),
+            'source_rel': str(rel), 'target_rel': str(target_rel),
+            'expected_sha256': expected, 'secret_kinds': [], 'reason': reason}
+
+def _brain_import_plan(inv):
+    """Create a deterministic copy/bind/quarantine plan from a sealed inventory.
+
+    The inventory already represents a read-only snapshot. This function does
+    no I/O beyond interpreting that document; apply re-verifies every source
+    checksum before it creates anything in the target.
+    """
+    actions, blockers = [], []
+    for src in inv.get('sources', []):
+        kind, status = src.get('kind'), src.get('status')
+        if kind == 'hindsight':
+            actions.append({'action': 'bind_hindsight', 'source_id': src.get('id'),
+                            'kind': kind, 'target_rel': 'bindings/hindsight-shared-bank.json',
+                            'status': status, 'bound': bool(src.get('bound')),
+                            'reason': 'GET-only shared-bank binding; bank content is never copied'})
+            continue
+        if kind == 'autopilot':
+            actions.append({'action': 'external_execution_import_required', 'source_id': src.get('id'),
+                            'kind': kind, 'status': status,
+                            'reason': 'execution truth remains the existing migrate-import boundary'})
+            continue
+        if status == 'absent':
+            actions.append({'action': 'skip_absent', 'source_id': src.get('id'), 'kind': kind,
+                            'reason': '; '.join(src.get('problems', []))})
+            continue
+        if status not in ('ok', 'ok_partial_scan'):
+            blockers.append(f"{src.get('id')} ({kind}) is {status}: {'; '.join(src.get('problems', []))}")
+            continue
+        if status == 'ok_partial_scan':
+            blockers.append(f"{src.get('id')} ({kind}) was partially scanned; take a complete inventory")
+            continue
+        if kind in ('temporal', 'claude_sync'):
+            dest = 'temporal.db' if kind == 'temporal' else 'metadata/claude-memory-sync.json'
+            actions.append({'action': 'copy', 'source_id': src['id'], 'kind': kind,
+                            'source': src['path'], 'target_rel': dest,
+                            'expected_sha256': src.get('sha256', ''),
+                            'secret_kinds': list(src.get('secret_kinds', [])), 'reason': ''})
+            continue
+        if kind not in ('claude_memory', 'sessions', 'profiles', 'skills', 'cron'):
+            actions.append({'action': 'quarantine_unsupported_source', 'source_id': src.get('id'),
+                            'kind': kind, 'reason': 'unsupported source kind is not copied'})
+            continue
+        prefix = {'claude_memory': 'archives/claude-memory', 'sessions': 'sessions',
+                  'profiles': 'profiles', 'skills': 'skills', 'cron': 'cron'}[kind]
+        for f in src.get('files', []):
+            rel = _brain_relative(f.get('path', ''))
+            if kind == 'sessions' and not (rel.parts and rel.parts[0] == 'raw-store'):
+                actions.append({'action': 'quarantine_unsupported_file', 'source_id': src['id'],
+                                'kind': kind, 'source_rel': str(rel),
+                                'expected_sha256': f.get('sha256', ''),
+                                'reason': 'derived session cache is rebuildable; only raw-store is portable'})
+                continue
+            if kind == 'cron' and rel != Path('jobs.json'):
+                actions.append({'action': 'quarantine_unsupported_file', 'source_id': src['id'],
+                                'kind': kind, 'source_rel': str(rel),
+                                'expected_sha256': f.get('sha256', ''),
+                                'reason': 'only cron/jobs.json is a portable definition'})
+                continue
+            row = _brain_plan_file(src, rel, Path(prefix) / rel)
+            row['secret_kinds'] = list(f.get('secret_kinds', []))
+            actions.append({'action': 'copy', **row})
+    return actions, blockers
+
+def _brain_binding_bytes(inv, src):
+    """Safe binding metadata; deliberately no Hindsight values or export."""
+    body = {'format': 'mindos-hindsight-binding-v1', 'inventory_sha256': inv['sha256'],
+            'adapter': src.get('adapter', 'provider-neutral-http-v1'), 'url': src.get('url', ''),
+            'bank': src.get('bank', ''), 'path': src.get('path', ''),
+            'status': src.get('status'), 'bound': bool(src.get('bound')),
+            'counts': src.get('counts', {}), 'problems': src.get('problems', [])}
+    body['sha256'] = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    return json.dumps(body, sort_keys=True).encode()
+
+def brain_import(args=None):
+    """Apply a sealed brain inventory into an explicit new MindOS home.
+
+    Dry-run is the default. Sources are re-hashed immediately before copying;
+    changed sources, incomplete inventories, and pre-existing different target
+    bytes fail closed. Hindsight is represented only by a provider-neutral,
+    GET-probed binding record — never by semantic-memory rows in SQLite.
+    Credential-shaped source files are quarantined by default, or copied as a
+    redacted text derivative with --redact. Every applied run writes a sealed
+    report and source-to-target provenance records; re-running verifies those
+    exact bytes and becomes a no-op.
+    """
+    inv = _load_brain_inventory(Path(args.inventory))
+    if inv.get('fail_closed'):
+        raise SystemExit('brain inventory failed closed; resolve blocked sources before import')
+    target = Path(args.target).expanduser()
+    if not target.is_absolute():
+        raise SystemExit('--target must be an explicit absolute new MindOS home')
+    target = target.resolve()
+    source_hermes = Path(inv.get('hermes_home', '')).expanduser()
+    if target == source_hermes or target == source_hermes / 'autopilot':
+        raise SystemExit('refusing to import into the inventoried Hermes source home')
+    actions, blockers = _brain_import_plan(inv)
+    if blockers:
+        raise SystemExit('brain import refused:\n  ' + '\n  '.join(blockers))
+    redact = bool(getattr(args, 'redact', False))
+    materialized, quarantine = [], []
+    # Preflight every source byte and every target conflict before a single
+    # destination write. This is the snapshot-consistency boundary.
+    for action in actions:
+        if action['action'] != 'copy':
+            continue
+        data = _brain_entry_bytes(Path(action['source']), action['expected_sha256'],
+                                  action['source'])
+        kinds = sorted({f['kind'] for f in autopilot._secret_findings(data.decode('utf-8', errors='ignore'))}) \
+            if Path(action['source']).suffix.lower() in _BRAIN_IMPORT_TEXT_EXTS else []
+        kinds = sorted(set(kinds) | set(action.get('secret_kinds', [])))
+        target_path = target / _brain_relative(action['target_rel'])
+        if kinds:
+            redacted = _brain_text_redacted(data) if redact else None
+            if redacted is None:
+                quarantine.append({**action, 'secret_kinds': kinds,
+                                   'reason': 'credential-shaped or non-text source quarantined'})
+                continue
+            data = redacted
+            action = {**action, 'secret_kinds': kinds, 'redacted': True}
+        if target_path.exists() or target_path.is_symlink():
+            digest = hashlib.sha256(data).hexdigest()
+            if not target_path.is_file() or target_path.is_symlink() or _scan_sha256(target_path) != digest:
+                blockers.append(f'target conflict at {target_path}')
+        materialized.append((action, data))
+    if blockers:
+        raise SystemExit('brain import refused:\n  ' + '\n  '.join(blockers))
+    for action in actions:
+        if action['action'] == 'quarantine_unsupported_file':
+            quarantine.append(action)
+    binding = next((s for s in inv.get('sources', []) if s.get('kind') == 'hindsight'), None)
+    binding_data = _brain_binding_bytes(inv, binding) if binding else None
+    binding_target = target / 'bindings/hindsight-shared-bank.json'
+    if binding_data and (binding_target.exists() or binding_target.is_symlink()):
+        if not binding_target.is_file() or binding_target.is_symlink() or \
+                _scan_sha256(binding_target) != hashlib.sha256(binding_data).hexdigest():
+            raise SystemExit(f'target conflict at {binding_target}; refusing to overwrite local binding')
+    planned = {'copy': len(materialized), 'quarantine': len(quarantine),
+               'bind_hindsight': bool(binding_data),
+               'execution_import_required': any(a['action'] == 'external_execution_import_required'
+                                                for a in actions)}
+    if not getattr(args, 'apply', False):
+        plan_actions = [{k: v for k, v in a.items() if k not in ('source',)} for a in actions]
+        plan_quarantine = [{k: v for k, v in a.items() if k not in ('source',)} for a in quarantine]
+        body = {'format': BRAIN_IMPORT_FORMAT, 'created_at': utc(), 'applied': False,
+                'dry_run': True, 'target': str(target), 'inventory_sha256': inv['sha256'],
+                'planned': planned, 'actions': plan_actions, 'quarantine': plan_quarantine}
+        digest = hashlib.sha256(json.dumps({k: v for k, v in body.items() if k != 'created_at'},
+                                           sort_keys=True).encode()).hexdigest()
+        report = {**body, 'sha256': digest}
+        out = getattr(args, 'out', '')
+        if out:
+            out_path = Path(out).expanduser()
+            if not out_path.is_absolute():
+                out_path = target / out_path
+            _brain_target_write(out_path, json.dumps(report, sort_keys=True).encode())
+        else:
+            out_path = None
+        print(json.dumps({'ok': True, 'dry_run': True, 'target': str(target),
+                          'inventory_sha256': inv['sha256'], 'sha256': digest,
+                          'planned': planned, 'actions': plan_actions,
+                          'quarantine': plan_quarantine,
+                          **({'report': str(out_path)} if out_path else {})}, sort_keys=True))
+        return
+    written, existing = [], []
+    records = []
+    for action, data in materialized:
+        destination = target / _brain_relative(action['target_rel'])
+        created = _brain_target_write(destination, data)
+        (written if created else existing).append(str(destination))
+        records.append({'source_id': action['source_id'], 'kind': action['kind'],
+                        'source_path': action['source'], 'source_sha256': action['expected_sha256'],
+                        'target_path': str(destination.relative_to(target)),
+                        'target_sha256': hashlib.sha256(data).hexdigest(),
+                        'redacted': bool(action.get('redacted')), 'secret_kinds': action.get('secret_kinds', [])})
+    if binding_data:
+        created = _brain_target_write(binding_target, binding_data)
+        (written if created else existing).append(str(binding_target))
+        records.append({'source_id': binding['id'], 'kind': 'hindsight_binding',
+                        'source_path': binding.get('path', ''), 'source_sha256': '',
+                        'target_path': str(binding_target.relative_to(target)),
+                        'target_sha256': hashlib.sha256(binding_data).hexdigest(),
+                        'redacted': False, 'secret_kinds': []})
+    provenance = {'format': 'mindos-brain-provenance-v1', 'inventory_sha256': inv['sha256'],
+                  'records': records, 'quarantine': [{k: v for k, v in a.items()
+                                                       if k not in ('source',)} for a in quarantine]}
+    provenance_bytes = json.dumps(provenance, sort_keys=True).encode()
+    prov_target = target / 'provenance' / f'brain-import-{inv["sha256"]}.json'
+    created = _brain_target_write(prov_target, provenance_bytes)
+    (written if created else existing).append(str(prov_target))
+    # The sealed report describes durable state, not the transient fact that a
+    # particular re-run happened to create rather than verify an artifact.
+    # That keeps the same inventory/target report reusable on an idempotent
+    # resume while stdout still tells the operator what this run wrote.
+    body = {'format': BRAIN_IMPORT_FORMAT, 'created_at': utc(), 'applied': True,
+            'target': str(target), 'inventory_sha256': inv['sha256'], 'planned': planned,
+            'artifacts': records, 'quarantine': provenance['quarantine'],
+            'provenance': str(prov_target.relative_to(target))}
+    digest = hashlib.sha256(json.dumps({k: v for k, v in body.items() if k != 'created_at'},
+                                       sort_keys=True).encode()).hexdigest()
+    report = {**body, 'sha256': digest}
+    report_target = Path(getattr(args, 'out', '') or
+                         target / 'migrations' / f'brain-import-{inv["sha256"][:12]}.json')
+    report_target = report_target.expanduser()
+    if not report_target.is_absolute():
+        report_target = target / report_target
+    if report_target.exists() or report_target.is_symlink():
+        try:
+            previous = json.loads(report_target.read_text())
+        except (OSError, json.JSONDecodeError):
+            raise SystemExit(f'target conflict at {report_target}; existing report is unreadable')
+        previous_body = {k: v for k, v in previous.items() if k not in ('sha256', 'created_at')}
+        report_body = {k: v for k, v in report.items() if k not in ('sha256', 'created_at')}
+        previous_digest = hashlib.sha256(json.dumps(previous_body, sort_keys=True).encode()).hexdigest()
+        if previous.get('format') != BRAIN_IMPORT_FORMAT or previous.get('sha256') != previous_digest \
+                or previous_body != report_body:
+            raise SystemExit(f'target conflict at {report_target}; refusing to replace a different report')
+    else:
+        _brain_target_write(report_target, json.dumps(report, sort_keys=True).encode())
+    print(json.dumps({'ok': True, 'applied': True, 'target': str(target), 'sha256': digest,
+                      'inventory_sha256': inv['sha256'], 'planned': planned,
+                      'written': [str(Path(p).relative_to(target)) for p in written],
+                      'already_present': [str(Path(p).relative_to(target)) for p in existing],
+                      'quarantine': len(quarantine), 'report': str(report_target)}, sort_keys=True))
+
 def policy(args):
     # Resolve through autopilot.POLICIES so HERMES_AUTOPILOT_HOME is honored —
     # a hardcoded live-home path would read (or miss) the wrong policies in
@@ -2875,6 +3233,7 @@ x=s.add_parser('migrate-import'); x.add_argument('--inventory',required=True); x
 x=s.add_parser('migrate-rollback'); x.add_argument('result'); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--force',action='store_true',help='cascade away drifted rows and local dependents of imported tasks'); x.set_defaults(fn=migrate_rollback)
 x=s.add_parser('brain-inventory'); x.add_argument('--hermes-home',dest='hermes_home',default='',help='Hermes home to inventory (default ~/.hermes; read-only)'); x.add_argument('--claude-home',dest='claude_home',default='',help='Claude home to inventory (default ~/.claude; read-only)'); x.add_argument('--hindsight-url',dest='hindsight_url',default='http://127.0.0.1:8888',help='Hindsight service base URL for the read-only binding probe'); x.add_argument('--bank',default='autopilot-shared-context',help='shared-context bank the binding must expose'); x.add_argument('--timeout',type=float,default=3.0,help='per-request HTTP timeout in seconds'); x.add_argument('--out',default=None,help='write a sealed mindos-brain-inventory-v1 manifest'); x.set_defaults(fn=brain_inventory)
 x=s.add_parser('brain-inventory-check'); x.add_argument('path'); x.set_defaults(fn=brain_inventory_check)
+x=s.add_parser('brain-import'); x.add_argument('--inventory',required=True,help='sealed mindos-brain-inventory-v1 manifest'); x.add_argument('--target',required=True,help='explicit absolute new MindOS home; never the inventoried source home'); x.add_argument('--apply',action='store_true',help='without this flag emit a dry-run plan only'); x.add_argument('--redact',action='store_true',help='copy credential-shaped text only as redacted derivatives; otherwise quarantine'); x.add_argument('--out',default='',help='sealed import report path (default <target>/migrations/)'); x.set_defaults(fn=brain_import)
 x=s.add_parser('onboard'); x.add_argument('--inventory',required=True,help='sealed autopilot-migration-inventory-v1 manifest from migrate-inventory'); x.add_argument('--source-id',dest='source_id',default='',help='autopilot_sqlite source to import; auto-selected when exactly one is healthy'); x.add_argument('--apply',action='store_true',help='without this flag onboarding plans and verifies but does not import'); x.add_argument('--out',default=None,help='write a sealed autopilot-onboarding-v1 report document'); x.add_argument('--redact',action='store_true'); x.add_argument('--allow-secret',action='store_true'); x.add_argument('--relink-audit',dest='relink_audit',action='store_true',help='merge into a non-empty audit ledger and relink the combined chain (forwarded to migrate-import)'); x.add_argument('--probe',action='store_true',help='run the end-to-end cross-agent handoff/recall/ack/complete probe (requires --apply)'); x.set_defaults(fn=onboard)
 if __name__ == '__main__':
     args=p.parse_args(); args.fn(args)

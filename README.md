@@ -1441,8 +1441,9 @@ Design rules, enforced and tested:
   sha256-sealed with `created_at` outside the digest, so unchanged sources
   re-seal byte-identically and interrupted installs resume against the same
   manifest; tampering any field makes `brain-inventory-check` refuse it.
-  The command's own audit events are excluded from the audited count it
-  records, so sealing never perturbs the next seal.
+  The manifest itself is the audit artifact: because the live Autopilot home
+  is a source, this end-to-end inventory does not append even a digest-only
+  bookkeeping event to it.
 - **Honest degradation**: corruption or ambiguity fails closed naming exact
   blockers (garbage `jobs.json`, a non-SQLite `temporal.db`); an absent
   optional sidecar and an unreachable Hindsight are recorded as `absent` /
@@ -1451,8 +1452,44 @@ Design rules, enforced and tested:
   broken.
 - **Bounded & atomic**: file-count caps keep giant trees from stalling the
   sweep (overflow reported, never silent); manifests are written atomically
-  with `0600` permissions and audited digest-only as
-  `brain_inventory_sealed`.
+  with `0600` permissions.
+
+## Brain import and shared-bank binding
+
+`brain-import` consumes only a sealed brain inventory and requires an explicit
+absolute new home. It is a separate layer from `migrate-import`: execution
+truth stays at the existing SQLite migration boundary, while this command
+brings across the non-execution brain surfaces without turning Hindsight into a
+second local semantic authority.
+
+```bash
+python3 "$O" brain-import --inventory brain.json --target /absolute/new/mindos
+python3 "$O" brain-import --inventory brain.json --target /absolute/new/mindos --apply --redact
+```
+
+The default command is a no-write plan. Under `--apply`, it first re-hashes
+every selected file from the inventory, refuses source drift or a different
+pre-existing target file, then creates files atomically with `0600` mode. It
+imports `temporal.db`, Claude sync metadata, Claude memory archives, portable
+raw session-store files, profile/config declarations, skill `SKILL.md`
+declarations, and `cron/jobs.json`; derived session cache artifacts, profile
+runtime state, non-definition skill support/cache trees, and non-definition
+cron artifacts are explicitly quarantined rather than guessed at. Every copied artifact has source and target
+checksums in `provenance/brain-import-<inventory-sha>.json`, and an applied run
+writes a sealed `mindos-brain-import-v1` report under `migrations/` (or `--out`).
+
+Credential-shaped text is quarantined by default. `--redact` copies only a
+redacted derivative; non-text secret-bearing sources remain quarantined. The
+quarantine records identities, checksums, kinds, and reasons — never values.
+Re-running the same inventory verifies the already-created bytes and is a
+no-op; it never replaces local destination data.
+
+For Hindsight, `brain-import` writes only
+`bindings/hindsight-shared-bank.json`: the provider-neutral endpoint, bank,
+GET-probed health/bound state, count-shaped stats, and inventory seal. It never
+exports, writes, or stores Hindsight semantic content in SQLite. An unavailable
+or degraded bank is faithfully bound as health metadata so recovery can happen
+in place rather than inventing a duplicate authority.
 
 ## Migration inventory (installer stage one)
 
