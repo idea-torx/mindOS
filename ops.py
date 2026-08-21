@@ -539,7 +539,7 @@ def archive_restore(args):
 WORKORDER_FORMAT = 'autopilot-workorder-v1'
 # Child tables carried by a work order; 'tasks' is exported separately as
 # 'task' since it gets sanitization and merge semantics of its own.
-WORKORDER_TABLES = ('task_deps', 'heartbeats', 'receipts', 'notes', 'handoffs')
+WORKORDER_TABLES = ('task_deps', 'heartbeats', 'receipts', 'notes', 'handoffs', 'facts')
 WORKORDER_ACTIVE_STATUSES = ('claimed', 'running', 'waiting_for_agent')
 
 def _doc_secret_kinds(node):
@@ -591,10 +591,12 @@ def export_task(args=None):
 
     A work order is the provider-neutral unit of cross-boundary recovery: it
     carries the task row, dependency edges in both directions, complete note
-    and handoff history, receipts (with their sealed files), and the heartbeat,
-    all under one sha256 seal so any Autopilot home can verify integrity before
-    importing. The same secret guard that protects shared-memory writes guards
-    the export boundary — a credential never leaves the database unredacted.
+    and handoff history, receipts (with their sealed files), the heartbeat,
+    and every temporal fact provenance-linked to the task (validity windows
+    intact), all under one sha256 seal so any Autopilot home can verify
+    integrity before importing. The same secret guard that protects
+    shared-memory writes guards the export boundary — a credential never
+    leaves the database unredacted.
     """
     tid = args.id
     with db() as c:
@@ -610,6 +612,7 @@ def export_task(args=None):
             'receipts': fetch('SELECT * FROM receipts WHERE task_id=?'),
             'notes': fetch('SELECT * FROM notes WHERE task_id=? ORDER BY created_at, rowid'),
             'handoffs': fetch('SELECT * FROM handoffs WHERE task_id=? ORDER BY created_at, rowid'),
+            'facts': fetch('SELECT * FROM facts WHERE task_id=? ORDER BY created_at, rowid'),
         }
     receipt_files = {}
     for r in tables['receipts']:
@@ -676,9 +679,12 @@ def import_task(args=None):
     An imported task can never arrive still leased — active statuses are reset
     to queued with lease fields cleared, because the previous owner does not
     exist here. Dependency edges are inserted only when both endpoints exist
-    locally; dangling ones are reported, never silently dropped. The secret
-    guard runs again on import so an override at the source cannot leak
-    credentials into this home unnoticed.
+    locally; dangling ones are reported, never silently dropped. Provenance-
+    linked temporal facts arrive with validity windows intact (facts are fleet
+    knowledge keyed by their own id, so INSERT OR IGNORE deduplicates).
+    Work orders sealed before the fact graph simply carry no facts key and
+    import unchanged. The secret guard runs again on import so an override at
+    the source cannot leak credentials into this home unnoticed.
     """
     body = _load_workorder(Path(args.path))
     tid = body['task']['id']
@@ -706,7 +712,7 @@ def import_task(args=None):
                     f'SELECT * FROM {t} WHERE '
                     + ('task_id=?' if t != 'task_deps' else 'task_id=? OR depends_on=?'),
                     (tid, tid) if t == 'task_deps' else (tid,)).fetchall()}
-                for t in ('notes', 'handoffs', 'receipts'))
+                for t in ('notes', 'handoffs', 'receipts', 'facts'))
         if dry:
             print(json.dumps({'ok': True, 'dry_run': True, 'task_id': tid,
                               'exists': existing is not None, 'identical': identical,
@@ -734,7 +740,7 @@ def import_task(args=None):
             c.execute(f'INSERT INTO tasks({",".join(cols)}) VALUES({",".join("?" * len(cols))})',
                       [task_in[col] for col in cols])
         inserted = {}
-        for t in ('notes', 'handoffs', 'receipts'):
+        for t in ('notes', 'handoffs', 'receipts', 'facts'):
             n = 0
             for row in tables.get(t, []):
                 cols = list(row.keys())
@@ -1631,10 +1637,13 @@ MIGRATION_RESULT_FORMAT = 'autopilot-migration-result-v1'
 # Execution-truth tables imported by migrate-import, in FK-safe insert order.
 # Heartbeats are deliberately excluded: liveness state for owners who do not
 # exist on this machine is disposable cache, not history worth carrying.
-_MIGRATION_TABLES = ('tasks', 'task_deps', 'receipts', 'notes', 'handoffs')
+# Facts carry no hard FK (task_id is a soft reference), so they insert last
+# and can never dangle.
+_MIGRATION_TABLES = ('tasks', 'task_deps', 'receipts', 'notes', 'handoffs', 'facts')
 _MIGRATION_REQUIRED_COLS = {
     'tasks': ('id',), 'task_deps': ('task_id', 'depends_on'),
     'receipts': ('id',), 'notes': ('id',), 'handoffs': ('id',),
+    'facts': ('id',),
 }
 
 def _rechain_audit(c):
@@ -1710,6 +1719,8 @@ def migrate_import(args=None):
     table idempotently (INSERT OR IGNORE on natural keys — an identical re-run
     deduplicates to nothing). Tasks that arrive mid-flight are sanitized to
     queued with leases cleared, because the prior owner does not exist here.
+    The temporal fact graph travels with execution truth (validity windows
+    intact); a source predating the fact table imports cleanly as legacy shape.
     The audit hash chain is preserved verbatim when this home's ledger is
     empty; merging into a live ledger breaks every link and is refused unless
     `--relink-audit` explicitly relinks the whole merged chain.
@@ -1751,10 +1762,17 @@ def migrate_import(args=None):
         tgt.row_factory = sqlite3.Row
         tgt.execute('PRAGMA foreign_keys=ON')
         # Schema-drift tolerance: import the intersection of columns, but never
-        # a row whose identity cannot be represented locally.
+        # a row whose identity cannot be represented locally. A source whose
+        # schema predates a table entirely (e.g. the temporal fact graph) is
+        # legacy shape, not drift — it carries zero rows there.
+        src_tables = {r[0] for r in src.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
         cols = {}
         for t in _MIGRATION_TABLES:
             tcols = {r[1] for r in tgt.execute(f'PRAGMA table_info({t})')}
+            if t not in src_tables:
+                cols[t] = []
+                continue
             scols = {r[1] for r in src.execute(f'PRAGMA table_info({t})')}
             missing = [c_ for c_ in _MIGRATION_REQUIRED_COLS[t] if c_ not in scols or c_ not in tcols]
             if missing:
@@ -1762,6 +1780,9 @@ def migrate_import(args=None):
             cols[t] = sorted(scols & tcols)
         rows = {}
         for t in _MIGRATION_TABLES:
+            if not cols[t]:
+                rows[t] = []
+                continue
             sel = ','.join(f'"{c_}"' for c_ in cols[t])
             order = 'id' if t == 'tasks' else 'rowid'
             rows[t] = [dict(r) for r in src.execute(f'SELECT {sel} FROM {t} ORDER BY {order}')]
@@ -1774,7 +1795,10 @@ def migrate_import(args=None):
             if r['status'] in WORKORDER_ACTIVE_STATUSES:
                 r.update(status='queued', lease_owner='', lease_expires_at='',
                          blocked_reason='migrated active lease sanitized')
-        secret_tables = {t: rows[t] for t in ('notes', 'handoffs', 'receipts')}
+        # The fact graph joins the secret guard even though its tokens cannot
+        # be credential-shaped by construction: the free-form `source` field
+        # is operator text and gets exactly the same boundary as notes.
+        secret_tables = {t: rows.get(t, []) for t in ('notes', 'handoffs', 'receipts', 'facts')}
         pre_secret = {r['id']: json.dumps(r, sort_keys=True) for r in secret_tables['receipts']}
         kinds, secret_tables = _migration_secret_policy(
             secret_tables, getattr(args, 'redact', False),
@@ -1942,7 +1966,8 @@ def migrate_import(args=None):
         health_problems += [f'audit chain: {p}' for p in chain_problems]
         coverage = {}
         for t in _MIGRATION_TABLES:
-            s_count = src.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
+            s_count = src.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0] \
+                if t in src_tables else 0
             t_count = tgt.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
             coverage[t] = {'source': s_count, 'target': t_count}
             if t_count < s_count:
@@ -2019,8 +2044,9 @@ def migrate_rollback(args=None):
     events it merged, and the receipt files it restored. Dry-run is the
     default. Refuses when an imported row has drifted since import (it is
     now live local execution truth someone changed) or when local rows that
-    were never imported depend on an imported task; --force is the explicit
-    override and cascades those dependents away with the task. Removed
+    were never imported depend on an imported task — including facts whose
+    soft provenance would dangle; --force is the explicit override and
+    cascades those dependents away with the task. Removed
     audit events are relinked into a continuous chain, receipt files are
     deleted only when they still match their sealed hash (locally changed
     files are withheld and reported), re-runs deduplicate to nothing, and
@@ -2061,12 +2087,15 @@ def migrate_rollback(args=None):
                     drift.append({'table': t, 'key': key})
         # Local rows that were never imported but reference imported tasks:
         # removing the task would cascade them away, so they block by default.
+        # Facts are soft references, but rolling back a task that a local fact
+        # points at would leave the dangling provenance doctor flags as
+        # out-of-band surgery — so they block exactly like hard children.
         journal_ids = {t: {json.dumps(k, sort_keys=True) for k in rb['tables'][t]['keys']}
                        for t in _MIGRATION_TABLES}
         task_keys = [k[0] if isinstance(k, list) else k for k in rb['tables']['tasks']['keys']]
         blockers = []
         for tid in task_keys:
-            for t in ('notes', 'handoffs', 'receipts'):
+            for t in ('notes', 'handoffs', 'receipts', 'facts'):
                 for r in c.execute(f'SELECT id FROM {t} WHERE task_id=?', (tid,)):
                     if json.dumps(r['id'], sort_keys=True) not in journal_ids[t]:
                         blockers.append({'table': t, 'id': r['id'], 'task_id': tid})
@@ -2110,7 +2139,7 @@ def migrate_rollback(args=None):
                 n += c.execute('DELETE FROM task_deps WHERE task_id=? AND depends_on=?',
                                tuple(key)).rowcount
             removed['task_deps'] = n
-            for t in ('receipts', 'notes', 'handoffs'):
+            for t in ('receipts', 'notes', 'handoffs', 'facts'):
                 n = 0
                 for key in rb['tables'][t]['keys']:
                     cur = c.execute(f'DELETE FROM {t} WHERE id=?', (key,))
@@ -2121,6 +2150,15 @@ def migrate_rollback(args=None):
                 cur = c.execute('DELETE FROM tasks WHERE id=?', (key,))
                 n += cur.rowcount
             removed['tasks'] = n
+            # Facts are soft references with no FK cascade: under --force,
+            # local facts pointing at removed tasks are deleted explicitly so
+            # their provenance cannot dangle (hard children cascade via FK).
+            cascaded_facts = 0
+            for b in blockers:
+                if b.get('table') == 'facts':
+                    cascaded_facts += c.execute(
+                        'DELETE FROM facts WHERE id=?', (b['id'],)).rowcount
+            removed['facts'] = removed.get('facts', 0) + cascaded_facts
             audit_removed = 0
             for aid in rb.get('audit_event_ids', []):
                 cur = c.execute('DELETE FROM audit_events WHERE id=?', (aid,))

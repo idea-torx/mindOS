@@ -94,12 +94,24 @@ This report separates **fixed issues**, **accepted risks**, and **merge blockers
   sessions` cascades messages and the FTS triggers keep the index in sync);
   no automatic retention was added because deleting conversation history
   silently is exactly the kind of false-success behavior this runtime avoids.
-- **Fact-graph rows are not yet carried by migration import or work orders**
-  — `migrate-import` and `export-task`/`import-task` predate the temporal
-  fact graph, so cross-home transfers move execution truth but not sidecar
-  facts. Snapshots and archives do carry/detach them correctly; extending the
-  migration documents to include `facts` (with validity windows intact) is
-  the natural next slice rather than a rushed afterthought.
+
+## Fixed in the fact-graph transfer round (previously an accepted risk)
+
+1. **Fact-graph rows were not carried by migration import or work orders**
+   (accepted risk from the audit round) — both boundaries now move the
+   temporal fact graph: work orders carry facts provenance-linked to the
+   exported task with validity windows byte-intact and deduplicate by fact
+   id on re-import; `migrate-import` carries the whole graph idempotently
+   (fleet-level facts included), treats a source predating the facts table
+   as legacy shape rather than corruption, scans the free-form `source`
+   field through the same secret guard as notes, and journals imported
+   facts for rollback; `migrate-rollback` blocks on local facts whose soft
+   provenance would dangle and deletes them explicitly under `--force`
+   (facts have no FK cascade by design). Regression coverage spans both
+   boundaries: window survival, dedup re-import, guard refusal via a
+   credential-shaped `source`, journal coverage, local-fact blocker +
+   forced cascade accounting, exact post-rollback zero, and clean import of
+   a dropped-facts-table legacy source.
 
 ## Merge blockers
 

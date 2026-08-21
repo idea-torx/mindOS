@@ -1663,6 +1663,30 @@ with tempfile.TemporaryDirectory() as td:
     assert 'secret_kinds' not in imr, 'an already-redacted file must pass the guard cleanly'
     stored = next(n for n in run2('notes','wo-1') if 'AKIA' in n['content'] or 'REDACTED' in n['content'])
     assert '[REDACTED:aws_access_key]' in stored['content'] and 'AKIAIOSFODNN7EXAMPLE' not in stored['content'], stored
+    # Work orders carry provenance-linked temporal facts across boundaries:
+    # validity windows travel intact, re-import deduplicates by fact id, and
+    # the secret guard spans the graph (tokens cannot be credential-shaped by
+    # construction, but the free-form source field is operator text).
+    run('create','--project','Verify','--title','fact traveler','--id','wo-fact')
+    fw = run('fact-assert','--subject','deploy-api','--predicate','targets',
+             '--object','us-east-2','--source','codex','--task','wo-fact','--valid-hours','72')
+    wo_fact_path = Path(td) / 'wo-fact.json'
+    expf = ops('export-task','wo-fact','--out',str(wo_fact_path))
+    assert expf['ok'] is True and expf['counts']['facts'] == 1, expf
+    impf = ops2('import-task',str(wo_fact_path))
+    assert impf['ok'] is True and impf['inserted'].get('facts') == 1, impf
+    carried = run2('facts','--all')
+    assert len(carried) == 1 and carried[0]['id'] == fw['id'], carried
+    assert carried[0]['task_id'] == 'wo-fact' and carried[0]['valid_until'] == fw['valid_until'] \
+        and carried[0]['valid_from'] == fw['valid_from'], 'validity window must survive intact'
+    again_f = ops2('import-task',str(wo_fact_path))
+    assert again_f['deduplicated'] is True and again_f['inserted'].get('facts', 0) == 0, again_f
+    assert len(run2('facts','--all')) == 1, 're-import must not duplicate facts'
+    run('create','--project','Verify','--title','fact secret host','--id','wo-fact2')
+    run('fact-assert','--subject','vault-token','--predicate','issued-by',
+        '--object','hashicorp','--source','rotate AKIAIOSFODNN7EXAMPLE now','--task','wo-fact2')
+    err = ops_fail('export-task','wo-fact2','--out',str(Path(td) / 'wo-fact2.json'))
+    assert 'aws_access_key' in err and '--redact' in err, err   # guard spans the fact graph
     # Seam conflicts: a task whose worktree (or branch+project) is held by
     # another live lease cannot be claimed — audited refusal, no lease left
     # behind; dispatch skips conflicted candidates; --force overrides;
@@ -2068,6 +2092,14 @@ with tempfile.TemporaryDirectory() as td:
     rid = next((impsrc / 'receipts').glob('*.json')).stem
     hrun(senv, 'complete', 'mig-1', '--owner', 'old-agent', '--receipt', rid)
     hrun(senv, 'note', 'mig-1', '--content', 'context note for the next agent')
+    # The temporal fact graph travels with execution truth: one provenance-
+    # linked fact and one fleet-level fact with a validity window. Tokens are
+    # namespaced away from the fact-graph stage's own fixtures because the
+    # relink test below merges this same inventory into the main home.
+    hrun(senv, 'fact-assert', '--subject', 'mig-auth', '--predicate', 'uses',
+         '--object', 'postgres-13', '--source', 'codex', '--task', 'mig-1')
+    hrun(senv, 'fact-assert', '--subject', 'mig-api', '--predicate', 'reads',
+         '--object', 'redis-cache', '--source', 'hermes', '--valid-hours', '48')
     inv2_path = Path(td) / 'inventory-import.json'
     inv2 = ops('migrate-inventory', '--root', str(Path(td) / 'impsrc'), '--out', str(inv2_path))
     sid = inv2['sources'][0]['id']
@@ -2088,9 +2120,15 @@ with tempfile.TemporaryDirectory() as td:
     assert dry['heartbeats_skipped_disposable'] >= 1, dry      # disposable cache reported, not carried
     res = mimpo(tenv, '--apply', '--out', str(Path(td) / 'migration-result.json'))
     assert res['ok'] is True and res['inserted']['tasks'] == 2, res
+    assert res['inserted']['facts'] == 2, res          # fact graph crosses the boundary
     assert res['audit_events_imported'] > 0 and not res['audit_relinked'], res
     assert res['receipt_files_written'] == 1, res
     assert res['health']['problems'] == [], res                # post-apply health report clean
+    tf = {r['id']: r for r in hrun(tenv, 'facts', '--all')}
+    assert len(tf) == 2 and all(f['valid_from'] for f in tf.values()), tf
+    windowed = [f for f in tf.values() if f['valid_until']]
+    assert len(windowed) == 1 and windowed[0]['subject'] == 'mig-api', \
+        'validity windows must survive the transfer'
     rdoc = json.loads((Path(td) / 'migration-result.json').read_text())
     rbody = {k: v for k, v in rdoc.items() if k not in ('sha256', 'format', 'created_at')}
     assert rdoc['format'] == 'autopilot-migration-result-v1'
@@ -2155,6 +2193,40 @@ with tempfile.TemporaryDirectory() as td:
         'SELECT content FROM notes').fetchone()[0]
     assert '[REDACTED:aws_access_key]' in note_content, note_content
     assert 'AKIAIOSFODNN7EXAMPLE' not in note_content          # value never crosses the boundary
+    # Legacy tolerance: a source whose schema predates the fact graph entirely
+    # (no facts table) is legacy shape, not corruption — it classifies healthy,
+    # imports cleanly with zero facts, and never refuses the whole migration.
+    legsrc = Path(td) / 'legacysrc/autopilot'
+    lenv = mkhome(legsrc)
+    hrun(lenv, 'create', '--project', 'Legacy', '--title', 'pre-fact-graph work', '--id', 'lg-1')
+    lgcon = sqlite3.connect(legsrc / 'state.db')
+    for trig in ('facts_fts_ai', 'facts_fts_ad'):
+        lgcon.execute(f'DROP TRIGGER IF EXISTS {trig}')
+    lgcon.execute('DROP TABLE IF EXISTS facts_fts')
+    lgcon.execute('DROP INDEX IF EXISTS idx_facts_subject')
+    lgcon.execute('DROP INDEX IF EXISTS idx_facts_object')
+    lgcon.execute('DROP TABLE facts')
+    lgcon.commit(); lgcon.close()
+    lginv_path = Path(td) / 'inventory-legacy.json'
+    lginv = ops('migrate-inventory', '--root', str(Path(td) / 'legacysrc'), '--out', str(lginv_path))
+    assert lginv['sources'][0]['status'] == 'ok', lginv         # classified healthy, not ambiguous
+    lgtgt = Path(td) / 'legacytgt/autopilot'
+    lgenv = mkhome(lgtgt)
+    def limpo(*a, fail=False):
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-import',
+                            '--inventory', str(lginv_path), '--source-id', lginv['sources'][0]['id'], *a],
+                           env=lgenv, text=True, capture_output=True)
+        if fail:
+            assert p.returncode != 0, ('expected refusal', a, p.stdout, p.stderr)
+            return p.stdout + p.stderr
+        assert p.returncode == 0, (a, p.stdout, p.stderr)
+        return json.loads(p.stdout)
+    dry_lg = limpo()
+    assert dry_lg['tables']['facts']['source_rows'] == 0, dry_lg
+    res_lg = limpo('--apply')
+    assert res_lg['ok'] is True and res_lg['inserted']['tasks'] == 1 \
+        and res_lg['inserted'].get('facts', 0) == 0, res_lg
+    assert res_lg['health']['problems'] == [], res_lg
     # Migration rollback: stage three of the installer/migrator. A sealed
     # apply writes a rollback journal (exact rows + insert-time hashes,
     # merged audit event ids, restored receipt files); migrate-rollback
@@ -2181,6 +2253,7 @@ with tempfile.TemporaryDirectory() as td:
     assert err.returncode != 0 and 'integrity check failed' in err.stdout + err.stderr
     plan = mroll()
     assert plan['dry_run'] is True and plan['would_remove']['tasks'] == ['mig-1', 'mig-2'], plan
+    assert len(plan['would_remove']['facts']) == 2, plan        # journal covers the fact graph
     assert rid in plan['receipt_files_would_delete'], plan
     assert plan['force_required'] is False and plan['drifted_rows'] == [], plan
     assert sqlite3.connect(tgt / 'state.db').execute(
@@ -2194,17 +2267,24 @@ with tempfile.TemporaryDirectory() as td:
     raw = sqlite3.connect(tgt / 'state.db')
     raw.execute("UPDATE tasks SET title='carried work' WHERE id='mig-1'"); raw.commit(); raw.close()
     hrun(tenv, 'note', 'mig-1', '--content', 'local follow-up written after import')
+    # A local fact pointing at an imported task blocks rollback too: removing
+    # the task would dangle its soft provenance (doctor flags that as
+    # out-of-band surgery), so facts block exactly like hard children.
+    hrun(tenv, 'fact-assert', '--subject', 'mig-service', '--predicate', 'owned-by',
+         '--object', 'legacy-team', '--source', 'local', '--task', 'mig-1')
     err = mroll('--apply', fail=True)
     assert 'local dependent' in err and '--force' in err, err   # never-imported child blocks removal
     rb = mroll('--apply', '--force')
     assert rb['ok'] is True and rb['removed']['tasks'] == 2, rb
     assert rb['removed']['notes'] == 1, rb                      # imported note removed by journal
-    assert rb['cascade_removed'] == 1, rb                       # local dependent cascaded with --force
+    assert rb['removed']['facts'] == 3, rb                      # 2 imported + 1 local cascade
+    assert rb['cascade_removed'] == 2, rb                       # local dependents cascaded with --force
     assert rb['receipt_files_deleted'] == [rid], rb             # byte-exact file removed with its row
     assert rb['audit_events_removed'] > 0 and rb['health']['problems'] == [], rb
     con = sqlite3.connect(tgt / 'state.db')
     assert con.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     assert con.execute("SELECT COUNT(*) FROM receipts").fetchone()[0] == 0
+    assert con.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0   # graph rolled back exactly
     acts = {r[0] for r in con.execute('SELECT action FROM audit_events')}
     con.close()
     assert 'migration_rollback_applied' in acts and 'migration_import_applied' in acts, acts

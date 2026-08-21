@@ -1219,7 +1219,8 @@ Design properties:
 Archives move *retired* fleet history; work orders move *live* work. A work
 order is the provider-neutral unit of cross-boundary recovery: one task's full
 execution state — the task row, dependency edges in both directions, complete
-note and handoff history, receipts with their sealed files, and the heartbeat —
+note and handoff history, receipts with their sealed files, the heartbeat, and
+every temporal fact provenance-linked to the task (validity windows intact) —
 sealed under a single sha256 so any Autopilot home can verify integrity before
 importing:
 
@@ -1244,6 +1245,10 @@ Design properties:
 - **Dependency-aware**: dependency edges are inserted only when both endpoints
   exist locally; dangling ones are reported in `skipped_deps`, never silently
   dropped. Import prerequisite tasks first to carry the full graph.
+- **Fact graph travels with provenance**: facts whose `task_id` points at the
+  exported task are carried with validity windows byte-intact and deduplicate
+  by fact id on re-import; work orders sealed before the fact graph simply
+  carry no facts key and import unchanged.
 - **Privacy boundary on both ends**: the same secret guard that protects
   shared-memory writes scans the whole document at export *and* again at
   import (so an `--allow-secret` override at the source cannot leak credentials
@@ -1472,11 +1477,17 @@ Design rules, enforced and tested:
   break tamper evidence) unless `--relink-audit` explicitly relinks the
   combined ledger. Stage-one's own bookkeeping does not make a home
   "lived-in", so the canonical init → inventory → import flow needs no flags.
-- **Secret boundary**: notes/handoffs/receipts pass through the same guard as
-  the shared-memory write path — credential-shaped content is refused by
-  default, `--redact` imports `[REDACTED:<kind>]` copies (their source receipt
-  files are withheld rather than reintroducing the secret), `--allow-secret`
-  overrides audited.
+- **Secret boundary**: notes/handoffs/receipts/facts pass through the same
+  guard as the shared-memory write path — credential-shaped content is refused
+  by default, `--redact` imports `[REDACTED:<kind>]` copies (their source
+  receipt files are withheld rather than reintroducing the secret),
+  `--allow-secret` overrides audited. Fact tokens cannot be credential-shaped
+  by construction, but their free-form `source` field is operator text and is
+  scanned like any other note.
+- **Fact graph crosses with execution truth**: the temporal fact graph
+  imports idempotently by fact id with validity windows intact; a source home
+  whose schema predates the facts table is legacy shape — it classifies
+  healthy and imports cleanly with zero facts instead of refusing.
 - **Restore verification**: receipt files reappear byte-exactly, each checked
   against its sealed `file_hash`; a post-apply health report (integrity check,
   FK violations introduced by the import, audit-chain problems, per-table
@@ -1511,7 +1522,10 @@ Design rules, enforced and tested:
   import — rolling it back would destroy someone's newer work, so the
   rollback refuses naming the drifted rows. Local rows that were never
   imported but depend on an imported task (a note an agent wrote afterwards,
-  a dep edge added locally) block the same way. `--force` is the explicit
+  a dep edge added locally, a fact whose soft provenance would dangle) block
+  the same way — facts have no FK cascade by design, so under `--force` they
+  are deleted explicitly rather than left pointing at removed tasks. `--force`
+  is the explicit
   override: drifted rows and dependents cascade away with the task, and the
   audited `migration_rollback_applied` event records that it was forced.
 - **Chain integrity**: removed audit events leave no gaps in tamper evidence
