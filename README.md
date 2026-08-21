@@ -1,10 +1,33 @@
-# IdeatorX Autopilot Control Plane v1
+# MindOS — Autopilot v2
 
-Durable local coordination layer for Hermes, Client Manager, Momentum Manager, cron jobs, and explicitly requested Claude Code work.
+**MindOS is the durable local operating system for Hermes and cooperating AI agents.** It is the v2 evolution of the IdeatorX Autopilot: a shared control plane for execution state, memory, temporal facts, handoffs, receipts, recovery, and agent coordination.
+
+MindOS brings together:
+
+- **Autopilot execution truth** — tasks, leases, dependencies, approvals, receipts, and audit history.
+- **Shared semantic memory** — Hindsight remains the semantic brain through an explicit, provider-neutral binding.
+- **Temporal facts** — evolving ownership, priorities, validity windows, superseded decisions, and blockers.
+- **Agent memory and context** — Claude memory archives, session sources, profiles, skills, and cron definitions with provenance.
+- **Recovery and portability** — sealed inventories, dry-run-first migration, rollback, quarantine, integrity checks, and cross-agent handoffs.
+
+The repository is currently **source-available under FSL-1.1-MIT**. It becomes MIT-licensed after the applicable two-year change date; it is not OSI open source during the FSL restriction period.
+
+## Project identity
+
+```text
+Project:        MindOS
+Generation:     Autopilot v2
+Primary surface: Hermes Agent
+Execution core: SQLite-backed Autopilot
+Semantic brain: Hindsight shared bank
+Fallback:       preserved prior Autopilot installation
+```
+
+The schema names that end in `-v1` elsewhere in this document are **artifact-format versions**, not the project generation. They identify stable JSON/report formats inside MindOS v2.
 
 ## Safety boundary
 
-This v1 is a registry and evidence layer. It does **not** deploy, merge, send external messages, submit applications, or run arbitrary agent commands.
+MindOS is a local coordination and memory system. It does **not** deploy, merge, send external messages, submit applications, or run arbitrary agent commands without an explicitly authorized integration and verified evidence.
 
 ## Commands
 
