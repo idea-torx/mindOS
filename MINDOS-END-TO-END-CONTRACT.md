@@ -6,12 +6,12 @@ Implement and verify the next stage of the MindOS installation without touching 
 Extend the installer from Autopilot execution-state migration to a safe end-to-end brain migration plan covering semantic memory, temporal facts, session cache, profiles, skills, cron definitions, and Claude memory sync metadata.
 
 ## Live sources (read-only only)
-- Current Autopilot: /Users/leofelix/.hermes/autopilot
+- Current Autopilot: ~/.hermes/autopilot
 - Hindsight service: http://127.0.0.1:8888, bank autopilot-shared-context
-- Claude memory: /Users/leofelix/.claude/projects/*/memory/
-- Claude sync state: /Users/leofelix/.hermes/hindsight/claude-memory-sync.json
+- Claude memory: ~/.claude/projects/*/memory/
+- Claude sync state: ~/.hermes/hindsight/claude-memory-sync.json
 - Temporal sidecar: current autopilot temporal.db if present
-- Hermes profiles and cron definitions under /Users/leofelix/.hermes
+- Hermes profiles and cron definitions under ~/.hermes
 
 Do not mutate these sources, access Keychain values, print secrets, call external APIs for writes, or alter Hermes defaults.
 
@@ -32,7 +32,7 @@ Where Hindsight is a shared service rather than a file store, implement a safe v
 
 ## Installation authorization
 
-After the isolated implementation passes its audit and disposable migration tests, proceed with the full parallel installation into `/Users/leofelix/.hermes/mindos`. Preserve `/Users/leofelix/.hermes/autopilot` as the immutable rollback source and do not replace, delete, or mutate its logical data. The new MindOS home must receive the verified execution state, Hindsight connectivity/brain manifest or safe shared-bank binding, temporal sidecar, Claude memory sync metadata, session cache where supported, profiles/skills/cron definitions, and provider-neutral handoff protocol. Use explicit manifests, dry-run first, apply only after dry-run passes, run doctor and cross-agent probes, and write a sealed install report. Switch Hermes defaults only after the new home passes health checks; retain a one-command rollback to the old home. If a source cannot be safely copied, bind, or migrated, preserve it in place with a clear report rather than inventing a duplicate authority.
+After the isolated implementation passes its audit and disposable migration tests, proceed with the full parallel installation into `~/.hermes/mindos`. Preserve `~/.hermes/autopilot` as the immutable rollback source and do not replace, delete, or mutate its logical data. The new MindOS home must receive the verified execution state, Hindsight connectivity/brain manifest or safe shared-bank binding, temporal sidecar, Claude memory sync metadata, session cache where supported, profiles/skills/cron definitions, and provider-neutral handoff protocol. Use explicit manifests, dry-run first, apply only after dry-run passes, run doctor and cross-agent probes, and write a sealed install report. Switch Hermes defaults only after the new home passes health checks; retain a one-command rollback to the old home. If a source cannot be safely copied, bind, or migrated, preserve it in place with a clear report rather than inventing a duplicate authority.
 
 ## Audit gates
 Run full compile/tests, migration dry-run and apply against disposable targets, interrupted re-run, rollback, source immutability, secret scan, FTS drift, Hindsight unavailable behavior, cross-agent probe, and post-install doctor. Produce a concise stability and migration report. Commit only verified implementation changes on this branch; do not push or deploy application code.

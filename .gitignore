@@ -1,17 +1,48 @@
-# Live Autopilot state and machine-local artifacts
+# Live Autopilot/MindOS state and machine-local artifacts
 state.db
 state.db-*
 temporal.db
 temporal.db-*
-receipts/
-__pycache__/
-*.pyc
-*.log
-*.tmp
-.env
-.env.*
-.DS_Store
+*.sqlite
+*.sqlite3
 
-# Local recovery/runtime output
+# Receipts and sealed install/evidence artifacts (never publish)
+receipts/
+installation-reports/
+*receipt*.json
+!docs/examples/*receipt*
+
+# Sessions, Hindsight exports, backups, Keychain-derived values
+sessions/
 runtime/
 backups/
+*hindsight*export*
+*claude-memory-sync*
+keychain*
+
+# Claude/agent memory contents
+memory/
+MEMORY.md
+CLAUDE.md.local
+
+# Python runtime artifacts
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+credentials*.json
+secrets*
+
+# OS/editor noise
+.DS_Store
+*.log
+*.tmp
+*.swp

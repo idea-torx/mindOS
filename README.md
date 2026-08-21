@@ -1824,6 +1824,25 @@ Design properties:
   `facts_closed`; `ops.py doctor` includes `facts_fts` in its FTS drift sweep;
   snapshots carry the `facts` table.
 
+## License
+
+MindOS is source-available under the Functional Source License 1.1 with an
+MIT future license ([FSL-1.1-MIT](LICENSE)). You may use, copy, modify, and
+redistribute it today for any non-competing purpose (internal use,
+non-commercial education/research, professional services); it becomes
+fully MIT-licensed two years after each release. This is **not** OSI open
+source during the restricted period.
+
+## Repository guide
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — layers, invariants, module map
+- [INSTALL.md](INSTALL.md) — install + migration from an existing home
+- [CONTRIBUTING.md](CONTRIBUTING.md) — workflow, gates, commit style
+- [SECURITY.md](SECURITY.md) — safety boundary, data boundary, secret guard
+- [ROADMAP.md](ROADMAP.md) — shipped vs. next vs. non-goals
+- [CHANGELOG.md](CHANGELOG.md) — notable changes
+- [STABILITY.md](STABILITY.md) — audited fixed issues / accepted risks
+
 ## Audit & hardening (stability round)
 
 A full runtime audit (see `STABILITY.md` for the complete report) fixed the

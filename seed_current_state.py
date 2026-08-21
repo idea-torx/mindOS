@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Seed/update the current known IdeatorX queue without executing work."""
 import sqlite3, sys
-sys.path.insert(0, '/Users/leofelix/.hermes/autopilot')
+import os
+sys.path.insert(0, os.environ.get('MINDOS_HOME', os.path.expanduser('~/.hermes/autopilot')))
 import autopilot
 
 items = [
