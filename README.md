@@ -25,6 +25,9 @@ python3 "$A" transfer <task-id> --from-owner hermes --to-agent codex   # reassig
 python3 "$A" resume <task-id> --agent codex         # idempotent killed-session recovery
 python3 "$A" cancel <task-id> --owner leo --reason "obsolete"       # rejected on foreign leases
 python3 "$A" defer <task-id> --owner hermes --until "2026-08-22T09:00:00Z"  # park out of dispatch
+python3 "$A" tag <task-id> --tag autopilot-safe      # attach capability/scope tags (repeatable)
+python3 "$A" untag <task-id> --tag client:trove      # remove one tag
+python3 "$A" next --claim --owner codex --tag autopilot-safe  # tag-scoped dispatch
 python3 "$A" show <task-id>          # task detail + receipts + audit trail + dependencies
 python3 "$A" search "deploy"         # substring search over task text fields
 python3 "$A" search "audit" --status queued --project Trove --priority P1
@@ -707,6 +710,32 @@ With `--explain`, a boosted pick reports `effective_priority` and
 `priority_boost`. Within one effective tier the longest-waiting task wins
 (oldest `created_at` first), so equal-priority work drains FIFO instead of
 last-touched-first.
+
+## Task tags (capability/scope dispatch policy)
+
+Tags are a lightweight vocabulary on tasks — `autopilot-safe`, `client:trove`,
+`infra` — that turn dispatch policy into data instead of per-agent prompts.
+An operator marks what each task is allowed for, and every agent constrains
+itself with the same flag shape across Hermes, Claude Code, Codex, and
+OpenCode:
+
+```bash
+python3 "$A" create --project Infra --title "rotate logs" --tag autopilot-safe
+python3 "$A" tag t-123 --tag autopilot-safe --tag client:trove   # idempotent, audited
+python3 "$A" untag t-123 --tag client:trove                      # audited; absent tag fails
+python3 "$A" next --claim --owner codex --tag autopilot-safe     # scoped dispatch
+python3 "$A" list --tag autopilot-safe                           # triage filter
+python3 "$A" search "logs" --tag autopilot-safe                  # search filter
+```
+
+Tag-scoped dispatch is a hard filter: an agent constrained to
+`--tag autopilot-safe` never receives untagged or differently-tagged work,
+even when that work outranks it — an empty scope dispatches nothing rather
+than leaking other work. Tags are validated to lowercase
+`[a-z0-9:_./-]` (max 64 chars), which keeps them safe inside the JSON-array
+LIKE filter and stable as CLI flags. Every task output exposes `tags` as a
+JSON array, and tagging is audited (`task_tagged`/`task_untagged`) like all
+state changes.
 
 ## Dependency priority inheritance (urgency flows upstream)
 

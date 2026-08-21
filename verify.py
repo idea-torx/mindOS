@@ -1407,6 +1407,40 @@ with tempfile.TemporaryDirectory() as td:
     m = run('metrics')
     assert m['secrets_blocked_total'] >= 2 and m['secrets_redacted_total'] >= 2 \
         and m['secrets_allowed_total'] >= 2, (m['secrets_blocked_total'], m['secrets_redacted_total'], m['secrets_allowed_total'])
+    # Task tags: capability/scope vocabulary for tag-scoped dispatch.
+    run('create','--project','Verify','--title','safe work','--id','tag-a','--priority','P1','--tag','autopilot-safe')
+    run('create','--project','Verify','--title','risky work','--id','tag-b','--priority','P0')
+    run('tag','tag-b','--tag','needs-human','--tag','client:trove')
+    # Idempotent re-tag is a no-op that still reports state.
+    again = run('tag','tag-b','--tag','needs-human')
+    assert again['tags'] == ['client:trove','needs-human'] and again['added'] == [] \
+        and again['already_tagged'] == ['needs-human'], again
+    err = run_fail('tag','tag-a','--tag','Bad Tag!')
+    assert 'invalid tag' in err
+    rows = run('list','--tag','autopilot-safe')
+    assert [r['id'] for r in rows] == ['tag-a'], rows
+    assert [r['id'] for r in run('list','--tag','client:trove')] == ['tag-b']
+    assert [r['id'] for r in run('search','work','--tag','autopilot-safe')] == ['tag-a']
+    # Tag-scoped dispatch: a constrained agent only ever sees its own work,
+    # even when higher-priority untagged work exists.
+    got = run('next','--tag','autopilot-safe')
+    assert got['task']['id'] == 'tag-a', ('P1 tagged must be visible to its scope', got)
+    got = run('next','--tag','client:trove')
+    assert got['task']['id'] == 'tag-b', ('second scope sees its own P0', got)
+    got = run('next','--tag','no-such-scope')
+    assert got['task'] is None, ('an empty scope must dispatch nothing, not leak other work', got)
+    got = run('next','--claim','--owner','scoped-agent','--minutes','5','--tag','autopilot-safe')
+    assert got['claimed'] is True and got['task']['id'] == 'tag-a' and got['task']['tags'] == ['autopilot-safe'], got
+    det = run('show','tag-a')
+    assert any(e['action'] == 'claimed' for e in det['audit'])
+    run('update','tag-a','--status','completed')
+    # Untag removes exactly one tag and is audited; removing an absent tag fails.
+    u = run('untag','tag-b','--tag','needs-human')
+    assert u['tags'] == ['client:trove'] and u['removed'] == 'needs-human', u
+    err = run_fail('untag','tag-b','--tag','needs-human')
+    assert "does not carry tag" in err
+    assert [r['id'] for r in run('list','--tag','needs-human')] == []
+    doc = ops('doctor'); assert doc['ok'] is True and doc['problems'] == [], doc
     doc = ops('doctor'); assert doc['ok'] is True and doc['problems'] == [], doc
     assert run('verify-chain')['ok'] is True
     # Audit chain checkpoints: pin the head so tail truncation becomes detectable.

@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS tasks (
    recover_after TEXT NOT NULL DEFAULT '',
    due_at TEXT NOT NULL DEFAULT '',
    not_before TEXT NOT NULL DEFAULT '',
+   tags TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_receipt TEXT NOT NULL DEFAULT ''
@@ -172,6 +173,31 @@ STATUSES = {"queued", "claimed", "running", "waiting_for_agent", "waiting_for_us
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 PRIORITIES = {"P0", "P1", "P2", "P3"}
 NOTE_KINDS = {"fact", "decision", "observation", "evidence", "constraint"}
+TAG_RE = re.compile(r"^[a-z0-9][a-z0-9:_./-]{0,63}$")
+
+def _valid_tag(tag: str) -> str:
+    """Validate a task tag: a short lowercase capability/scope token.
+
+    The restricted charset keeps tags safe inside the JSON-array LIKE filter
+    (`%"tag"%`) and stable as CLI flags across every agent adapter.
+    """
+    t = (tag or "").strip()
+    if not TAG_RE.fullmatch(t):
+        raise SystemExit(f"invalid tag: {tag!r} (lowercase [a-z0-9] then [a-z0-9:_./-], max 64 chars)")
+    return t
+
+def _task_tags(row) -> list:
+    try:
+        v = json.loads(row["tags"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return v if isinstance(v, list) else []
+
+def _task_view(row) -> dict:
+    """Serialize a task row for output, exposing tags as a JSON array."""
+    d = dict(row)
+    d["tags"] = _task_tags(row)
+    return d
 
 def now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -257,6 +283,8 @@ def _migrate(db) -> None:
         db.execute("ALTER TABLE tasks ADD COLUMN recover_after TEXT NOT NULL DEFAULT ''")
     if "not_before" not in task_cols:
         db.execute("ALTER TABLE tasks ADD COLUMN not_before TEXT NOT NULL DEFAULT ''")
+    if "tags" not in task_cols:
+        db.execute("ALTER TABLE tasks ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
     handoff_cols = {r[1] for r in db.execute("PRAGMA table_info(handoffs)")}
     if "recall_digest" not in handoff_cols:
         db.execute("ALTER TABLE handoffs ADD COLUMN recall_digest TEXT NOT NULL DEFAULT ''")
@@ -1664,7 +1692,7 @@ def release(args):
         t = now()
         db.execute("UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',updated_at=? WHERE id=?", (t, args.id))
         audit(db, "task", args.id, "lease_released", {"owner": args.owner})
-        json_out(dict(task_row(db, args.id)))
+        json_out(_task_view(task_row(db, args.id)))
 
 def renew(args):
     """Extend a live lease from now without changing status or the fencing epoch.
@@ -1815,9 +1843,10 @@ def create(args):
     t = now()
     due_at = _normalize_due(getattr(args, "due_at", None) or "")
     not_before = _normalize_iso(getattr(args, "not_before", None) or "", "--not-before")
+    tags = sorted({_valid_tag(x) for x in (getattr(args, "tag", None) or [])})
     with conn() as db:
-        db.execute("INSERT INTO tasks(id,project,title,description,owner,status,priority,next_action,due_at,not_before,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (task_id,args.project,args.title,args.description,args.owner,"queued",args.priority,args.next_action,due_at,not_before,t,t))
-        audit(db, "task", task_id, "created", {"project": args.project, "owner": args.owner, "priority": args.priority, "due_at": due_at, "not_before": not_before})
+        db.execute("INSERT INTO tasks(id,project,title,description,owner,status,priority,next_action,due_at,not_before,tags,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (task_id,args.project,args.title,args.description,args.owner,"queued",args.priority,args.next_action,due_at,not_before,json.dumps(tags),t,t))
+        audit(db, "task", task_id, "created", {"project": args.project, "owner": args.owner, "priority": args.priority, "due_at": due_at, "not_before": not_before, **({"tags": tags} if tags else {})})
         for dep in getattr(args, "depends_on", []) or []:
             add_dependency(db, task_id, dep)
     json_out({"ok": True, "id": task_id, "status": "queued"})
@@ -1846,7 +1875,7 @@ def update(args):
         task_row(db, args.id)
         db.execute(f"UPDATE tasks SET {', '.join(k+'=?' for k in fields)} WHERE id=?", (*fields.values(), args.id))
         audit(db, "task", args.id, "updated", {k: v for k, v in fields.items() if k != "updated_at"})
-        json_out(dict(task_row(db, args.id)))
+        json_out(_task_view(task_row(db, args.id)))
 
 def _require_live_lease(row, owner: str, verb: str) -> None:
     """Strict guard: only the current holder of a live lease may proceed."""
@@ -1876,7 +1905,7 @@ def complete(args):
         db.execute("UPDATE tasks SET status='completed',lease_owner='',lease_expires_at='',blocked_reason='',updated_at=? WHERE id=?", (t, args.id))
         audit(db, "task", args.id, "completed", {"owner": args.owner, "note": args.note,
                                                  "recall_digest": recall_digest or None})
-        json_out(dict(task_row(db, args.id)))
+        json_out(_task_view(task_row(db, args.id)))
 
 def cancel(args):
     with conn() as db:
@@ -1887,7 +1916,7 @@ def cancel(args):
         t = now()
         db.execute("UPDATE tasks SET status='cancelled',lease_owner='',lease_expires_at='',blocked_reason=?,updated_at=? WHERE id=?", (args.reason or 'cancelled by operator', t, args.id))
         audit(db, "task", args.id, "cancelled", {"owner": args.owner, "reason": args.reason})
-        json_out(dict(task_row(db, args.id)))
+        json_out(_task_view(task_row(db, args.id)))
 
 def block(args):
     """Operator transition to blocked: park work with a reason without cancelling it.
@@ -1908,7 +1937,7 @@ def block(args):
                    (args.reason or 'blocked by operator', t, args.id))
         audit(db, "task", args.id, "blocked",
               {"owner": args.owner, "reason": args.reason, "previous_status": row["status"]})
-        json_out(dict(task_row(db, args.id)))
+        json_out(_task_view(task_row(db, args.id)))
 
 def unblock(args):
     """Requeue a blocked task, clearing its blocked reason."""
@@ -1919,7 +1948,7 @@ def unblock(args):
         t = now()
         db.execute("UPDATE tasks SET status='queued',blocked_reason='',updated_at=? WHERE id=?", (t, args.id))
         audit(db, "task", args.id, "unblocked", {"owner": args.owner})
-        json_out(dict(task_row(db, args.id)))
+        json_out(_task_view(task_row(db, args.id)))
 
 def defer(args):
     """Park a task out of dispatch until a future instant (or clear the park).
@@ -1941,7 +1970,44 @@ def defer(args):
         audit(db, "task", args.id, "deferred",
               {"owner": args.owner, "not_before": until,
                "previous_status": row["status"], "cleared": until == ""})
-        json_out(dict(task_row(db, args.id)))
+        json_out(_task_view(task_row(db, args.id)))
+
+def tag_task(args):
+    """Attach capability/scope tags to a task (idempotent, audited).
+
+    Tags are the dispatch-policy vocabulary: an operator marks work
+    `autopilot-safe` (or scopes it `client:trove`), and agents constrain their
+    dispatch with `next --tag`. Adding an already-present tag is a no-op that
+    still reports state, so retries are safe.
+    """
+    tags = [_valid_tag(x) for x in (args.tag or [])]
+    if not tags:
+        raise SystemExit("at least one --tag is required")
+    with conn() as db:
+        row = task_row(db, args.id)
+        cur_tags = _task_tags(row)
+        added = sorted(set(tags) - set(cur_tags))
+        new_tags = sorted(set(cur_tags) | set(tags))
+        if added:
+            db.execute("UPDATE tasks SET tags=?,updated_at=? WHERE id=?",
+                       (json.dumps(new_tags), now(), args.id))
+            audit(db, "task", args.id, "task_tagged", {"tags": added})
+        json_out({"ok": True, "task_id": args.id, "tags": new_tags,
+                  "added": added, "already_tagged": [t for t in tags if t not in added]})
+
+def untag_task(args):
+    """Remove tags from a task (audited); removing an absent tag is rejected."""
+    tag = _valid_tag(args.tag)
+    with conn() as db:
+        row = task_row(db, args.id)
+        cur_tags = _task_tags(row)
+        if tag not in cur_tags:
+            raise SystemExit(f"task {args.id} does not carry tag '{tag}'")
+        new_tags = [t for t in cur_tags if t != tag]
+        db.execute("UPDATE tasks SET tags=?,updated_at=? WHERE id=?",
+                   (json.dumps(new_tags), now(), args.id))
+        audit(db, "task", args.id, "task_untagged", {"tag": tag})
+    json_out({"ok": True, "task_id": args.id, "tags": new_tags, "removed": tag})
 
 def blocked_by(args):
     """Transitive blockers: walk the dependency DAG upward from a task.
@@ -2038,7 +2104,7 @@ def claim(args):
             raise SystemExit(_explain_acquire_failure(db, args.id, args.owner, resolve_max_active(args)))
         db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"claimed",now(),"lease claimed"))
         audit(db, "task", args.id, "claimed", {"owner": args.owner, "lease_expires_at": exp, "lease_epoch": epoch})
-        out = dict(task_row(db, args.id))
+        out = _task_view(task_row(db, args.id))
         json_out(out)
 
 def add_dep(args):
@@ -2080,6 +2146,11 @@ def next_task(args):
     cooldown deadline, or deferred_until with its not_before), plus the
     effective priority of the pick when aging boosted it.
 
+    --tag scopes dispatch to tasks carrying that capability/scope tag
+    (see `tag`/`untag`): an agent constrained to `--tag autopilot-safe` never
+    receives untagged or differently-tagged work, so policy lives in the task
+    graph instead of per-agent prompts.
+
     With --claim --recall, the dispatch response embeds the full sealed recall
     bundle (digest, lease state, receipts) for the claimed task and audits it
     as `context_recalled` — one call takes work AND proves which context it
@@ -2100,6 +2171,12 @@ def next_task(args):
         vals = []
         if args.project:
             q += " AND project=?"; vals.append(args.project)
+        if getattr(args, "tag", ""):
+            # Tag-scoped dispatch: an agent constrained to a capability (e.g.
+            # --tag autopilot-safe) only ever sees work marked for it. The
+            # LIKE filter is exact because tags are validated against a
+            # charset that cannot contain quotes.
+            q += " AND tags LIKE ?"; vals.append('%"' + _valid_tag(args.tag) + '"%')
         q += _due_order()
         rows = db.execute(q, vals).fetchall()
         eligible = []
@@ -2138,7 +2215,7 @@ def next_task(args):
             eligible.sort(key=lambda e: (_prio_rank(e[0]), e[2]["due_at"] == "",
                                          e[2]["due_at"], e[2]["created_at"]))
             picked_eff, picked_boost, picked, picked_via = eligible[0]
-        out = {"ok": True, "task": dict(picked) if picked else None}
+        out = {"ok": True, "task": _task_view(picked) if picked else None}
         if explain:
             out["considered"] = len(rows)
             out["skipped"] = skipped
@@ -2231,7 +2308,7 @@ def receipt(args):
 
 def show(args):
     with conn() as db:
-        out = dict(task_row(db, args.id))
+        out = _task_view(task_row(db, args.id))
         receipts = [dict(r) for r in db.execute(
             "SELECT id,kind,payload_json,created_at FROM receipts WHERE task_id=? ORDER BY created_at DESC, id DESC LIMIT ?",
             (args.id, args.limit)).fetchall()]
@@ -2342,9 +2419,12 @@ def list_tasks(args):
         if getattr(args, "overdue", False):
             clauses.append("due_at!='' AND due_at<=? AND status NOT IN ('completed','failed','cancelled')")
             vals.append(now())
+        if getattr(args, "tag", ""):
+            clauses.append("tags LIKE ?")
+            vals.append('%"' + _valid_tag(args.tag) + '"%')
         if clauses: q += " WHERE " + " AND ".join(clauses)
         q += _due_order(", created_at ASC")
-        json_out([dict(r) for r in db.execute(q, vals).fetchall()])
+        json_out([_task_view(r) for r in db.execute(q, vals).fetchall()])
 
 def _due_order(final: str = ", updated_at DESC") -> str:
     """Priority first, then earliest deadline (undated last), then a caller tiebreak."""
@@ -2434,7 +2514,9 @@ def search_tasks(args):
                 clauses.append("t.project=?"); vals.append(args.project)
             if args.priority:
                 clauses.append("t.priority=?"); vals.append(args.priority)
-            rows = [dict(r) for r in db.execute(
+            if getattr(args, "tag", ""):
+                clauses.append("t.tags LIKE ?"); vals.append('%"' + _valid_tag(args.tag) + '"%')
+            rows = [_task_view(r) for r in db.execute(
                 "SELECT t.*,bm25(tasks_fts) AS score FROM tasks_fts f "
                 "JOIN tasks t ON t.rowid=f.rowid WHERE " + " AND ".join(clauses) +
                 " ORDER BY score LIMIT 50", vals).fetchall()]
@@ -2450,9 +2532,11 @@ def search_tasks(args):
             clauses.append("project=?"); vals.append(args.project)
         if args.priority:
             clauses.append("priority=?"); vals.append(args.priority)
+        if getattr(args, "tag", ""):
+            clauses.append("tags LIKE ?"); vals.append('%"' + _valid_tag(args.tag) + '"%')
         q = ("SELECT * FROM tasks WHERE " + " AND ".join(clauses) +
              " ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END, updated_at DESC")
-        json_out([dict(r) for r in db.execute(q, vals).fetchall()])
+        json_out([_task_view(r) for r in db.execute(q, vals).fetchall()])
 
 def dashboard(args):
     with conn() as db:
@@ -2504,7 +2588,7 @@ def main():
     ap = argparse.ArgumentParser(prog="autopilot")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p=sub.add_parser("init"); p.set_defaults(fn=lambda a: (ensure(), json_out({"ok":True,"db":str(DB)})))
-    p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--due-at",default=""); p.add_argument("--not-before",dest="not_before",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.set_defaults(fn=create)
+    p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--due-at",default=""); p.add_argument("--not-before",dest="not_before",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.add_argument("--tag",action="append",default=[],help="capability/scope tag (repeatable)"); p.set_defaults(fn=create)
     p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.add_argument("--not-before",dest="not_before"); p.add_argument("--title"); p.add_argument("--description"); p.add_argument("--priority",choices=sorted(PRIORITIES)); p.add_argument("--project"); p.set_defaults(fn=update)
     p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.set_defaults(fn=complete)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
@@ -2517,14 +2601,16 @@ def main():
     p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=claim)
     p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=heartbeat)
     p=sub.add_parser("receipt"); p.add_argument("task_id"); p.add_argument("--kind",required=True); p.add_argument("--payload",default="{}"); p.set_defaults(fn=receipt)
-    p=sub.add_parser("list"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--overdue",action="store_true"); p.set_defaults(fn=list_tasks)
+    p=sub.add_parser("list"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--overdue",action="store_true"); p.add_argument("--tag",default=""); p.set_defaults(fn=list_tasks)
     p=sub.add_parser("show"); p.add_argument("id"); p.add_argument("--limit",type=int,default=20); p.set_defaults(fn=show)
     p=sub.add_parser("metrics"); p.set_defaults(fn=metrics)
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
+    p=sub.add_parser("tag"); p.add_argument("id"); p.add_argument("--tag",action="append",required=True,help="capability/scope tag (repeatable)"); p.set_defaults(fn=tag_task)
+    p=sub.add_parser("untag"); p.add_argument("id"); p.add_argument("--tag",required=True); p.set_defaults(fn=untag_task)
     p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
-    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
-    p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_tasks)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
+    p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.add_argument("--tag",default=""); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=supersede_note)
