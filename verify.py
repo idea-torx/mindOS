@@ -1302,6 +1302,71 @@ with tempfile.TemporaryDirectory() as td:
     assert {n['id'] for n in run('notes','con-2')} == {db_['id']}, run('notes','con-2')
     doc = ops('doctor'); assert doc['ok'] is True and doc['problems'] == [], doc
     assert run('verify-chain')['ok'] is True
+    # Handoff retrieval: fleet-wide keyword search over the handoff protocol.
+    run('create','--project','RagH','--title','postgres pool incident followups','--id','hr-src')
+    hr1 = run('handoff','hr-src','--from-agent','codex','--to-agent','claude-code',
+              '--status','running','--objective','stabilize postgres pool under load',
+              '--commit','abc999')
+    run('create','--project','RagH','--title','unrelated host','--id','hr-x')
+    hr2 = run('handoff','hr-x','--from-agent','hermes','--to-agent','opencode',
+              '--objective','gardening schedule for tomatoes')
+    hits = run('search-handoffs','postgres pool','--rank')
+    # Multi-token queries are conjunctive; hits join task project/title for triage.
+    assert len(hits) == 1 and hits[0]['id'] == hr1['id'] and 'score' in hits[0], hits
+    assert hits[0]['task_title'] == 'postgres pool incident followups' and hits[0]['project'] == 'RagH'
+    hits = run('search-handoffs','postgres','--to-agent','claude-code')
+    assert {h['id'] for h in hits} == {hr1['id']}
+    assert run('search-handoffs','postgres','--to-agent','opencode') == []
+    hits = run('search-handoffs','tomatoes','--project','RagH')
+    assert {h['id'] for h in hits} == {hr2['id']}
+    assert run('search-handoffs','no-such-task') == []
+    # Superseded handoffs drop out of search unless --all includes them.
+    hr1b = run('handoff','hr-src','--from-agent','claude-code','--to-agent','opencode',
+               '--objective','stabilize postgres pool under load v2')
+    assert hr1b['superseded'] == hr1['id']
+    hits = run('search-handoffs','postgres pool','--rank')
+    assert {h['id'] for h in hits} == {hr1b['id']} and all(h['superseded_by'] == '' for h in hits), hits
+    hits = run('search-handoffs','postgres pool','--rank','--all')
+    assert {h['id'] for h in hits} == {hr1['id'], hr1b['id']}
+    assert next(h for h in hits if h['id'] == hr1['id'])['superseded_by'] == hr1b['id']
+    # Tokenless queries degrade to an empty result instead of an FTS syntax error.
+    assert run('search-handoffs','!!! ---','--rank') == []
+    # Related-handoffs: opt-in cross-task resume points packed into context.
+    run('create','--project','RagH','--title','postgres pool capacity planning','--id','hr-q')
+    ctx = run('context','hr-q','--budget','100000')
+    assert 'related_handoffs' not in ctx and 'related_handoffs_packed' not in ctx, \
+        'legacy pack shape must stay without the flag'
+    ctx = run('context','hr-q','--budget','100000','--related-handoffs','3')
+    assert ctx['related_handoffs_requested'] == 3 and ctx['related_handoffs_matched'] >= 1
+    assert ctx['related_handoffs_packed'] >= 1, ctx
+    rh = ctx['related_handoffs']
+    assert hr1b['id'] in [h['id'] for h in rh], rh
+    assert all(h['task_id'] != 'hr-q' for h in rh), 'self-task handoffs must never be related'
+    assert all(h['via_task_title'] for h in rh)
+    # Budget: related handoffs respect the same character budget.
+    tight = run('context','hr-q','--budget','120','--related-handoffs','3')
+    assert tight['used_chars'] <= 120 and tight['truncated'] is True
+    assert tight['related_handoffs_packed'] < tight['related_handoffs_matched'], tight
+    # Recall integration: digest moves only when the flag is used, verifies with
+    # identical params, and the recorded parameter lets fleet sweeps recompute.
+    ra = run('recall','hr-q','--agent','codex','--budget','100000','--related-handoffs','2')
+    rb = run('recall','hr-q','--agent','codex','--budget','100000')
+    assert ra['digest'] != rb['digest'], 'the flag must move the sealed digest'
+    rv = run('recall-verify','hr-q','--digest',ra['digest'],'--agent','codex',
+             '--budget','100000','--related-handoffs','2')
+    assert rv['fresh'] is True, rv
+    rvb = run('recall-verify','hr-q','--digest',ra['digest'],'--agent','codex','--budget','100000')
+    assert rvb['fresh'] is False, 'a related-handoffs digest must not verify without the flag'
+    hh = run('handoff','hr-q','--from-agent','codex','--to-agent','claude-code',
+             '--objective','plan capacity','--next-action','size the pool',
+             '--recall-digest',ra['digest'])
+    st = ops('recall-stale')
+    item = next(i for i in st['items'] if i['recall_digest'] == ra['digest'])
+    assert item['state'] == 'fresh', (item, 'core digest must survive own-handoff drift')
+    rd = run('recall-diff','hr-q','--digest',ra['digest'])
+    assert rd['state'] == 'stale' and 'handoff' in rd['sections_changed'], rd
+    doc = ops('doctor'); assert doc['ok'] is True and doc['problems'] == [], doc
+    assert run('verify-chain')['ok'] is True
     # Audit chain checkpoints: pin the head so tail truncation becomes detectable.
     cp = ops('checkpoint')
     assert cp['ok'] is True and cp['last_event_id'] > 0 and len(cp['sha256']) == 64, cp

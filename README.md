@@ -396,6 +396,48 @@ Design properties:
   matching (same shape, minus `score`); tokenless task text yields zero
   related matches instead of an error.
 
+### Related handoffs: neighboring resume points
+
+`--related-handoffs N` extends the same idea to the handoff protocol itself:
+up to N live handoffs on *other* tasks whose objective/status/agents match the
+task's text are packed after related notes, within the same budget. Where
+related notes carry prior *knowledge*, related handoffs carry neighboring
+*resume points* — the decisions and commit refs of sibling work an agent would
+otherwise rediscover:
+
+```bash
+python3 "$A" context <task-id> --budget 6000 --related 5 --related-handoffs 3
+```
+
+Each entry carries `task_id`, `via_task_title`, `from_agent`/`to_agent`,
+`status`, `objective`, and `commit_ref`; the pack reports
+`related_handoffs_requested` / `_matched` / `_packed`. The flag is opt-in and
+digest-gated: packs built without it stay byte-identical to the legacy shape,
+and a recall made with it only verifies when recomputed with the same value.
+Candidates are matched through the FTS index but ordered deterministically
+(created_at DESC, rowid) with no relevance score emitted — BM25 scores drift
+whenever any handoff joins the index, which would falsely stale every sealed
+digest. Superseded handoffs are never candidates; the task's own handoffs are
+excluded (its own live handoff already appears in the bundle).
+
+## Handoff search
+
+`search-handoffs` is fleet-wide keyword retrieval over the protocol: "what
+decided/did work like this before?" Live handoffs are searched by default;
+`--all` includes superseded ones (tagged with `superseded_by`). Filters:
+`--task`, `--from-agent`, `--to-agent`, `--project`. With `--rank` (and an
+FTS5-capable SQLite) results are BM25-ranked over
+objective/status/from_agent/to_agent via a dedicated `handoffs_fts` index and
+carry a `score`; otherwise substring LIKE matching with identical output shape
+minus the score. Every row joins its task's project/title so hits are
+triageable without a follow-up `show`:
+
+```bash
+python3 "$A" search-handoffs "postgres pool" --rank --project Trove
+python3 "$A" search-handoffs "migration" --from-agent codex --all
+```
+
+
 ## Session bootstrap (recall)
 
 `recall` is the one-call pre-action ritual the handoff protocol requires: every
