@@ -411,6 +411,20 @@ def unsatisfied_deps(db, task_id: str):
         "LEFT JOIN tasks t ON t.id=d.depends_on WHERE d.task_id=? AND COALESCE(t.status,'')!='completed'",
         (task_id,)).fetchall()]
 
+def pending_dependents(db, task_id: str):
+    """Direct dependents of a task that are still open (not completed/cancelled)."""
+    return [dict(r) for r in db.execute(
+        "SELECT d.task_id AS id, COALESCE(t.status,'missing') AS status FROM task_deps d "
+        "LEFT JOIN tasks t ON t.id=d.task_id WHERE d.depends_on=? "
+        "AND COALESCE(t.status,'') NOT IN ('completed','cancelled')",
+        (task_id,)).fetchall()]
+
+def unblock_count(db, task_id: str) -> int:
+    """Queued direct dependents — work this task's completion frees for dispatch."""
+    return db.execute(
+        "SELECT COUNT(*) n FROM task_deps d JOIN tasks t ON t.id=d.task_id "
+        "WHERE d.depends_on=? AND t.status='queued'", (task_id,)).fetchone()["n"]
+
 def would_cycle(db, task_id: str, depends_on: str) -> bool:
     """True if adding edge task_id->depends_on creates a cycle (i.e. task_id is reachable from depends_on)."""
     row = db.execute(
@@ -2023,9 +2037,15 @@ def complete(args):
         _require_epoch(row, getattr(args, "epoch", None), "completing")
         t = now()
         db.execute("UPDATE tasks SET status='completed',lease_owner='',lease_expires_at='',blocked_reason='',updated_at=? WHERE id=?", (t, args.id))
+        # Downstream feedback: which queued dependents just became dispatchable.
+        newly = sorted(d["id"] for d in pending_dependents(db, args.id)
+                       if d["status"] == "queued" and not unsatisfied_deps(db, d["id"]))
         audit(db, "task", args.id, "completed", {"owner": args.owner, "note": args.note,
-                                                 "recall_digest": recall_digest or None})
-        json_out(_task_view(task_row(db, args.id)))
+                                                 "recall_digest": recall_digest or None,
+                                                 "newly_unblocked": newly})
+        out = _task_view(task_row(db, args.id))
+        out["newly_unblocked"] = newly
+        json_out(out)
 
 def cancel(args):
     with conn() as db:
@@ -2151,6 +2171,38 @@ def blocked_by(args):
     json_out({"ok": True, "task_id": args.id,
               "blocked": any(not r["satisfied"] for r in rows),
               "blockers": rows})
+
+def impact(args):
+    """Blast radius: walk the dependency DAG downward from a task.
+
+    The mirror of `blocked-by`: every transitive dependent with its depth
+    (direct dependents at depth 1), live status, and a settled flag
+    (completed/cancelled work no longer cares). The summary answers the
+    operator question "what happens if I block, defer, or cancel this?" —
+    `open` is the number of downstream tasks still waiting somewhere on this
+    one. The graph is acyclic by construction (would_cycle guards every edge
+    insert), so the recursive walk always terminates.
+    """
+    with conn() as db:
+        task_row(db, args.id)
+        rows = [dict(r) for r in db.execute(
+            "WITH RECURSIVE down(id,depth) AS ("
+            " SELECT ?,0 UNION"
+            " SELECT d.task_id,down.depth+1 FROM task_deps d JOIN down ON d.depends_on=down.id"
+            ") "
+            "SELECT down.id,down.depth,COALESCE(t.status,'missing') AS status,"
+            "COALESCE(t.title,'') AS title,"
+            "(COALESCE(t.status,'') IN ('completed','cancelled')) AS settled "
+            "FROM down LEFT JOIN tasks t ON t.id=down.id WHERE down.depth>0 "
+            "ORDER BY down.depth,down.id", (args.id,)).fetchall()]
+    by_status = {}
+    for r in rows:
+        by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+    json_out({"ok": True, "task_id": args.id,
+              "impacted": len(rows),
+              "open": sum(1 for r in rows if not r["settled"]),
+              "by_status": by_status,
+              "dependents": rows})
 
 def verify_chain(args):
     """Recompute the audit hash chain; optionally pin-check against a sealed
@@ -2280,6 +2332,12 @@ def next_task(args):
     receives untagged or differently-tagged work, so policy lives in the task
     graph instead of per-agent prompts.
 
+    --prefer-unblocking adds a critical-path tie-break: within one effective
+    priority tier and deadline class, candidates are ordered by descending
+    count of queued direct dependents (`unblocks`), so finishing a hub frees
+    more of the graph than finishing a leaf. It never overrides priority,
+    deadlines, or aging fairness; without the flag, ordering is unchanged.
+
     With --claim --recall, the dispatch response embeds the full sealed recall
     bundle (digest, lease state, receipts) for the claimed task and audits it
     as `context_recalled` — one call takes work AND proves which context it
@@ -2342,19 +2400,29 @@ def next_task(args):
             via = None
             if inh is not None and _prio_rank(inh[0]) < _prio_rank(eff):
                 eff, via = inh[0], inh[1]
-            eligible.append((eff, boost, r, via))
+            eligible.append((eff, boost, r, via, unblock_count(db, r["id"])))
         picked = None
         picked_eff = None
         picked_boost = 0
         picked_via = None
+        picked_unblocks = 0
+        prefer_unblocking = bool(getattr(args, "prefer_unblocking", False))
         if eligible:
             # Effective priority first, then earliest deadline (undated last),
             # then oldest-created first: within one effective tier the
             # longest-waiting task wins, which is what makes aging fair.
-            eligible.sort(key=lambda e: (_prio_rank(e[0]), e[2]["due_at"] == "",
-                                         e[2]["due_at"], e[2]["created_at"]))
-            picked_eff, picked_boost, picked, picked_via = eligible[0]
+            # With --prefer-unblocking, the count of queued direct dependents
+            # breaks ties before age: between equally urgent, equally due
+            # candidates, finishing the hub frees more of the graph than
+            # finishing a leaf (critical-path scheduling as a tie-break — it
+            # never overrides priority or deadlines).
+            eligible.sort(key=lambda e: (
+                _prio_rank(e[0]), e[2]["due_at"] == "", e[2]["due_at"],
+                (-e[4] if prefer_unblocking else 0), e[2]["created_at"]))
+            picked_eff, picked_boost, picked, picked_via, picked_unblocks = eligible[0]
         out = {"ok": True, "task": _task_view(picked) if picked else None}
+        if picked is not None:
+            out["unblocks"] = picked_unblocks
         if explain:
             out["considered"] = len(rows)
             out["skipped"] = skipped
@@ -2363,6 +2431,8 @@ def next_task(args):
                 out["priority_boost"] = picked_boost
                 if picked_via:
                     out["inherited_via"] = picked_via
+            if prefer_unblocking:
+                out["unblock_scheduling"] = True
         if picked is None:
             json_out(out)
             return
@@ -2737,6 +2807,7 @@ def main():
     p=sub.add_parser("unblock"); p.add_argument("id"); p.add_argument("--owner",required=True); p.set_defaults(fn=unblock)
     p=sub.add_parser("defer"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--until",default=""); p.set_defaults(fn=defer)
     p=sub.add_parser("blocked-by"); p.add_argument("id"); p.set_defaults(fn=blocked_by)
+    p=sub.add_parser("impact"); p.add_argument("id"); p.set_defaults(fn=impact)
     p=sub.add_parser("verify-chain"); p.add_argument("--checkpoint",default=""); p.set_defaults(fn=verify_chain)
     p=sub.add_parser("events"); p.add_argument("--entity-type"); p.add_argument("--entity-id"); p.add_argument("--action"); p.add_argument("--since",default=""); p.add_argument("--until",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--verify",action="store_true"); p.set_defaults(fn=events)
     p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--force",action="store_true",help="claim even if another live lease holds the same worktree/branch seam"); p.set_defaults(fn=claim)
@@ -2750,7 +2821,7 @@ def main():
     p=sub.add_parser("tag"); p.add_argument("id"); p.add_argument("--tag",action="append",required=True,help="capability/scope tag (repeatable)"); p.set_defaults(fn=tag_task)
     p=sub.add_parser("untag"); p.add_argument("id"); p.add_argument("--tag",required=True); p.set_defaults(fn=untag_task)
     p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
-    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); p.add_argument("--prefer-unblocking",dest="prefer_unblocking",action="store_true",help="tie-break equal-priority candidates by queued dependents freed (critical-path scheduling)"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.add_argument("--tag",default=""); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)

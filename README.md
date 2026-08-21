@@ -122,6 +122,37 @@ failing after picking — `--explain` reports them as `seam_conflict` skips with
 the holding tasks. Set `worktree`/`branch` via `update`; empty values are
 never seams.
 
+## Downstream impact & unblock-aware scheduling
+
+`blocked-by` answers "what holds this task?"; `impact` answers the mirror
+question: "what is waiting on this task?" It walks the dependency DAG downward
+and reports every transitive dependent with its depth, live status, and a
+settled flag (completed/cancelled work no longer cares), plus a summary that
+answers "what happens if I block, defer, or cancel this?":
+
+```bash
+python3 "$A" impact <task-id>
+# { "impacted": 5, "open": 4, "by_status": {"queued": 3, "running": 1, ...},
+#   "dependents": [{"id": ..., "depth": 1, "status": ..., "settled": 0}, ...] }
+```
+
+Completion feeds back downstream: `complete` now reports `newly_unblocked` —
+the queued direct dependents whose dependencies it just satisfied — in both
+its output and the audited `completed` event, so an agent finishing a hub
+knows exactly which work it freed (and the audit trail records it).
+
+Dispatch can also schedule by graph shape. `next --prefer-unblocking` adds a
+critical-path tie-break: within one effective priority tier and deadline
+class, candidates are ordered by descending count of queued direct dependents
+(surfaced as `unblocks` on every pick and under `--explain` with
+`unblock_scheduling: true`). Finishing a hub frees more of the graph than
+finishing a leaf — but priority, deadlines, and aging fairness are never
+overridden; without the flag, ordering is byte-for-byte unchanged.
+
+```bash
+python3 "$A" next --claim --owner codex --prefer-unblocking
+```
+
 ## Lease transfer (cross-agent ownership)
 
 When work moves from one agent to another, ownership moves with it. `transfer`

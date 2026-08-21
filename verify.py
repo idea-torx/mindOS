@@ -1663,6 +1663,42 @@ with tempfile.TemporaryDirectory() as td:
     nx2 = run('next','--project','Seam','--claim','--owner','dispatcher2','--explain')
     assert nx2['claimed'] is True and nx2['task']['id'] == 'seam-e', nx2
     run('release','seam-e','--owner','dispatcher2')
+    # Downstream impact & unblock-aware scheduling: `impact` walks the DAG
+    # downward (mirror of blocked-by), complete reports which queued work it
+    # just freed, and --prefer-unblocking tie-breaks equal-priority dispatch
+    # toward graph hubs without changing the default order.
+    run('create','--project','Impact','--title','root','--id','imp-root')
+    run('create','--project','Impact','--title','mid a','--id','imp-mid')
+    run('create','--project','Impact','--title','mid b','--id','imp-mid2')
+    run('create','--project','Impact','--title','leaf','--id','imp-leaf')
+    run('dep','imp-mid','imp-root'); run('dep','imp-mid2','imp-root'); run('dep','imp-leaf','imp-mid')
+    imp = run('impact','imp-root')
+    assert imp['ok'] is True and imp['impacted'] == 3 and imp['open'] == 3, imp
+    assert imp['by_status'].get('queued') == 3, imp
+    depths = {d['id']: d['depth'] for d in imp['dependents']}
+    assert depths == {'imp-mid': 1, 'imp-mid2': 1, 'imp-leaf': 2}, imp
+    assert all(d['settled'] == 0 for d in imp['dependents']), imp
+    empty = run('impact','verify-1')
+    assert empty['impacted'] == 0 and empty['open'] == 0, empty
+    run('claim','imp-root','--owner','tester','--minutes','5')
+    done = run('complete','imp-root','--owner','tester')
+    assert sorted(done['newly_unblocked']) == ['imp-mid','imp-mid2'], done
+    ev = next(e for e in run('show','imp-root')['audit'] if e['action'] == 'completed')
+    assert sorted(ev['payload']['newly_unblocked']) == ['imp-mid','imp-mid2'], ev
+    run('cancel','imp-leaf','--owner','leo','--reason','obsolete')
+    imp2 = run('impact','imp-root')
+    assert imp2['open'] == 2 and imp2['by_status'].get('cancelled') == 1, imp2
+    run('create','--project','Impact','--title','plain p1','--id','imp-plain','--priority','P1')
+    import time; time.sleep(1.1)   # make imp-plain strictly older than imp-hub
+    run('create','--project','Impact','--title','hub p1','--id','imp-hub','--priority','P1')
+    run('create','--project','Impact','--title','waiting child','--id','imp-child','--priority','P3')
+    run('dep','imp-child','imp-hub')
+    nx_def = run('next','--project','Impact','--explain')
+    assert nx_def['task']['id'] == 'imp-plain' and nx_def['unblocks'] == 0, nx_def
+    assert 'unblock_scheduling' not in nx_def, nx_def
+    nx_pref = run('next','--project','Impact','--explain','--prefer-unblocking')
+    assert nx_pref['task']['id'] == 'imp-hub' and nx_pref['unblocks'] == 1, nx_pref
+    assert nx_pref.get('unblock_scheduling') is True, nx_pref
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
