@@ -18,7 +18,35 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-ROOT = Path(os.environ.get("HERMES_AUTOPILOT_HOME", Path.home() / ".hermes" / "autopilot"))
+# Runtime home selection: HERMES_AUTOPILOT_HOME (explicit env override) wins;
+# otherwise an explicit, reversible selector file may point the runtime at a
+# new MindOS home; absent both, the immutable rollback default
+# ~/.hermes/autopilot applies. The selector is a plain JSON document written
+# atomically by `ops.py home-select` and removed by `home-deselect`; nothing
+# here ever writes it implicitly, and a deleted/unreadable selector degrades
+# to the default rather than failing the runtime.
+SELECTOR_PATH = Path(os.environ.get(
+    "AUTOPILOT_HOME_SELECTOR",
+    Path.home() / ".hermes" / "autopilot-home-selector.json"))
+DEFAULT_HOME = Path.home() / ".hermes" / "autopilot"
+
+def _resolve_home():
+    """Return (root_path, selection_source) honoring env > selector > default."""
+    env_home = os.environ.get("HERMES_AUTOPILOT_HOME", "").strip()
+    if env_home:
+        return Path(env_home).expanduser(), "env"
+    try:
+        sel = json.loads(SELECTOR_PATH.read_text())
+        home = str(sel.get("home", "")).strip()
+        if home and sel.get("source") == "mindos":
+            p = Path(home).expanduser()
+            if p.is_dir():
+                return p, "selector"
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_HOME, "default"
+
+ROOT, HOME_SOURCE = _resolve_home()
 DB = ROOT / "state.db"
 RECEIPTS = ROOT / "receipts"
 POLICIES = ROOT / "policies"

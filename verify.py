@@ -3083,6 +3083,93 @@ with tempfile.TemporaryDirectory() as td:
     assert tree_digest_under(fhermes) + tree_digest_under(fx / 'claude') == fx_after_edits, \
         'fail-closed runs still never mutate scanned sources'
 
+    # Hermes runtime home selection: env > selector > default, with a health
+    # gate on select and a dry-run-first one-command rollback on deselect.
+    import sqlite3 as _sq
+    sel_fx = Path(td) / 'home-sel-fx'
+    good_home = sel_fx / 'mindos-good'
+    bad_home = sel_fx / 'mindos-bad'
+    for d in (good_home, bad_home):
+        p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), 'init'],
+                           env={**env, 'HERMES_AUTOPILOT_HOME': str(d)},
+                           text=True, capture_output=True)
+        assert p.returncode == 0, p.stderr
+        # Seed one audited event in each home so the tamper check has a chain.
+        p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), 'create',
+                            '--project', 'Sel', '--title', 'seed'],
+                           env={**env, 'HERMES_AUTOPILOT_HOME': str(d)},
+                           text=True, capture_output=True)
+        assert p.returncode == 0, p.stderr
+    sel_path = sel_fx / 'selector.json'
+    senv = {**env, 'AUTOPILOT_HOME_SELECTOR': str(sel_path)}
+    cenv = {k: v for k, v in senv.items() if k != 'HERMES_AUTOPILOT_HOME'}  # default-resolution env
+    def sops(*a, _env=None):
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=_env or senv,
+                           text=True, capture_output=True)
+        if p.returncode: raise AssertionError((a, p.stdout, p.stderr))
+        return json.loads(p.stdout)
+    def sops_fail(*a, _env=None):
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=_env or senv,
+                           text=True, capture_output=True)
+        assert p.returncode != 0, ('expected failure', a, p.stdout, p.stderr)
+        return p.stderr
+    # Default resolution: no env, no selector → rollback default.
+    show = sops('home-show', _env=cenv)
+    assert show['source'] == 'default' and show['selector_present'] is False, show
+    # A malformed selector degrades to the default instead of failing.
+    sel_path.write_text('{not json')
+    assert sops('home-show', _env=cenv)['source'] == 'default'
+    # A selector naming a vanished home is ignored too.
+    ghost = sel_fx / 'ghost-home'; ghost.mkdir()
+    sel_path.write_text(json.dumps({'format': 'mindos-home-selector-v1',
+                                    'source': 'mindos', 'home': str(ghost)}))
+    ghost.rmdir()
+    assert sops('home-show', _env=cenv)['source'] == 'default'
+    # Read-only doctor on a healthy home passes; on a home with a tampered
+    # audit chain it fails closed naming the problem — without mutating either.
+    def tree_d(root_):
+        # Exclude SQLite's -wal/-shm sidecars: any read connection may
+        # checkpoint them; their churn is not a mutation of durable data.
+        h = hashlib.sha256()
+        for p in sorted(root_.rglob('*')):
+            if p.is_file() and not p.is_symlink() and not p.name.endswith(('-wal', '-shm')):
+                h.update(str(p.relative_to(root_)).encode()); h.update(p.read_bytes())
+        return h.hexdigest()
+    good_before = tree_d(good_home)
+    assert sops('home-doctor', '--home', str(good_home))['ok'] is True
+    with _sq.connect(bad_home / 'state.db') as bdb:
+        bdb.execute("UPDATE audit_events SET action='tampered' WHERE id=(SELECT MIN(id) FROM audit_events)")
+    bad_before = tree_d(bad_home)
+    dres = sops('home-doctor', '--home', str(bad_home))
+    assert dres['ok'] is False and any(p['kind'] == 'hash_mismatch' for p in dres['problems']), dres
+    assert tree_d(bad_home) == bad_before and tree_d(good_home) == good_before, 'doctor must be read-only'
+    # home-select refuses an unhealthy home and refuses the rollback default.
+    err = sops_fail('home-select', '--home', str(bad_home), '--selector', str(sel_path))
+    assert 'failed health verification' in err and 'hash_mismatch' in err, err
+    assert not sel_path.exists() or 'tampered' not in sel_path.read_text()
+    err = sops_fail('home-select', '--home', str(Path.home() / '.hermes' / 'autopilot'), '--selector', str(sel_path))
+    assert 'rollback default' in err, err
+    # A healthy home selects cleanly: selector written 0600 and honored.
+    selres = sops('home-select', '--home', str(good_home), '--selector', str(sel_path))
+    assert selres['ok'] is True and selres['health'] == 'pass', selres
+    assert sel_path.stat().st_mode & 0o077 == 0
+    body = json.loads(sel_path.read_text())
+    assert body['format'] == 'mindos-home-selector-v1' and body['home'] == str(good_home.resolve()), body
+    # An explicit env override still outranks the selector…
+    assert sops('home-show')['source'] == 'env'
+    # …and without it, the selector drives resolution.
+    assert sops('home-show', _env=cenv)['source'] == 'selector'
+    assert sops('home-show', _env=cenv)['root'] == str(good_home.resolve())
+    # Deselect is dry-run first; the apply is the one-command rollback.
+    plan = sops('home-deselect', '--selector', str(sel_path))
+    assert plan['dry_run'] is True and plan['would_remove_selector'] is True and sel_path.exists(), plan
+    done = sops('home-deselect', '--selector', str(sel_path), '--apply')
+    assert done['removed_selector'] is True and not sel_path.exists(), done
+    assert sops('home-show', _env=cenv)['source'] == 'default'
+    # Idempotent deselect apply on an absent selector stays honest.
+    again = sops('home-deselect', '--selector', str(sel_path), '--apply')
+    assert again['removed_selector'] is False, again
+
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

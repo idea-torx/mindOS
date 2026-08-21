@@ -1850,6 +1850,36 @@ concurrency and false-success seams it found:
   `HERMES_AUTOPILOT_HOME` instead of a hardcoded live-home path; `ops.py` is
   importable (`__main__`-guarded) for in-process testing.
 
+## Hermes runtime home selection (explicit, reversible)
+
+The runtime resolves its home in a strict precedence order, so the new MindOS
+home can be selected without ever touching `~/.hermes/autopilot`:
+
+1. `HERMES_AUTOPILOT_HOME` env var (unchanged; always wins)
+2. An explicit selector file — `~/.hermes/autopilot-home-selector.json`
+   (override with `AUTOPILOT_HOME_SELECTOR`), written atomically `0600` by
+   `ops.py home-select` and removed by `ops.py home-deselect --apply`
+3. The immutable rollback default `~/.hermes/autopilot`
+
+Nothing writes the selector implicitly: a missing, unreadable, or malformed
+selector degrades silently to the default rather than failing the runtime.
+A selector pointing at a directory that no longer exists is ignored.
+
+```bash
+O=~/.hermes/mindos/ops.py
+python3 "$O" home-doctor --home ~/.hermes/mindos   # read-only health sweep of an explicit home
+python3 "$O" home-show                             # which home is active and why
+python3 "$O" home-select --home ~/.hermes/mindos   # verify-then-select (refuses an unhealthy home)
+python3 "$O" home-deselect                         # read-only dry-run plan
+python3 "$O" home-deselect --apply                 # one-command rollback to ~/.hermes/autopilot
+```
+
+`home-select` refuses to point at the rollback default itself and runs a
+read-only doctor sweep first (audit chain, sealed checkpoints under
+`<home>/backups`, stale leases) — selection fails closed naming every problem,
+so a default switch only ever follows verified health. Deselecting is the
+one-command rollback; the old home's data is never mutated by any of this.
+
 ## Next integration
 
 The hourly control tower should read this registry and report task changes. Existing project-specific policies should be added under `policies/` before allowing automatic side effects.

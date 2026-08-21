@@ -3192,6 +3192,112 @@ def brain_import(args=None):
                       'already_present': [str(Path(p).relative_to(target)) for p in existing],
                       'quarantine': len(quarantine), 'report': str(report_target)}, sort_keys=True))
 
+HOME_SELECTOR_FORMAT = 'mindos-home-selector-v1'
+# Health checks a MindOS home must pass before the selector may point at it.
+# Everything here is read-only: doctor-style consistency sweep plus presence
+# checks for the artifacts a brain-imported home is expected to carry.
+
+def _home_doctor_problems(root: Path):
+    """Read-only health/doctor verification of an Autopilot/MindOS home."""
+    import autopilot as _ap  # local alias; module-level import already exists
+    problems = []
+    if not (root / 'state.db').is_file():
+        return [{'kind': 'state_db_missing', 'home': str(root)}]
+    # Run the full consistency sweep against this home by pointing the
+    # autopilot module at it for the duration (restored afterwards).
+    saved = (_ap.ROOT, _ap.DB, _ap.RECEIPTS, _ap.POLICIES)
+    try:
+        _ap.ROOT, _ap.DB = root, root / 'state.db'
+        _ap.RECEIPTS, _ap.POLICIES = root / 'receipts', root / 'policies'
+        with _ap.conn() as c:
+            problems.extend(_ap.audit_chain_problems(c))
+            stale = c.execute(
+                "SELECT id FROM tasks WHERE lease_expires_at!='' AND lease_expires_at<=? "
+                "AND status IN ('claimed','running','waiting_for_agent')",
+                (_ap.now(),)).fetchall()
+            for r in stale:
+                problems.append({'kind': 'stale_lease', 'task_id': r['id']})
+            # Sealed chain checkpoints pinned under <home>/backups: divergence
+            # proves tail truncation or history rewriting, exactly as doctor.
+            backups = root / 'backups'
+            if backups.exists():
+                for p in sorted(backups.glob('checkpoint-*.json')):
+                    try:
+                        cp = _ap._load_checkpoint(str(p))
+                    except SystemExit:
+                        problems.append({'kind': 'checkpoint_file_invalid', 'path': p.name})
+                        continue
+                    problems.extend(_ap.checkpoint_problems(c, cp))
+    finally:
+        _ap.ROOT, _ap.DB, _ap.RECEIPTS, _ap.POLICIES = saved
+    return problems
+
+
+def home_show(args=None):
+    """Report which home the runtime resolves to and why (read-only)."""
+    print(json.dumps({'root': str(autopilot.ROOT), 'source': autopilot.HOME_SOURCE,
+                      'default_home': str(autopilot.DEFAULT_HOME),
+                      'selector_path': str(autopilot.SELECTOR_PATH),
+                      'selector_present': autopilot.SELECTOR_PATH.exists()}, sort_keys=True))
+
+
+def home_select(args=None):
+    """Point the Hermes runtime at an explicit new MindOS home — reversibly."""
+    target = Path(args.home).expanduser()
+    if not target.is_absolute():
+        raise SystemExit('--home must be an explicit absolute MindOS home')
+    target = target.resolve()
+    if not target.is_dir():
+        raise SystemExit(f'home does not exist: {target}')
+    if target == autopilot.DEFAULT_HOME.resolve():
+        raise SystemExit('refusing to select the rollback default home; deselect instead')
+    problems = _home_doctor_problems(target)
+    if problems:
+        raise SystemExit(f'{target} failed health verification:\n  ' +
+                         '\n  '.join(p['kind'] + ': ' + json.dumps({k: v for k, v in p.items() if k != "kind"}, sort_keys=True)
+                                     for p in problems))
+    body = {'format': HOME_SELECTOR_FORMAT, 'source': 'mindos', 'home': str(target),
+            'selected_at': utc(), 'rollback_home': str(autopilot.DEFAULT_HOME)}
+    path = Path(getattr(args, 'selector', '') or autopilot.SELECTOR_PATH).expanduser()
+    fd, tmp = tempfile.mkstemp(prefix='.selector.', dir=str(path.parent))
+    try:
+        os.write(fd, json.dumps(body, sort_keys=True).encode())
+        os.close(fd); fd = None
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, str(path))
+    except OSError:
+        if fd is not None:
+            os.close(fd)
+        raise
+    print(json.dumps({'ok': True, 'selected': str(target), 'selector': str(path),
+                      'rollback': body['rollback_home'], 'health': 'pass'}, sort_keys=True))
+
+
+def home_deselect(args=None):
+    """Revert to the immutable ~/.hermes/autopilot rollback home."""
+    path = Path(getattr(args, 'selector', '') or autopilot.SELECTOR_PATH).expanduser()
+    if getattr(args, 'apply', False):
+        existed = path.exists() or path.is_symlink()
+        if existed:
+            path.unlink()
+        print(json.dumps({'ok': True, 'removed_selector': existed,
+                          'active_home': str(autopilot.DEFAULT_HOME),
+                          'source': 'default'}, sort_keys=True))
+    else:
+        planned = path.exists() or path.is_symlink()
+        print(json.dumps({'ok': True, 'dry_run': True, 'would_remove_selector': planned,
+                          'active_home': str(autopilot.DEFAULT_HOME)}, sort_keys=True))
+
+
+def home_doctor(args=None):
+    """Read-only health/doctor verification of an explicit home (no selection)."""
+    target = Path(args.home).expanduser().resolve()
+    if not target.is_dir():
+        raise SystemExit(f'home does not exist: {target}')
+    problems = _home_doctor_problems(target)
+    print(json.dumps({'ok': not problems, 'home': str(target), 'count': len(problems),
+                      'problems': problems}, sort_keys=True))
+
 def policy(args):
     # Resolve through autopilot.POLICIES so HERMES_AUTOPILOT_HOME is honored —
     # a hardcoded live-home path would read (or miss) the wrong policies in
@@ -3206,6 +3312,10 @@ import argparse
 p=argparse.ArgumentParser(); s=p.add_subparsers(dest='cmd',required=True)
 for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning),('doctor',doctor)]:
  x=s.add_parser(name); x.set_defaults(fn=fn)
+x=s.add_parser('home-show'); x.set_defaults(fn=home_show)
+x=s.add_parser('home-select'); x.add_argument('--home',required=True,help='explicit absolute new MindOS home; health-verified before selection'); x.add_argument('--selector',default='',help='selector file path (default ~/.hermes/autopilot-home-selector.json)'); x.set_defaults(fn=home_select)
+x=s.add_parser('home-deselect'); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--selector',default=''); x.set_defaults(fn=home_deselect)
+x=s.add_parser('home-doctor'); x.add_argument('--home',required=True); x.set_defaults(fn=home_doctor)
 x=s.add_parser('handoff-check'); x.add_argument('--task',default=''); x.add_argument('--ack-sla-hours',dest='ack_sla_hours',type=float,default=24); x.set_defaults(fn=handoff_check)
 x=s.add_parser('recall-stale'); x.set_defaults(fn=recall_stale)
 x=s.add_parser('notes-expired'); x.set_defaults(fn=notes_expired)
