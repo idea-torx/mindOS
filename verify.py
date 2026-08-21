@@ -404,6 +404,76 @@ with tempfile.TemporaryDirectory() as td:
     plain = run('context','mem-2','--budget','100000')
     assert plain['related_requested'] == 0 and plain['related_packed'] == 0
     assert all(not n.get('related') for n in plain['notes'])
+    # Audit event stream: filtered global query over the hash-chained ledger.
+    ev = run('events','--action','note_added','--limit','2')
+    assert ev['ok'] is True and len(ev['events']) == 2 and ev['truncated'] is True, ev
+    assert all(e['action'] == 'note_added' and isinstance(e['payload'], dict) for e in ev['events'])
+    assert ev['total_matching'] > 2
+    ev = run('events','--entity-id','mem-1','--action','note_superseded')
+    assert ev['total_matching'] >= 1 and ev['count'] == ev['total_matching']
+    assert ev['truncated'] is False and ev['events'][0]['entity_id'] == 'mem-1'
+    err = run_fail('events','--since','not-a-date')
+    assert 'invalid --since' in err
+    run_fail('events','--until','also-bad')
+    ev = run('events','--limit','5','--verify')
+    assert ev['chain']['ok'] is True and ev['chain']['problems'] == [], ev
+    # Time-window filter: everything created after "now" yields nothing new.
+    ev = run('events','--since','2030-01-01T00:00:00Z')
+    assert ev['total_matching'] == 0 and ev['events'] == []
+    # Archival: sealed export + removal of terminal tasks, with safety guards.
+    run('create','--project','Archive','--title','done work','--id','arc-1')
+    run('claim','arc-1','--owner','tester','--minutes','5')
+    ar = run('receipt','arc-1','--kind','verification','--payload','{"result":"pass"}')
+    run('note','arc-1','--kind','fact','--content','archived knowledge about postgres pool sizing','--source','hermes')
+    run('complete','arc-1','--owner','tester','--note','done')
+    run('create','--project','Archive','--title','drop work','--id','arc-2')
+    run('cancel','arc-2','--owner','leo','--reason','obsolete')
+    run('create','--project','Archive','--title','live dependent','--id','arc-3','--depends-on','arc-1')
+    # Guard: a live task still depends on arc-1, so archiving must refuse.
+    err = ops_fail('archive','--before','2030-01-01T00:00:00+00:00','--dry-run')
+    assert 'still depend' in err and 'arc-3' in err, err
+    run('complete','dep-b','--owner','tester','--note','finish leftover dependency host')
+    run('cancel','arc-3','--owner','leo','--reason','not needed')
+    dry = ops('archive','--before','2030-01-01T00:00:00+00:00','--dry-run')
+    assert dry['dry_run'] is True and {'arc-1','arc-2','arc-3'} <= set(dry['task_ids']), dry
+    assert dry['counts']['notes'] == 1 and dry['receipt_files'] == 1
+    row = next(r for r in run('list') if r['id'] == 'arc-1')
+    assert row['status'] == 'completed', 'dry-run must not mutate'
+    arc = ops('archive','--before','2030-01-01T00:00:00+00:00')
+    assert arc['ok'] is True and {'arc-1','arc-2','arc-3'} <= set(arc['archived']), arc
+    assert Path(arc['path']).exists() and len(arc['sha256']) == 64
+    live_ids = {r['id'] for r in run('list')}
+    assert not live_ids & {'arc-1','arc-2','arc-3'}, 'archived tasks must leave the live registry'
+    assert not (Path(td) / 'receipts' / (ar['receipt_id'] + '.json')).exists(), 'receipt file archived away'
+    assert run('search-notes','archived knowledge') == [], 'fts index must drop archived notes'
+    chain = run('verify-chain')
+    assert chain['ok'] is True, 'audit events are retained; chain must stay intact'
+    ev = run('events','--entity-id','arc-1','--action','completed')
+    assert ev['total_matching'] >= 1, 'retained audit events stay queryable after archive'
+    chk = ops('archive-check', arc['path'])
+    assert chk['ok'] is True and chk['counts']['tasks'] >= 3, chk
+    assert chk['before'] == '2030-01-01T00:00:00+00:00'
+    # Restore: re-import the archive with integrity verification.
+    res = ops('archive-restore', arc['path'])
+    assert res['ok'] is True and set(res['restored_tasks']) >= {'arc-1'}, res
+    row = next(r for r in run('list') if r['id'] == 'arc-1')
+    assert row['status'] == 'completed'
+    notes_back = run('notes','arc-1')
+    assert any(n['content'].startswith('archived knowledge') for n in notes_back)
+    hits = run('search-notes','archived knowledge')
+    assert len(hits) == 1, 'fts trigger must re-index restored notes'
+    assert (Path(td) / 'receipts' / (ar['receipt_id'] + '.json')).exists(), 'receipt file recreated'
+    doc = ops('doctor')
+    assert doc['ok'] is True and doc['problems'] == [], doc
+    # Restore refuses to collide with existing task ids unless --force.
+    err = ops_fail('archive-restore', arc['path'])
+    assert 'already exist' in err and '--force' in err
+    # Tamper detection on archives.
+    evil = json.loads(Path(arc['path']).read_text())
+    evil['tables']['tasks'][0]['title'] = 'tampered'
+    Path(arc['path']).write_text(json.dumps(evil, sort_keys=True))
+    err = ops_fail('archive-check', arc['path'])
+    assert '"ok": false' in err or 'integrity check failed' in err
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

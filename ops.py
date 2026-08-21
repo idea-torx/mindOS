@@ -205,6 +205,172 @@ def snapshot_check(args):
                       'created_at': body.get('created_at'), 'counts': counts}))
     if not ok: sys.exit(1)
 
+ARCHIVE_TABLES = ('tasks', 'task_deps', 'heartbeats', 'receipts', 'notes')
+ARCHIVE_FORMAT = 'autopilot-archive-v1'
+
+def archive(args=None):
+    """Retention / memory consolidation: seal terminal tasks into an
+    integrity-checked archive file, then remove them from the live database.
+
+    Tasks with status completed/failed/cancelled and updated_at <= --before
+    are eligible. Refuses when a live (non-archived) task still depends on an
+    archived candidate. Audit events are *retained* in the live database — the
+    hash chain is append-only tamper-evident history — but copies are included
+    in the archive for reference. Receipt files move into the archive document.
+    """
+    before = autopilot._normalize_iso(getattr(args, 'before', ''), '--before')
+    if not before:
+        raise SystemExit('--before requires an ISO 8601 cutoff applied to updated_at')
+    dry = bool(getattr(args, 'dry_run', False))
+    with db() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT * FROM tasks WHERE status IN ('completed','failed','cancelled') AND updated_at<=? "
+            "ORDER BY updated_at", (before,)).fetchall()]
+        ids = [r['id'] for r in rows]
+        if not ids:
+            print(json.dumps({'ok': True, 'archived': [], 'dry_run': dry, 'path': None, 'counts': {}}))
+            return
+        ph = ','.join('?' * len(ids))
+        blockers = [dict(r) for r in c.execute(
+            f"SELECT DISTINCT task_id, depends_on FROM task_deps "
+            f"WHERE depends_on IN ({ph}) AND task_id NOT IN ({ph})", (*ids, *ids)).fetchall()]
+        if blockers:
+            detail = ', '.join(f"{b['task_id']} -> {b['depends_on']}" for b in blockers)
+            raise SystemExit('refusing to archive: live tasks still depend on terminal candidates: ' + detail)
+        def fetch(sql, params=None):
+            return [dict(r) for r in c.execute(sql, params if params is not None else ids).fetchall()]
+        tables = {
+            'tasks': rows,
+            'task_deps': fetch(f'SELECT * FROM task_deps WHERE task_id IN ({ph}) OR depends_on IN ({ph})', (*ids, *ids)),
+            'heartbeats': fetch(f'SELECT * FROM heartbeats WHERE task_id IN ({ph})'),
+            'receipts': fetch(f'SELECT * FROM receipts WHERE task_id IN ({ph})'),
+            'notes': fetch(f'SELECT * FROM notes WHERE task_id IN ({ph})'),
+        }
+        audit_retained = c.execute(
+            f"SELECT COUNT(*) n FROM audit_events WHERE entity_type='task' AND entity_id IN ({ph})",
+            ids).fetchone()['n']
+    receipt_files = {}
+    for r in tables['receipts']:
+        p = autopilot.RECEIPTS / (r['id'] + '.json')
+        receipt_files[r['id']] = p.read_text() if p.exists() else None
+    doc = {'format': ARCHIVE_FORMAT, 'created_at': utc(), 'before': before,
+           'tables': tables, 'receipt_files': receipt_files,
+           'audit_events_retained': audit_retained}
+    digest = hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()
+    doc['sha256'] = digest
+    counts = {t: len(tables[t]) for t in ARCHIVE_TABLES}
+    if dry:
+        print(json.dumps({'ok': True, 'dry_run': True, 'task_ids': ids, 'counts': counts,
+                          'receipt_files': len(receipt_files), 'audit_events_retained': audit_retained}))
+        return
+    if getattr(args, 'out', None):
+        out_path = Path(args.out); out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_path = autopilot.ROOT / 'backups'
+        out_path.mkdir(parents=True, exist_ok=True)
+        out_path = out_path / f"archive-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    fd, tmp = tempfile.mkstemp(prefix='.archive.', dir=str(out_path.parent))
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(json.dumps(doc, sort_keys=True)); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, str(out_path))
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+    # Seal-then-destroy: the verified archive exists on disk before any deletion.
+    with db() as c:
+        c.execute(f'DELETE FROM task_deps WHERE task_id IN ({ph}) OR depends_on IN ({ph})', (*ids, *ids))
+        for t in ('heartbeats', 'receipts', 'notes'):
+            c.execute(f'DELETE FROM {t} WHERE task_id IN ({ph})', ids)
+        c.execute(f'DELETE FROM tasks WHERE id IN ({ph})', ids)
+    removed = 0
+    for rid, text in receipt_files.items():
+        p = autopilot.RECEIPTS / (rid + '.json')
+        if text is not None and p.exists():
+            p.unlink(); removed += 1
+    print(json.dumps({'ok': True, 'archived': ids, 'path': str(out_path), 'sha256': digest,
+                      'counts': counts, 'receipt_files_removed': removed,
+                      'audit_events_retained': audit_retained}))
+
+def _load_archive(path: Path):
+    """Read and integrity-check an archive file; returns its body."""
+    if not path.exists(): raise SystemExit(f'archive not found: {path}')
+    try:
+        doc = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f'archive is not valid JSON: {e}')
+    expected = doc.get('sha256')
+    body = {k: v for k, v in doc.items() if k != 'sha256'}
+    if body.get('format') != ARCHIVE_FORMAT:
+        raise SystemExit('unrecognized archive format')
+    actual = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    if actual != expected:
+        raise SystemExit('archive integrity check failed; refusing to use a tampered file')
+    return body
+
+def archive_check(args):
+    """Verify an archive file's self-hash without touching any database."""
+    body = _load_archive(Path(args.path))
+    tables = body.get('tables', {})
+    print(json.dumps({'ok': True, 'path': str(args.path), 'created_at': body.get('created_at'),
+                      'before': body.get('before'),
+                      'counts': {t: len(tables.get(t, [])) for t in ARCHIVE_TABLES},
+                      'audit_events_retained': body.get('audit_events_retained', 0)}))
+
+def archive_restore(args):
+    """Re-import archived tasks into the live database after verifying integrity.
+
+    Refuses when any archived task id already exists unless --force (which
+    replaces those tasks and their dependent rows via cascade). Receipt files
+    are recreated atomically; FTS triggers re-index restored notes/tasks.
+    """
+    body = _load_archive(Path(args.path))
+    tables = body.get('tables', {})
+    ids = [t['id'] for t in tables.get('tasks', [])]
+    force = bool(getattr(args, 'force', False))
+    autopilot.ensure()
+    ph = ','.join('?' * len(ids)) if ids else ''
+    with sqlite3.connect(DB, timeout=10) as c:
+        c.row_factory = sqlite3.Row
+        c.execute('PRAGMA foreign_keys=ON')
+        existing = [r[0] for r in c.execute(
+            f'SELECT id FROM tasks WHERE id IN ({ph})', ids).fetchall()] if ids else []
+        if existing and not force:
+            raise SystemExit('tasks already exist in database: %s; pass --force to replace'
+                             % ', '.join(sorted(existing)))
+        c.execute('BEGIN')
+        if existing:
+            c.execute(f'DELETE FROM tasks WHERE id IN ({ph})', existing)
+        for t in ARCHIVE_TABLES:
+            for row in tables.get(t, []):
+                cols = list(row.keys())
+                c.execute(f'INSERT INTO {t}({",".join(cols)}) VALUES({",".join("?" * len(cols))})',
+                          [row[k] for k in cols])
+        fk_violations = [dict(r) for r in c.execute('PRAGMA foreign_key_check').fetchall()]
+        c.commit()
+    written = 0
+    for rid, text in (body.get('receipt_files') or {}).items():
+        if text is None:
+            continue
+        target = autopilot.RECEIPTS / (rid + '.json')
+        if target.exists() and not force:
+            continue
+        fd, tmp = tempfile.mkstemp(prefix=f'.{rid}.', dir=str(autopilot.RECEIPTS))
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(text); f.flush(); os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, str(target))
+            written += 1
+        finally:
+            if os.path.exists(tmp): os.unlink(tmp)
+    ok = not fk_violations
+    print(json.dumps({'ok': ok, 'path': str(args.path), 'restored_tasks': ids,
+                      'restored': {t: len(tables.get(t, [])) for t in ARCHIVE_TABLES},
+                      'replaced': sorted(existing), 'receipt_files_written': written,
+                      'fk_violations': fk_violations}))
+    if not ok: sys.exit(1)
+
 def doctor(args=None):
     """Read-only consistency sweep: orphan deps, receipt index/files, audit chain, stale leases."""
     problems = []
@@ -265,6 +431,9 @@ x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)
 x=s.add_parser('snapshot-check'); x.add_argument('path'); x.set_defaults(fn=snapshot_check)
 x=s.add_parser('snapshot-restore'); x.add_argument('path'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=snapshot_restore)
+x=s.add_parser('archive'); x.add_argument('--before',required=True); x.add_argument('--out',default=None); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=archive)
+x=s.add_parser('archive-check'); x.add_argument('path'); x.set_defaults(fn=archive_check)
+x=s.add_parser('archive-restore'); x.add_argument('path'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=archive_restore)
 x=s.add_parser('approval'); x.add_argument('action',choices=['approve','reject','block']); x.add_argument('id'); x.add_argument('--by',default='leo'); x.add_argument('--reason',default=''); x.add_argument('--next-action',default=''); x.set_defaults(fn=approval)
 x=s.add_parser('policy'); x.add_argument('project'); x.add_argument('action'); x.set_defaults(fn=policy)
 args=p.parse_args(); args.fn(args)

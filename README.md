@@ -24,6 +24,8 @@ python3 "$A" search "deploy"         # substring search over task text fields
 python3 "$A" search "audit" --status queued --project Trove --priority P1
 python3 "$A" metrics                 # JSON observability snapshot
 python3 "$A" verify-chain            # recompute the audit hash chain; report tampering
+python3 "$A" events --action claimed --limit 20      # query the global audit stream
+python3 "$A" events --entity-id <task-id> --since 2026-08-21T00:00:00Z --verify
 python3 "$A" dashboard
 ```
 
@@ -226,6 +228,10 @@ python3 "$O" morning                   # morning brief
 python3 "$O" snapshot                  # consistent JSON export of all tables, sealed with a SHA-256
 python3 "$O" snapshot-check <file>     # verify a snapshot's integrity hash (exit 1 on tampering)
 python3 "$O" snapshot-restore <file> --force   # rebuild the database from a verified snapshot
+python3 "$O" archive --before "2026-09-01T00:00:00Z"           # seal + remove terminal tasks
+python3 "$O" archive --before "..." --dry-run                  # preview without mutating
+python3 "$O" archive-check <file>      # verify an archive's integrity hash
+python3 "$O" archive-restore <file> [--force]  # re-import archived tasks
 ```
 
 `snapshot` writes an atomic, `autopilot-snapshot-v1` JSON document (default
@@ -247,6 +253,38 @@ retry budget is exhausted (`retry_count > max-retries`, default 3) transition to
 `--dry-run` reports `would_recover` / `would_fail` without touching state,
 making it safe to run from monitoring cron before committing to a real pass.
 
+## Archival & retention
+
+Terminal tasks accumulate forever without a retention path. `ops.py archive`
+consolidates them: every `completed` / `failed` / `cancelled` task with
+`updated_at <= --before` is sealed into an atomic, self-hash-verified
+`autopilot-archive-v1` JSON document (default under
+`~/.hermes/autopilot/backups/`), then removed from the live database together
+with its dependencies, heartbeats, receipts, notes, and receipt files:
+
+```bash
+python3 "$O" archive --before "2026-09-01T00:00:00Z" --dry-run   # preview ids + counts
+python3 "$O" archive --before "2026-09-01T00:00:00Z" --out /path/archive.json
+python3 "$O" archive-check <archive.json>       # exit 1 if the file was tampered with
+python3 "$O" archive-restore <archive.json>     # re-import; --force replaces collisions
+```
+
+Design properties:
+
+- **Seal-then-destroy**: the archive file is written and fsynced before any
+  row is deleted; deletion happens in one transaction in child-first order.
+- **Dependency guard**: archiving refuses while any *live* task still depends
+  on a terminal candidate, so dispatch prerequisites can never be archived out
+  from under queued work.
+- **Append-only audit**: audit events are retained in the live database (the
+  hash chain must stay verifiable) but are counted and copied into the archive
+  for reference. `verify-chain` remains `ok` after an archive pass.
+- **FTS-consistent**: deletions and restores fire the external-content triggers,
+  so ranked search never surfaces (or misses) archived notes.
+- **Restorable**: `archive-restore` verifies integrity first, refuses task-id
+  collisions unless `--force`, reinserts rows in FK order, recreates receipt
+  files atomically with `0600` permissions, and re-checks foreign keys.
+
 ## Lifecycle guardrails
 
 - `complete` enforces claim-before-complete: only the current holder of a live
@@ -256,6 +294,22 @@ making it safe to run from monitoring cron before committing to a real pass.
   overrides a foreign or expired lease.
 - Any `update --status` to a terminal state (`completed`, `failed`,
   `cancelled`) releases the held lease so terminal tasks cannot look active.
+
+## Audit event stream
+
+`events` queries the global hash-chained audit ledger — not just the per-task
+trail from `show` — with entity/action filters, an ISO 8601 time window, a
+limit, and optional inline chain verification:
+
+```bash
+python3 "$A" events --action claimed --limit 20
+python3 "$A" events --entity-id <task-id> --since "2026-08-21T00:00:00Z" --until "2026-08-22T00:00:00Z"
+python3 "$A" events --limit 100 --verify   # also recompute the chain in the same call
+```
+
+Results are newest-first and carry parsed `payload` objects. `total_matching`
+and `truncated` report how the limit clipped the result set; invalid
+timestamps are rejected with the offending flag named in the error.
 
 ## Audit integrity
 

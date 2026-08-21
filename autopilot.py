@@ -133,18 +133,22 @@ NOTE_KINDS = {"fact", "decision", "observation", "evidence", "constraint"}
 def now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-def _normalize_due(value: str) -> str:
-    """Normalize a user-supplied deadline to UTC ISO 8601; '' clears the deadline."""
+def _normalize_iso(value: str, flag: str) -> str:
+    """Normalize a user-supplied timestamp to UTC ISO 8601; '' stays ''."""
     v = (value or "").strip()
     if not v:
         return ""
     try:
         dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
     except ValueError:
-        raise SystemExit(f"invalid due-at timestamp: {value!r} (use ISO 8601, e.g. 2026-08-21T17:00:00+00:00)")
+        raise SystemExit(f"invalid {flag} timestamp: {value!r} (use ISO 8601, e.g. 2026-08-21T17:00:00+00:00)")
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+def _normalize_due(value: str) -> str:
+    """Normalize a user-supplied deadline to UTC ISO 8601; '' clears the deadline."""
+    return _normalize_iso(value, "due-at")
 
 def ensure() -> None:
     ROOT.mkdir(parents=True, exist_ok=True)
@@ -671,6 +675,40 @@ def verify_chain(args):
         total = db.execute("SELECT COUNT(*) n FROM audit_events").fetchone()["n"]
     json_out({"ok": not problems, "events": total, "problems": problems})
 
+def events(args):
+    """Query the global audit event stream with filters; newest first.
+
+    Supports entity/action filters, an ISO 8601 --since/--until window
+    (normalized to UTC), a limit, and optional inline chain verification so
+    operators can confirm the ledger is intact in the same call.
+    """
+    clauses, vals = [], []
+    for col in ("entity_type", "entity_id", "action"):
+        v = getattr(args, col, None)
+        if v:
+            clauses.append(col + "=?"); vals.append(v)
+    since = _normalize_iso(getattr(args, "since", "") or "", "--since")
+    until = _normalize_iso(getattr(args, "until", "") or "", "--until")
+    if since:
+        clauses.append("created_at>=?"); vals.append(since)
+    if until:
+        clauses.append("created_at<=?"); vals.append(until)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    limit = max(0, args.limit)
+    with conn() as db:
+        total = db.execute("SELECT COUNT(*) n FROM audit_events" + where, vals).fetchone()["n"]
+        rows = [dict(r) for r in db.execute(
+            "SELECT id,entity_type,entity_id,action,payload_json,created_at,prev_hash,hash "
+            "FROM audit_events" + where + " ORDER BY id DESC LIMIT ?", (*vals, limit)).fetchall()]
+        problems = audit_chain_problems(db) if args.verify else None
+    for r in rows:
+        r["payload"] = json.loads(r.pop("payload_json"))
+    out = {"ok": True, "count": len(rows), "total_matching": total,
+           "truncated": total > len(rows), "events": rows}
+    if problems is not None:
+        out["chain"] = {"ok": not problems, "problems": problems}
+    json_out(out)
+
 def claim(args):
     with conn() as db:
         row = task_row(db, args.id)
@@ -924,6 +962,7 @@ def main():
     p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=complete)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
     p=sub.add_parser("verify-chain"); p.set_defaults(fn=verify_chain)
+    p=sub.add_parser("events"); p.add_argument("--entity-type"); p.add_argument("--entity-id"); p.add_argument("--action"); p.add_argument("--since",default=""); p.add_argument("--until",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--verify",action="store_true"); p.set_defaults(fn=events)
     p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=claim)
     p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=heartbeat)
     p=sub.add_parser("receipt"); p.add_argument("task_id"); p.add_argument("--kind",required=True); p.add_argument("--payload",default="{}"); p.set_defaults(fn=receipt)
