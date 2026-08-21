@@ -292,6 +292,49 @@ with tempfile.TemporaryDirectory() as td:
     Path(snap['path']).write_text(json.dumps(tampered, sort_keys=True))
     err = ops_fail('snapshot-check', snap['path'])
     assert '"ok": false' in err
+    # Deadlines: due_at normalizes to UTC ISO 8601; invalid timestamps rejected.
+    err = run_fail('create','--project','Verify','--title','bad due','--id','due-bad','--due-at','not-a-date')
+    assert 'invalid due-at' in err
+    run('create','--project','DueTest','--title','late thing','--id','due-1','--due-at','2020-01-01T00:00:00Z')
+    row = next(r for r in run('list') if r['id'] == 'due-1')
+    assert row['due_at'] == '2020-01-01T00:00:00+00:00', row
+    m = run('metrics')
+    assert 'due-1' in m['overdue_tasks'], m
+    assert m['due_within_24h'] >= 0
+    assert 'due-1' in {h['id'] for h in run('list','--overdue')}
+    # Deadline-aware dispatch: within a priority, earliest due_at wins; undated sort last.
+    run('create','--project','DueTest','--title','later thing','--id','due-2','--due-at','2030-01-01T00:00:00+00:00')
+    run('create','--project','DueTest','--title','undated thing','--id','due-3')
+    nx = run('next','--project','DueTest')
+    assert nx['task']['id'] == 'due-1', nx
+    got = run('next','--claim','--project','DueTest','--owner','tester','--minutes','5')
+    assert got['task']['id'] == 'due-1' and got['claimed'] is True
+    # Context pack surfaces the deadline; update can clear it.
+    ctx = run('context','due-1','--budget','4000')
+    assert ctx['task']['due_at'] == '2020-01-01T00:00:00+00:00'
+    run('update','due-2','--due-at','')
+    row = next(r for r in run('list') if r['id'] == 'due-2')
+    assert row['due_at'] == '', row
+    # Snapshot restore: disaster-recovery round trip with integrity guards.
+    snap2 = ops('snapshot')
+    err = ops_fail('snapshot-restore', snap2['path'])
+    assert 'not empty' in err, 'non-empty target must require --force'
+    res = ops('snapshot-restore', snap2['path'], '--force')
+    assert res['ok'] is True and res['restored']['tasks'] >= 1 and res['fk_violations'] == [], res
+    chain = run('verify-chain')
+    assert chain['ok'] is True and chain['problems'] == [], 'audit chain must survive restore'
+    doc = ops('doctor')
+    assert doc['ok'] is True and doc['problems'] == [], doc
+    notes_after = run('notes','mem-2')
+    assert any(n['content'] == 'MUST NOT exceed 240/min' for n in notes_after), 'note data restored'
+    row = next(r for r in run('list') if r['id'] == 'due-1')
+    assert row['status'] == 'claimed' and row['lease_owner'] == 'tester', 'lease state restored'
+    bad = Path(td) / 'bad-snap.json'
+    evil = json.loads(Path(snap2['path']).read_text())
+    evil['snapshot']['tables']['tasks'][0]['title'] = 'evil'
+    bad.write_text(json.dumps(evil, sort_keys=True))
+    err = ops_fail('snapshot-restore', str(bad), '--force')
+    assert 'integrity check failed' in err
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

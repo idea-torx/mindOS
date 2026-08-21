@@ -109,6 +109,7 @@ def morning(args=None):
     print('\nSAFE AUTOMATION: read-only reconciliation, no deploy/merge/external submission.')
 
 SNAPSHOT_TABLES = ('tasks', 'heartbeats', 'receipts', 'notes', 'task_deps', 'audit_events')
+RESTORE_ORDER = ('tasks', 'task_deps', 'heartbeats', 'receipts', 'notes', 'audit_events')
 
 def _snapshot_doc():
     data = {}
@@ -139,6 +140,51 @@ def snapshot(args=None):
         if os.path.exists(tmp): os.unlink(tmp)
     counts = {t: len(doc['snapshot']['tables'][t]) for t in SNAPSHOT_TABLES}
     print(json.dumps({'ok': True, 'path': str(out_path), 'sha256': doc['sha256'], 'counts': counts}))
+
+def _load_snapshot(path: Path):
+    """Read and integrity-check a snapshot file; returns (body, counts)."""
+    if not path.exists(): raise SystemExit(f'snapshot not found: {path}')
+    try:
+        doc = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f'snapshot is not valid JSON: {e}')
+    body = doc.get('snapshot')
+    if not body or body.get('format') != 'autopilot-snapshot-v1':
+        raise SystemExit('unrecognized snapshot format')
+    recomputed = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    if recomputed != doc.get('sha256'):
+        raise SystemExit('snapshot integrity check failed; refusing to use a tampered file')
+    return body, {t: len(body.get('tables', {}).get(t, [])) for t in SNAPSHOT_TABLES}
+
+def snapshot_restore(args):
+    """Disaster-recovery restore: rebuild the database from an integrity-checked snapshot.
+
+    Refuses to touch a non-empty target unless --force. After loading, foreign-key
+    consistency and the audit hash chain are re-verified.
+    """
+    body, counts = _load_snapshot(Path(args.path))
+    autopilot.ensure()
+    with sqlite3.connect(DB, timeout=10) as c:
+        c.row_factory = sqlite3.Row
+        existing = sum(c.execute(f'SELECT COUNT(*) n FROM {t}').fetchone()['n'] for t in SNAPSHOT_TABLES)
+        if existing and not getattr(args, 'force', False):
+            raise SystemExit(f'target database is not empty ({existing} rows); pass --force to overwrite')
+        c.execute('PRAGMA foreign_keys=OFF')
+        c.execute('BEGIN')
+        for t in RESTORE_ORDER:
+            c.execute(f'DELETE FROM {t}')
+            for row in body.get('tables', {}).get(t, []):
+                cols = list(row.keys())
+                c.execute(f'INSERT INTO {t}({",".join(cols)}) VALUES({",".join("?" * len(cols))})',
+                          [row[k] for k in cols])
+        fk_violations = [dict(r) for r in c.execute('PRAGMA foreign_key_check').fetchall()]
+        chain_problems = autopilot.audit_chain_problems(c)
+        c.commit()
+    ok = not fk_violations and not chain_problems
+    print(json.dumps({'ok': ok, 'path': str(args.path), 'restored': counts,
+                      'total_rows': sum(counts.values()),
+                      'fk_violations': fk_violations, 'audit_chain_problems': chain_problems}))
+    if not ok: sys.exit(1)
 
 def snapshot_check(args):
     """Verify a snapshot file's self-hash without touching any database."""
@@ -212,6 +258,7 @@ for name,fn in [('processes',processes),('github',github),('sentry',sentry),('mo
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)
 x=s.add_parser('snapshot-check'); x.add_argument('path'); x.set_defaults(fn=snapshot_check)
+x=s.add_parser('snapshot-restore'); x.add_argument('path'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=snapshot_restore)
 x=s.add_parser('approval'); x.add_argument('action',choices=['approve','reject','block']); x.add_argument('id'); x.add_argument('--by',default='leo'); x.add_argument('--reason',default=''); x.add_argument('--next-action',default=''); x.set_defaults(fn=approval)
 x=s.add_parser('policy'); x.add_argument('project'); x.add_argument('action'); x.set_defaults(fn=policy)
 args=p.parse_args(); args.fn(args)

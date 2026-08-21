@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS tasks (
    lease_expires_at TEXT NOT NULL DEFAULT '',
    lease_epoch INTEGER NOT NULL DEFAULT 0,
    retry_count INTEGER NOT NULL DEFAULT 0,
+   due_at TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_receipt TEXT NOT NULL DEFAULT ''
@@ -93,11 +94,25 @@ CREATE INDEX IF NOT EXISTS idx_notes_task ON notes(task_id);
 CREATE INDEX IF NOT EXISTS idx_notes_hash ON notes(task_id, content_hash);
 """
 STATUSES = {"queued", "claimed", "running", "waiting_for_agent", "waiting_for_user", "waiting_for_review", "ready_to_merge", "ready_to_deploy", "blocked", "completed", "failed", "cancelled"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 PRIORITIES = {"P0", "P1", "P2", "P3"}
 NOTE_KINDS = {"fact", "decision", "observation", "evidence", "constraint"}
 
 def now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+def _normalize_due(value: str) -> str:
+    """Normalize a user-supplied deadline to UTC ISO 8601; '' clears the deadline."""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    try:
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        raise SystemExit(f"invalid due-at timestamp: {value!r} (use ISO 8601, e.g. 2026-08-21T17:00:00+00:00)")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 def ensure() -> None:
     ROOT.mkdir(parents=True, exist_ok=True)
@@ -120,6 +135,8 @@ def _migrate(db) -> None:
     task_cols = {r[1] for r in db.execute("PRAGMA table_info(tasks)")}
     if "lease_epoch" not in task_cols:
         db.execute("ALTER TABLE tasks ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0")
+    if "due_at" not in task_cols:
+        db.execute("ALTER TABLE tasks ADD COLUMN due_at TEXT NOT NULL DEFAULT ''")
     prev = ""
     for row in db.execute("SELECT id,prev_hash,hash FROM audit_events ORDER BY id").fetchall():
         if row[2]:
@@ -306,7 +323,7 @@ def task_context(args):
     budget = max(0, args.budget)
     with conn() as db:
         row = task_row(db, args.task_id)
-        summary = {k: row[k] for k in ("id", "project", "title", "status", "priority", "next_action", "blocked_reason")}
+        summary = {k: row[k] for k in ("id", "project", "title", "status", "priority", "next_action", "blocked_reason", "due_at")}
         pending = unsatisfied_deps(db, args.task_id)
         rows = [dict(r) for r in db.execute(
             "SELECT id,kind,content,source,created_at,pinned FROM notes "
@@ -408,21 +425,24 @@ def _explain_acquire_failure(db, task_id: str, owner: str, max_active: int) -> s
 def create(args):
     task_id = args.id or f"{args.project.lower().replace(' ', '-')}-{uuid.uuid4().hex[:8]}"
     t = now()
+    due_at = _normalize_due(getattr(args, "due_at", None) or "")
     with conn() as db:
-        db.execute("INSERT INTO tasks(id,project,title,description,owner,status,priority,next_action,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (task_id,args.project,args.title,args.description,args.owner,"queued",args.priority,args.next_action,t,t))
-        audit(db, "task", task_id, "created", {"project": args.project, "owner": args.owner, "priority": args.priority})
+        db.execute("INSERT INTO tasks(id,project,title,description,owner,status,priority,next_action,due_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (task_id,args.project,args.title,args.description,args.owner,"queued",args.priority,args.next_action,due_at,t,t))
+        audit(db, "task", task_id, "created", {"project": args.project, "owner": args.owner, "priority": args.priority, "due_at": due_at})
         for dep in getattr(args, "depends_on", []) or []:
             add_dependency(db, task_id, dep)
     json_out({"ok": True, "id": task_id, "status": "queued"})
 
 def update(args):
     fields = {}
-    for key in ("status", "next_action", "blocked_reason", "worktree", "branch", "pr_url", "owner"):
+    for key in ("status", "next_action", "blocked_reason", "worktree", "branch", "pr_url", "owner", "due_at"):
         value = getattr(args, key, None)
         if value is not None:
             fields[key] = value
     if "status" in fields and fields["status"] not in STATUSES:
         raise SystemExit(f"invalid status: {fields['status']}")
+    if "due_at" in fields:
+        fields["due_at"] = _normalize_due(fields["due_at"])
     if fields.get("status") in {"completed", "failed", "cancelled"}:
         # Terminal transitions release any held lease so the task cannot look active.
         fields["lease_owner"] = ""
@@ -511,7 +531,7 @@ def next_task(args):
         vals = []
         if args.project:
             q += " AND project=?"; vals.append(args.project)
-        q += " ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END, created_at ASC"
+        q += _due_order()
         picked = None
         for r in db.execute(q, vals).fetchall():
             if not unsatisfied_deps(db, r["id"]):
@@ -611,6 +631,13 @@ def metrics(args):
             (t,))}
         receipts = db.execute("SELECT COUNT(*) n FROM receipts").fetchone()["n"]
         events = db.execute("SELECT COUNT(*) n FROM audit_events").fetchone()["n"]
+        overdue = db.execute(
+            "SELECT id FROM tasks WHERE due_at!='' AND due_at<=? AND status NOT IN ('completed','failed','cancelled') "
+            "ORDER BY due_at", (t,)).fetchall()
+        horizon = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + 24 * 3600, timezone.utc).replace(microsecond=0).isoformat()
+        due_soon = db.execute(
+            "SELECT COUNT(*) n FROM tasks WHERE due_at!='' AND due_at>? AND due_at<=? AND status NOT IN ('completed','failed','cancelled')",
+            (t, horizon)).fetchone()["n"]
         notes = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded, "
                            "SUM(CASE WHEN pinned!=0 AND superseded_by='' THEN 1 ELSE 0 END) pinned FROM notes").fetchone()
     json_out({
@@ -621,6 +648,8 @@ def metrics(args):
         "stale_leases": stale,
         "active_leases_by_owner": leases_by_owner,
         "queued_blocked_by_deps": blocked_by_deps,
+        "overdue_tasks": [r["id"] for r in overdue],
+        "due_within_24h": due_soon,
         "total_retries": retries["s"],
         "max_retries_seen": retries["m"],
         "receipts": receipts,
@@ -639,9 +668,17 @@ def list_tasks(args):
             clauses.append("status=?"); vals.append(args.status)
         if args.project:
             clauses.append("project=?"); vals.append(args.project)
+        if getattr(args, "overdue", False):
+            clauses.append("due_at!='' AND due_at<=? AND status NOT IN ('completed','failed','cancelled')")
+            vals.append(now())
         if clauses: q += " WHERE " + " AND ".join(clauses)
-        q += " ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END, updated_at DESC"
+        q += _due_order(", created_at ASC")
         json_out([dict(r) for r in db.execute(q, vals).fetchall()])
+
+def _due_order(final: str = ", updated_at DESC") -> str:
+    """Priority first, then earliest deadline (undated last), then a caller tiebreak."""
+    return (" ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END, "
+            "(due_at=''), due_at" + final)
 
 def search_tasks(args):
     """Operator search across task text fields with status/project/priority filters."""
@@ -673,27 +710,30 @@ def dashboard(args):
     waiting = len(buckets["NEEDS LEO"])
     blocked = len(buckets["BLOCKED"])
     print(f"AUTOPILOT | active:{active} needs_leo:{waiting} blocked:{blocked} can_wait:{len(buckets['CAN WAIT'])}")
+    t = now()
     for heading, items in buckets.items():
         if not items:
             continue
         print(f"\n{heading}")
         for r in items[:20]:
             extra = r["next_action"] or r["blocked_reason"] or r["pr_url"] or ""
+            if r["due_at"] and r["due_at"] <= t:
+                extra = (extra + " " if extra else "") + f"[OVERDUE due {r['due_at']}]"
             print(f"- [{r['priority']}] {r['project']} · {r['title']}" + (f" — {extra}" if extra else ""))
 
 def main():
     ap = argparse.ArgumentParser(prog="autopilot")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p=sub.add_parser("init"); p.set_defaults(fn=lambda a: (ensure(), json_out({"ok":True,"db":str(DB)})))
-    p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.set_defaults(fn=create)
-    p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.set_defaults(fn=update)
+    p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--due-at",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.set_defaults(fn=create)
+    p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.set_defaults(fn=update)
     p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=complete)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
     p=sub.add_parser("verify-chain"); p.set_defaults(fn=verify_chain)
     p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=claim)
     p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=heartbeat)
     p=sub.add_parser("receipt"); p.add_argument("task_id"); p.add_argument("--kind",required=True); p.add_argument("--payload",default="{}"); p.set_defaults(fn=receipt)
-    p=sub.add_parser("list"); p.add_argument("--status"); p.add_argument("--project"); p.set_defaults(fn=list_tasks)
+    p=sub.add_parser("list"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--overdue",action="store_true"); p.set_defaults(fn=list_tasks)
     p=sub.add_parser("show"); p.add_argument("id"); p.add_argument("--limit",type=int,default=20); p.set_defaults(fn=show)
     p=sub.add_parser("metrics"); p.set_defaults(fn=metrics)
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)

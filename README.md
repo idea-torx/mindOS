@@ -113,6 +113,25 @@ claim fails with `owner '<name>' at lease capacity (n/max)`; completing or
 releasing a lease frees capacity immediately. `metrics` reports
 `active_leases_by_owner` for observability.
 
+## Deadlines (due_at)
+
+Tasks can carry an optional UTC deadline. Dispatch honors it: within a
+priority class, the earliest deadline is picked first and undated tasks sort
+last. Overdue non-terminal tasks surface in `metrics` (`overdue_tasks`,
+`due_within_24h`), can be listed with `list --overdue`, and are flagged
+`[OVERDUE …]` on the dashboard:
+
+```bash
+python3 "$A" create --project Trove --title "Renew cert" --due-at "2026-09-01T17:00:00Z"
+python3 "$A" update <task-id> --due-at "2026-09-02T09:00:00+02:00"   # reschedule (normalized to UTC)
+python3 "$A" update <task-id> --due-at ""                            # clear the deadline
+python3 "$A" list --overdue
+```
+
+Timestamps accept any ISO 8601 form (naive values are assumed UTC) and are
+stored normalized; invalid timestamps are rejected. `context` includes
+`due_at` in the task summary so agents see deadlines in their prompt pack.
+
 ## Operator search
 
 `search` does a substring match across `id`, `project`, `title`,
@@ -149,6 +168,7 @@ python3 "$O" processes                 # list active agent processes (read-only)
 python3 "$O" morning                   # morning brief
 python3 "$O" snapshot                  # consistent JSON export of all tables, sealed with a SHA-256
 python3 "$O" snapshot-check <file>     # verify a snapshot's integrity hash (exit 1 on tampering)
+python3 "$O" snapshot-restore <file> --force   # rebuild the database from a verified snapshot
 ```
 
 `snapshot` writes an atomic, `autopilot-snapshot-v1` JSON document (default
@@ -156,6 +176,13 @@ under `~/.hermes/autopilot/backups/`) containing every table plus a self-hash,
 giving a point-in-time backup for disaster recovery without touching the live
 database. `snapshot-check` recomputes the hash and exits non-zero if the file
 was modified.
+
+`snapshot-restore` closes the recovery loop: it verifies the snapshot's
+integrity hash *before* touching anything, refuses to overwrite a non-empty
+database unless `--force` is passed, reloads every table in one transaction,
+then re-checks foreign-key consistency and the audit hash chain (exiting
+non-zero if either fails). Restores preserve audit-event ordering and lease
+state exactly as snapshotted.
 
 `recover` consumes one unit of each task's retry budget per pass. Tasks whose
 retry budget is exhausted (`retry_count > max-retries`, default 3) transition to
