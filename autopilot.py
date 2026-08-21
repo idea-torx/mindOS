@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""IdeatorX Autopilot Control Plane v1.
+
+Durable task registry, leases, heartbeats, receipts, and a compact dashboard.
+This tool intentionally does not deploy, merge, send messages, or execute work.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import uuid
+import hashlib
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(os.environ.get("HERMES_AUTOPILOT_HOME", Path.home() / ".hermes" / "autopilot"))
+DB = ROOT / "state.db"
+RECEIPTS = ROOT / "receipts"
+POLICIES = ROOT / "policies"
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  project TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  owner TEXT NOT NULL DEFAULT 'hermes',
+  status TEXT NOT NULL DEFAULT 'queued',
+  priority TEXT NOT NULL DEFAULT 'P2',
+  next_action TEXT NOT NULL DEFAULT '',
+  blocked_reason TEXT NOT NULL DEFAULT '',
+  worktree TEXT NOT NULL DEFAULT '',
+  branch TEXT NOT NULL DEFAULT '',
+  pr_url TEXT NOT NULL DEFAULT '',
+  lease_owner TEXT NOT NULL DEFAULT '',
+  lease_expires_at TEXT NOT NULL DEFAULT '',
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_receipt TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project);
+CREATE TABLE IF NOT EXISTS heartbeats (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+  owner TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'alive',
+  at TEXT NOT NULL,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS receipts (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id, created_at);
+"""
+STATUSES = {"queued", "claimed", "running", "waiting_for_agent", "waiting_for_user", "waiting_for_review", "ready_to_merge", "ready_to_deploy", "blocked", "completed", "failed", "cancelled"}
+PRIORITIES = {"P0", "P1", "P2", "P3"}
+
+def now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+def ensure() -> None:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    RECEIPTS.mkdir(exist_ok=True)
+    POLICIES.mkdir(exist_ok=True)
+    with sqlite3.connect(DB) as db:
+        db.executescript(SCHEMA)
+
+def conn() -> sqlite3.Connection:
+    ensure()
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
+
+def json_out(value) -> None:
+    print(json.dumps(value, indent=2, sort_keys=True))
+
+def audit(db, entity_type: str, entity_id: str, action: str, payload=None) -> None:
+    """Append an immutable local audit event; never include credentials in payloads."""
+    db.execute("INSERT INTO audit_events(entity_type,entity_id,action,payload_json,created_at) VALUES(?,?,?,?,?)",
+               (entity_type, entity_id, action, json.dumps(payload or {}, sort_keys=True), now()))
+
+def task_row(db, task_id: str):
+    row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if not row:
+        raise SystemExit(f"task not found: {task_id}")
+    return row
+
+def create(args):
+    task_id = args.id or f"{args.project.lower().replace(' ', '-')}-{uuid.uuid4().hex[:8]}"
+    t = now()
+    with conn() as db:
+        db.execute("INSERT INTO tasks(id,project,title,description,owner,status,priority,next_action,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (task_id,args.project,args.title,args.description,args.owner,"queued",args.priority,args.next_action,t,t))
+        audit(db, "task", task_id, "created", {"project": args.project, "owner": args.owner, "priority": args.priority})
+    json_out({"ok": True, "id": task_id, "status": "queued"})
+
+def update(args):
+    fields = {}
+    for key in ("status", "next_action", "blocked_reason", "worktree", "branch", "pr_url", "owner"):
+        value = getattr(args, key, None)
+        if value is not None:
+            fields[key] = value
+    if "status" in fields and fields["status"] not in STATUSES:
+        raise SystemExit(f"invalid status: {fields['status']}")
+    if not fields:
+        raise SystemExit("no updates supplied")
+    fields["updated_at"] = now()
+    with conn() as db:
+        task_row(db, args.id)
+        db.execute(f"UPDATE tasks SET {', '.join(k+'=?' for k in fields)} WHERE id=?", (*fields.values(), args.id))
+        audit(db, "task", args.id, "updated", {k: v for k, v in fields.items() if k != "updated_at"})
+        json_out(dict(task_row(db, args.id)))
+
+def claim(args):
+    expires = datetime.now(timezone.utc).timestamp() + args.minutes * 60
+    exp = datetime.fromtimestamp(expires, timezone.utc).replace(microsecond=0).isoformat()
+    with conn() as db:
+        row = task_row(db, args.id)
+        if row["status"] in {"completed", "cancelled"}:
+            raise SystemExit(f"cannot claim terminal task: {row['status']}")
+        if row["lease_expires_at"] and row["lease_expires_at"] > now() and row["lease_owner"] not in ("", args.owner):
+            raise SystemExit(f"lease owned by {row['lease_owner']}")
+        db.execute("UPDATE tasks SET status='claimed', lease_owner=?, lease_expires_at=?, updated_at=? WHERE id=?", (args.owner, exp, now(), args.id))
+        db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"claimed",now(),"lease claimed"))
+        audit(db, "task", args.id, "claimed", {"owner": args.owner, "lease_expires_at": exp})
+        json_out(dict(task_row(db, args.id)))
+
+def heartbeat(args):
+    with conn() as db:
+        row = task_row(db, args.id)
+        if row["lease_owner"] and row["lease_owner"] != args.owner:
+            raise SystemExit(f"lease owned by {row['lease_owner']}")
+        if row["lease_expires_at"] and row["lease_expires_at"] <= now():
+            raise SystemExit("lease expired; reclaim before heartbeat")
+        exp = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + 15 * 60, timezone.utc).replace(microsecond=0).isoformat()
+        db.execute("UPDATE tasks SET status='running', lease_owner=?, lease_expires_at=?, updated_at=? WHERE id=?", (args.owner,exp,now(),args.id))
+        db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"alive",now(),args.note))
+        audit(db, "task", args.id, "heartbeat", {"owner": args.owner, "lease_expires_at": exp})
+        json_out({"ok": True, "task_id": args.id, "status": "running", "lease_expires_at": exp, "heartbeat_at": now()})
+
+def receipt(args):
+    payload = json.loads(args.payload) if args.payload else {}
+    rid = uuid.uuid4().hex
+    created = now()
+    with conn() as db:
+        task_row(db, args.task_id)
+        db.execute("INSERT INTO receipts(id,task_id,kind,payload_json,created_at) VALUES(?,?,?,?,?)", (rid,args.task_id,args.kind,json.dumps(payload,sort_keys=True),created))
+        db.execute("UPDATE tasks SET last_receipt=?,updated_at=? WHERE id=?", (rid,created,args.task_id))
+        audit(db, "task", args.task_id, "receipt", {"receipt_id": rid, "kind": args.kind})
+    data = json.dumps({"id":rid,"task_id":args.task_id,"kind":args.kind,"created_at":created,"payload":payload}, indent=2, sort_keys=True)+"\n"
+    target = RECEIPTS / f"{rid}.json"
+    fd, tmp = tempfile.mkstemp(prefix=f".{rid}.", dir=RECEIPTS)
+    try:
+        with os.fdopen(fd, "w") as f: f.write(data); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp, 0o600); os.replace(tmp, target)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+    json_out({"ok": True, "receipt_id": rid, "task_id": args.task_id, "sha256": hashlib.sha256(data.encode()).hexdigest()})
+
+def list_tasks(args):
+    with conn() as db:
+        q = "SELECT * FROM tasks"
+        vals = []
+        clauses = []
+        if args.status:
+            clauses.append("status=?"); vals.append(args.status)
+        if args.project:
+            clauses.append("project=?"); vals.append(args.project)
+        if clauses: q += " WHERE " + " AND ".join(clauses)
+        q += " ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END, updated_at DESC"
+        json_out([dict(r) for r in db.execute(q, vals).fetchall()])
+
+def dashboard(args):
+    with conn() as db:
+        rows = [dict(r) for r in db.execute("SELECT * FROM tasks ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END, updated_at DESC").fetchall()]
+    buckets = {
+        "BLOCKED": [r for r in rows if r["status"] == "blocked"],
+        "NEEDS LEO": [r for r in rows if r["status"] in ("waiting_for_user", "waiting_for_review")],
+        "RUNNING": [r for r in rows if r["status"] in ("claimed", "running", "waiting_for_agent")],
+        "CAN WAIT": [r for r in rows if r["status"] == "queued"],
+    }
+    active = sum(len(buckets[k]) for k in ("RUNNING",))
+    waiting = len(buckets["NEEDS LEO"])
+    blocked = len(buckets["BLOCKED"])
+    print(f"AUTOPILOT | active:{active} needs_leo:{waiting} blocked:{blocked} can_wait:{len(buckets['CAN WAIT'])}")
+    for heading, items in buckets.items():
+        if not items:
+            continue
+        print(f"\n{heading}")
+        for r in items[:20]:
+            extra = r["next_action"] or r["blocked_reason"] or r["pr_url"] or ""
+            print(f"- [{r['priority']}] {r['project']} · {r['title']}" + (f" — {extra}" if extra else ""))
+
+def main():
+    ap = argparse.ArgumentParser(prog="autopilot")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p=sub.add_parser("init"); p.set_defaults(fn=lambda a: (ensure(), json_out({"ok":True,"db":str(DB)})))
+    p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--id"); p.set_defaults(fn=create)
+    p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.set_defaults(fn=update)
+    p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.set_defaults(fn=claim)
+    p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.set_defaults(fn=heartbeat)
+    p=sub.add_parser("receipt"); p.add_argument("task_id"); p.add_argument("--kind",required=True); p.add_argument("--payload",default="{}"); p.set_defaults(fn=receipt)
+    p=sub.add_parser("list"); p.add_argument("--status"); p.add_argument("--project"); p.set_defaults(fn=list_tasks)
+    p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
+    args=ap.parse_args(); args.fn(args)
+
+if __name__ == "__main__": main()

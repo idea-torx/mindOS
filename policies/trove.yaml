@@ -1,0 +1,7 @@
+project: Trove
+base_branch: staging
+worktree_required: true
+deploy_requires_user: true
+merge_requires_user: true
+sentry_resolution_requires_evidence: true
+external_side_effects_require_user: true

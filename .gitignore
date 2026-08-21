@@ -1,0 +1,17 @@
+# Live Autopilot state and machine-local artifacts
+state.db
+state.db-*
+temporal.db
+temporal.db-*
+receipts/
+__pycache__/
+*.pyc
+*.log
+*.tmp
+.env
+.env.*
+.DS_Store
+
+# Local recovery/runtime output
+runtime/
+backups/

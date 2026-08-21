@@ -1,0 +1,7 @@
+project: Gitvoice
+base_branch: main
+deploy_path: github_actions
+production_healthcheck: https://invoicer-pro.ideatorx.workers.dev/api/health
+deploy_requires_user: false
+merge_requires_user: true
+external_side_effects_require_user: true
