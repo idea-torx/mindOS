@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS receipts (
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   kind TEXT NOT NULL,
   payload_json TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  file_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS audit_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,6 +229,9 @@ def _migrate(db) -> None:
     handoff_cols = {r[1] for r in db.execute("PRAGMA table_info(handoffs)")}
     if "recall_digest" not in handoff_cols:
         db.execute("ALTER TABLE handoffs ADD COLUMN recall_digest TEXT NOT NULL DEFAULT ''")
+    receipt_cols = {r[1] for r in db.execute("PRAGMA table_info(receipts)")}
+    if "file_hash" not in receipt_cols:
+        db.execute("ALTER TABLE receipts ADD COLUMN file_hash TEXT NOT NULL DEFAULT ''")
     prev = ""
     for row in db.execute("SELECT id,prev_hash,hash FROM audit_events ORDER BY id").fetchall():
         if row[2]:
@@ -1336,12 +1340,15 @@ def receipt(args):
     payload = json.loads(args.payload) if args.payload else {}
     rid = uuid.uuid4().hex
     created = now()
+    data = json.dumps({"id":rid,"task_id":args.task_id,"kind":args.kind,"created_at":created,"payload":payload}, indent=2, sort_keys=True)+"\n"
+    # Seal the receipt file: the sha256 recorded in SQLite must match the bytes
+    # on disk, so doctor can detect silent corruption or tampering later.
+    file_hash = hashlib.sha256(data.encode()).hexdigest()
     with conn() as db:
         task_row(db, args.task_id)
-        db.execute("INSERT INTO receipts(id,task_id,kind,payload_json,created_at) VALUES(?,?,?,?,?)", (rid,args.task_id,args.kind,json.dumps(payload,sort_keys=True),created))
+        db.execute("INSERT INTO receipts(id,task_id,kind,payload_json,created_at,file_hash) VALUES(?,?,?,?,?,?)", (rid,args.task_id,args.kind,json.dumps(payload,sort_keys=True),created,file_hash))
         db.execute("UPDATE tasks SET last_receipt=?,updated_at=? WHERE id=?", (rid,created,args.task_id))
         audit(db, "task", args.task_id, "receipt", {"receipt_id": rid, "kind": args.kind})
-    data = json.dumps({"id":rid,"task_id":args.task_id,"kind":args.kind,"created_at":created,"payload":payload}, indent=2, sort_keys=True)+"\n"
     target = RECEIPTS / f"{rid}.json"
     fd, tmp = tempfile.mkstemp(prefix=f".{rid}.", dir=RECEIPTS)
     try:
@@ -1349,7 +1356,7 @@ def receipt(args):
         os.chmod(tmp, 0o600); os.replace(tmp, target)
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
-    json_out({"ok": True, "receipt_id": rid, "task_id": args.task_id, "sha256": hashlib.sha256(data.encode()).hexdigest()})
+    json_out({"ok": True, "receipt_id": rid, "task_id": args.task_id, "sha256": file_hash})
 
 def show(args):
     with conn() as db:

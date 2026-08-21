@@ -441,8 +441,18 @@ def doctor(args=None):
         indexed = set()
         for r in c.execute("SELECT id FROM receipts"):
             indexed.add(r['id'])
-            if not (autopilot.RECEIPTS / f"{r['id']}.json").exists():
+            p = autopilot.RECEIPTS / f"{r['id']}.json"
+            if not p.exists():
                 problems.append({'kind': 'receipt_file_missing', 'receipt_id': r['id']})
+                continue
+            # Tamper-evident receipts: rows sealed with a file_hash must match
+            # the bytes on disk. Legacy unsealed rows (file_hash='') are skipped.
+            sealed = c.execute("SELECT file_hash FROM receipts WHERE id=?", (r['id'],)).fetchone()
+            if sealed and sealed['file_hash']:
+                actual = hashlib.sha256(p.read_bytes()).hexdigest()
+                if actual != sealed['file_hash']:
+                    problems.append({'kind': 'receipt_file_hash_mismatch', 'receipt_id': r['id'],
+                                     'expected_sha256': sealed['file_hash'], 'actual_sha256': actual})
         if autopilot.RECEIPTS.exists():
             for p in autopilot.RECEIPTS.glob('*.json'):
                 if p.stem not in indexed:
@@ -485,6 +495,76 @@ def doctor(args=None):
                     problems.append({'kind': 'fts_index_drift', 'table': table, 'rows': src, 'indexed': idx})
     print(json.dumps({'ok': not problems, 'problems': problems, 'count': len(problems)}, sort_keys=True))
 
+def handoff_check(args=None):
+    """Protocol lint over live handoffs: enforce the handoff contract read-only.
+
+    The handoff protocol promises that every durable handoff carries an
+    objective, is addressed to a recipient, carries verified evidence or next
+    actions, and — when it cites a `--recall-digest` — that the cited context
+    is still fresh. Nothing enforces those promises today; this sweep turns
+    violations into observable problems instead of silent drift:
+
+    - unaddressed: no to_agent, so no inbox will ever surface it;
+    - missing_objective: the resume point has no stated goal;
+    - sparse: neither evidence nor next_actions (a self-report without proof);
+    - unproven_recall_digest: the handoff cites a --recall-digest that never
+      appears in the audited `context_recalled` stream — a fabricated or
+      mistyped citation (self-report without proof);
+    - older_than_latest_recall: the cited digest was genuinely recalled but a
+      newer `recall` for the task has been audited since, so the handoff may
+      have been written against outdated context;
+    - terminal_task_handoff: a live handoff on a completed/failed/cancelled
+      task — stale recovery bait.
+
+    Read-only: reports problems, never mutates. Digest freshness relative to
+    *current* durable state is `recall-verify`'s job; this lint checks
+    provenance (was it really recalled, and is it the latest recall).
+    """
+    t = utc()
+    problems = []
+    with db() as c:
+        q = ("SELECT h.id,h.task_id,h.to_agent,h.objective,h.evidence,h.next_actions,"
+             "h.recall_digest,t.status AS task_status FROM handoffs h "
+             "JOIN tasks t ON t.id=h.task_id WHERE h.superseded_by=''")
+        vals = []
+        if getattr(args, 'task', ''):
+            q += " AND h.task_id=?"
+            vals.append(args.task)
+        for r in c.execute(q + " ORDER BY h.created_at DESC", vals).fetchall():
+            reasons = []
+            if not r['to_agent'].strip():
+                reasons.append('unaddressed')
+            if not r['objective'].strip():
+                reasons.append('missing_objective')
+            try:
+                evidence = json.loads(r['evidence'] or '[]')
+                next_actions = json.loads(r['next_actions'] or '[]')
+            except json.JSONDecodeError:
+                evidence, next_actions = [], []
+            if not evidence and not next_actions:
+                reasons.append('sparse_no_evidence_or_next_actions')
+            if r['recall_digest']:
+                proven = c.execute(
+                    "SELECT 1 FROM audit_events WHERE entity_type='task' AND entity_id=? "
+                    "AND action='context_recalled' AND payload_json LIKE ? LIMIT 1",
+                    (r['task_id'], '%"digest": "' + r['recall_digest'] + '"%')).fetchone()
+                if not proven:
+                    reasons.append('unproven_recall_digest')
+                else:
+                    latest = c.execute(
+                        "SELECT payload_json FROM audit_events WHERE entity_type='task' "
+                        "AND entity_id=? AND action='context_recalled' "
+                        "ORDER BY id DESC LIMIT 1", (r['task_id'],)).fetchone()
+                    if latest and json.loads(latest['payload_json']).get('digest') != r['recall_digest']:
+                        reasons.append('older_than_latest_recall')
+            if r['task_status'] in ('completed', 'failed', 'cancelled'):
+                reasons.append('terminal_task_handoff')
+            if reasons:
+                problems.append({'handoff_id': r['id'], 'task_id': r['task_id'],
+                                 'reasons': sorted(reasons)})
+    print(json.dumps({'ok': not problems, 'generated_at': t,
+                      'problems': problems, 'count': len(problems)}, sort_keys=True))
+
 def policy(args):
     path=Path.home()/'.hermes/autopilot/policies'/f'{args.project.lower()}.yaml'
     if not path.exists(): print(json.dumps({'allowed':False,'reason':'no project policy'})); return
@@ -496,6 +576,7 @@ import argparse
 p=argparse.ArgumentParser(); s=p.add_subparsers(dest='cmd',required=True)
 for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning),('doctor',doctor)]:
  x=s.add_parser(name); x.set_defaults(fn=fn)
+x=s.add_parser('handoff-check'); x.add_argument('--task',default=''); x.set_defaults(fn=handoff_check)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--backoff-base',type=int,default=60); x.add_argument('--backoff-cap',type=int,default=3600); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('escalate'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=escalate)
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)

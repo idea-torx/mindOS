@@ -241,6 +241,33 @@ state — title, status, priority, lease owner/liveness — plus the handoff's
 triage its inbound work without a follow-up `show` per task. The natural loop
 is: `handoff-inbox` → `resume <task-id> --agent me` → act → publish a receipt.
 
+## Handoff protocol lint (handoff-check)
+
+The handoff protocol makes promises — an objective, a recipient, evidence or
+next actions, and recall provenance when `--recall-digest` is cited.
+`ops.py handoff-check` is the read-only enforcement sweep that turns violations
+into observable problems instead of silent drift:
+
+```bash
+python3 ops.py handoff-check                 # lint every live handoff fleet-wide
+python3 ops.py handoff-check --task <task-id>   # scope to one task
+```
+
+Reported reasons:
+
+- `unaddressed` — no `to_agent`, so no inbox will ever surface it
+- `missing_objective` — the resume point has no stated goal
+- `sparse_no_evidence_or_next_actions` — a self-report without proof
+- `unproven_recall_digest` — the cited digest never appears in the audited
+  `context_recalled` stream (fabricated or mistyped citation)
+- `older_than_latest_recall` — genuinely recalled, but a newer `recall` for
+  the task has been audited since, so the handoff may rest on stale context
+- `terminal_task_handoff` — live handoff on a completed/failed/cancelled task
+
+Provenance is checked against the audit ledger, not recomputed digests, so
+routine lease renewals and the handoff's own recording never false-positive;
+fine-grained freshness against *current* state remains `recall-verify`'s job.
+
 ## Retrieval-augmented context packs
 
 `context --related N` turns the pack into cross-task RAG: up to N live notes
@@ -620,7 +647,12 @@ Terminal states are `completed`, `failed`, and `cancelled`.
 
 ## Receipts
 
-Receipts are stored in `receipts/` and indexed in SQLite. A completed engineering task should carry evidence such as:
+Receipts are stored in `receipts/` and indexed in SQLite. Every new receipt is
+**integrity-sealed**: the row carries a `file_hash` (sha256 of the exact file
+bytes, also printed by the `receipt` command), and `ops.py doctor` re-verifies
+each sealed file so silent corruption or tampering surfaces as a
+`receipt_file_hash_mismatch` problem. Rows created before sealing
+(`file_hash=''`) are skipped by the check. A completed engineering task should carry evidence such as:
 
 - test/typecheck result
 - commit SHA

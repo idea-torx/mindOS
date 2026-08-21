@@ -847,6 +847,62 @@ with tempfile.TemporaryDirectory() as td:
     assert all(c['task_id'] != 'sla-4' for c in esc3['escalated']), esc3
     chain = run('verify-chain')
     assert chain['ok'] is True, 'escalation audits must keep the chain intact'
+    # Receipt integrity sealing: file_hash recorded in SQLite must match disk bytes.
+    import hashlib
+    run('create','--project','Verify','--title','sealed evidence','--id','seal-1')
+    sr = run('receipt','seal-1','--kind','verification','--payload','{"checks": 42}')
+    sfile = Path(td) / 'receipts' / (sr['receipt_id'] + '.json')
+    sdigest = hashlib.sha256(sfile.read_bytes()).hexdigest()
+    assert sr['sha256'] == sdigest, 'printed sha256 must match the sealed file bytes'
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        stored = db.execute("SELECT file_hash FROM receipts WHERE id=?", (sr['receipt_id'],)).fetchone()[0]
+    assert stored == sdigest, 'receipt row must carry the file hash'
+    # Doctor detects silent receipt corruption or tampering...
+    orig = sfile.read_bytes()
+    sfile.write_bytes(orig.replace(b'"checks": 42', b'"checks": 43'))
+    doc = ops('doctor')
+    assert any(p['kind'] == 'receipt_file_hash_mismatch' and p['receipt_id'] == sr['receipt_id']
+               for p in doc['problems']), doc
+    # ...and is clean again once the original bytes are restored.
+    sfile.write_bytes(orig)
+    doc = ops('doctor')
+    assert doc['ok'] is True and doc['problems'] == [], doc
+    # Handoff protocol lint: contract violations become observable problems.
+    run('create','--project','Verify','--title','lint host','--id','hc-1')
+    bad = run('handoff','hc-1','--from-agent','rogue')      # sparse + unaddressed
+    chk = ops('handoff-check','--task','hc-1')
+    assert chk['ok'] is False and chk['count'] == 1, chk
+    assert chk['problems'][0]['handoff_id'] == bad['id'] and chk['problems'][0]['task_id'] == 'hc-1'
+    assert set(chk['problems'][0]['reasons']) == {
+        'unaddressed', 'missing_objective', 'sparse_no_evidence_or_next_actions'}, chk
+    # A provenance-clean handoff passes: cited digest was genuinely recalled.
+    rec_hc = run('recall','hc-1','--agent','codex')
+    good = run('handoff','hc-1','--from-agent','codex','--to-agent','claude-code',
+               '--objective','finish the retry path','--evidence','tests pass locally',
+               '--next-action','open PR','--recall-digest',rec_hc['digest'])
+    assert good['superseded'] == bad['id'], good
+    chk = ops('handoff-check','--task','hc-1')
+    assert chk['ok'] is True and chk['problems'] == [], chk
+    # A newer recall audited after the cited one flags the handoff as outdated.
+    run('recall','hc-1','--agent','claude-code')
+    chk = ops('handoff-check','--task','hc-1')
+    assert chk['problems'][0]['reasons'] == ['older_than_latest_recall'], chk
+    # A fabricated digest (never recalled) is called out as unproven.
+    fab = run('handoff','hc-1','--from-agent','codex','--to-agent','opencode',
+              '--objective','suspect handoff','--next-action','verify first',
+              '--recall-digest','f'*64)
+    chk = ops('handoff-check','--task','hc-1')
+    assert chk['problems'][0]['reasons'] == ['unproven_recall_digest'], chk
+    # Live handoffs on terminal tasks are stale recovery bait.
+    run('claim','hc-1','--owner','codex','--minutes','5')
+    run('complete','hc-1','--owner','codex','--note','done')
+    chk = ops('handoff-check','--task','hc-1')
+    assert set(chk['problems'][0]['reasons']) == {'terminal_task_handoff',
+                                                  'unproven_recall_digest'}, chk
+    # --task scoping keeps other tasks' live handoffs out of the report.
+    assert all(p['task_id'] == 'hc-1' for p in chk['problems'])
+    doc = ops('doctor')
+    assert doc['ok'] is True and doc['problems'] == [], doc
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
