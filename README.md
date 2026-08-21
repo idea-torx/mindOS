@@ -1455,7 +1455,50 @@ Design rules, enforced and tested:
   (e.g. intentionally dangling dep edges) are baselined before the import and
   reported separately instead of falsely failing the migration.
 - **Sealed result**: `--out` writes an sha256-sealed
-  `autopilot-migration-result-v1` document for operator records.
+  `autopilot-migration-result-v1` document for operator records — which now
+  doubles as the rollback journal (see next section).
+
+## Migration rollback (installer stage three)
+
+Every `migrate-import --apply --out` now seals a **rollback journal** inside
+the result document: exactly the rows it inserted per table (with each row's
+content hash at insert time), the audit event ids it merged, and the receipt
+files it restored. `migrate-rollback` consumes that journal to undo the
+import precisely — not "delete everything that looks migrated", but delete
+exactly what that apply added:
+
+```bash
+python3 "$O" migrate-rollback migration-result.json           # dry-run plan
+python3 "$O" migrate-rollback migration-result.json --apply   # undo it
+```
+
+Design rules, enforced and tested:
+
+- **Dry-run first**: without `--apply` nothing is written; the plan lists
+  rows it would remove, what is already gone, audit events and receipt files
+  in scope, plus any drift or local dependents that would demand `--force`.
+- **Fail-closed on changed truth**: a row whose content hash differs from its
+  insert-time journal hash has become live local execution truth since the
+  import — rolling it back would destroy someone's newer work, so the
+  rollback refuses naming the drifted rows. Local rows that were never
+  imported but depend on an imported task (a note an agent wrote afterwards,
+  a dep edge added locally) block the same way. `--force` is the explicit
+  override: drifted rows and dependents cascade away with the task, and the
+  audited `migration_rollback_applied` event records that it was forced.
+- **Chain integrity**: removed audit events leave no gaps in tamper evidence
+  — the ledger is relinked into a continuous chain and must verify
+  (`verify-chain`) before the rollback reports success.
+- **Receipt files**: deleted only while they still match their sealed hash;
+  a locally changed file is kept and reported as withheld rather than
+  destroyed.
+- **Idempotent**: re-running against an already-rolled-back home deduplicates
+  to nothing; the sealed document itself is verified before use, so a
+  tampered or hand-edited result doc is refused; documents from imports run
+  before journals existed are refused with a clear regeneration hint.
+
+The full installer lifecycle is therefore: `init` → `migrate-inventory` →
+`migrate-import --apply --out` → (verify) → optional `migrate-rollback`,
+each stage dry-run-first, sealed, and independently re-runnable.
 
 ## Next integration
 

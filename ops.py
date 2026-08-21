@@ -1738,6 +1738,11 @@ def migrate_import(args=None):
         try:
             tgt.execute('BEGIN')
             inserted, skipped_existing = {}, {}
+            # Rollback journal: exactly what this apply inserted, with the
+            # content hash of every row at insert time, so a later
+            # migrate-rollback can undo this import precisely — and refuse
+            # when a row has since become live local execution truth.
+            journal = {t: {'cols': cols[t], 'keys': [], 'hashes': {}} for t in _MIGRATION_TABLES}
             for t in _MIGRATION_TABLES:
                 n = 0
                 for r in rows[t]:
@@ -1745,6 +1750,12 @@ def migrate_import(args=None):
                         f'INSERT OR IGNORE INTO {t}({",".join(cols[t])}) '
                         f'VALUES({",".join("?" * len(cols[t]))})',
                         [r[c_] for c_ in cols[t]])
+                    if cur.rowcount:
+                        key = [r['task_id'], r['depends_on']] if t == 'task_deps' else r['id']
+                        kj = json.dumps(key, sort_keys=True)
+                        journal[t]['keys'].append(key)
+                        journal[t]['hashes'][kj] = hashlib.sha256(json.dumps(
+                            [r[c_] for c_ in cols[t]], sort_keys=True).encode()).hexdigest()
                     n += cur.rowcount
                 inserted[t] = n
                 skipped_existing[t] = len(rows[t]) - n
@@ -1753,6 +1764,7 @@ def migrate_import(args=None):
                 audit_offset = tgt.execute(
                     'SELECT COALESCE(MAX(id),0) FROM audit_events').fetchone()[0]
             audit_imported = 0
+            journal_audit_ids = []
             for r in src_audit:
                 # Per-event content twin: an event already absorbed by a prior
                 # import (verbatim or relink-shifted) is skipped rather than
@@ -1769,6 +1781,8 @@ def migrate_import(args=None):
                     'payload_json,created_at,prev_hash,hash) VALUES(?,?,?,?,?,?,?,?)',
                     (r['id'] + audit_offset, r['entity_type'], r['entity_id'], r['action'],
                      r['payload_json'], r['created_at'], r['prev_hash'], r['hash']))
+                if cur.rowcount:
+                    journal_audit_ids.append(r['id'] + audit_offset)
                 audit_imported += cur.rowcount
             autopilot.audit(tgt, 'system', sid, 'migration_import_applied',
                             {'inventory_sha256': inv['sha256'], 'source_id': sid,
@@ -1788,6 +1802,7 @@ def migrate_import(args=None):
         # Restore verification: receipt files reappear here exactly as sealed,
         # byte-checked against the file_hash recorded in each imported row.
         written, hash_mismatches = 0, []
+        journal_receipt_files = []
         src_receipts = db_path.parent / 'receipts'
         for r in rows['receipts']:
             rid = r['id']
@@ -1810,6 +1825,7 @@ def migrate_import(args=None):
                 os.chmod(tmp, 0o600)
                 os.replace(tmp, str(target_file))
                 written += 1
+                journal_receipt_files.append({'id': rid, 'file_hash': r.get('file_hash', '')})
             finally:
                 if os.path.exists(tmp): os.unlink(tmp)
         health_problems = []
@@ -1842,6 +1858,8 @@ def migrate_import(args=None):
             'heartbeats_skipped_disposable': hb_count,
             'receipt_files_written': written,
             **({'receipt_files_withheld': withheld_receipts} if withheld_receipts else {}),
+            'rollback': {'tables': journal, 'audit_event_ids': sorted(journal_audit_ids),
+                         'receipt_files': journal_receipt_files},
             'health': {'problems': health_problems, 'coverage': coverage,
                        'chain_problem_count': len(chain_problems),
                        'pre_existing_fk_violations': pre_existing_fk}}
@@ -1874,6 +1892,179 @@ def migrate_import(args=None):
             tgt.close()
         except Exception:
             pass
+
+def _load_result_doc(path: Path):
+    """Load and seal-verify a sealed autopilot-migration-result-v1 document."""
+    doc = json.loads(path.read_text())
+    if doc.get('format') != MIGRATION_RESULT_FORMAT:
+        raise SystemExit(f'not a {MIGRATION_RESULT_FORMAT} document: {path}')
+    body = {k: v for k, v in doc.items() if k not in ('sha256', 'format', 'created_at')}
+    if hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest() != doc.get('sha256'):
+        raise SystemExit('integrity check failed: result document seal does not match its content')
+    return doc
+
+def migrate_rollback(args=None):
+    """Undo a migration import, precisely and fail-closed.
+
+    Stage three of the installer/migrator: consumes the sealed rollback
+    journal a prior `migrate-import --apply --out` recorded — exactly the
+    rows it inserted (with their content hashes at insert time), the audit
+    events it merged, and the receipt files it restored. Dry-run is the
+    default. Refuses when an imported row has drifted since import (it is
+    now live local execution truth someone changed) or when local rows that
+    were never imported depend on an imported task; --force is the explicit
+    override and cascades those dependents away with the task. Removed
+    audit events are relinked into a continuous chain, receipt files are
+    deleted only when they still match their sealed hash (locally changed
+    files are withheld and reported), re-runs deduplicate to nothing, and
+    a post-rollback health report exits non-zero on any problem.
+    """
+    doc = _load_result_doc(Path(args.result))
+    if not doc.get('applied'):
+        raise SystemExit('this result document records a dry-run; nothing was applied')
+    rb = doc.get('rollback')
+    if not isinstance(rb, dict) or 'tables' not in rb:
+        raise SystemExit(
+            'result document carries no rollback journal; re-run the import with --out '
+            'to regenerate one before rolling back')
+    dry = not getattr(args, 'apply', False)
+    force = bool(getattr(args, 'force', False))
+    autopilot.ensure()
+    c = sqlite3.connect(DB, timeout=10)
+    c.row_factory = sqlite3.Row
+    c.execute('PRAGMA foreign_keys=ON')
+    try:
+        present, gone, drift = {}, {}, []
+        for t in _MIGRATION_TABLES:
+            jcols = rb['tables'][t].get('cols') or _MIGRATION_REQUIRED_COLS[t]
+            for key in rb['tables'][t]['keys']:
+                kj = json.dumps(key, sort_keys=True)
+                if t == 'task_deps':
+                    row = c.execute('SELECT * FROM task_deps WHERE task_id=? AND depends_on=?',
+                                    tuple(key)).fetchone()
+                else:
+                    row = c.execute(f'SELECT * FROM {t} WHERE id=?', (key,)).fetchone()
+                if row is None:
+                    gone.setdefault(t, []).append(key)
+                    continue
+                present.setdefault(t, []).append(key)
+                h = hashlib.sha256(json.dumps(
+                    [row[c_] for c_ in jcols if c_ in row.keys()], sort_keys=True).encode()).hexdigest()
+                if h != rb['tables'][t]['hashes'].get(kj):
+                    drift.append({'table': t, 'key': key})
+        # Local rows that were never imported but reference imported tasks:
+        # removing the task would cascade them away, so they block by default.
+        journal_ids = {t: {json.dumps(k, sort_keys=True) for k in rb['tables'][t]['keys']}
+                       for t in _MIGRATION_TABLES}
+        task_keys = [k[0] if isinstance(k, list) else k for k in rb['tables']['tasks']['keys']]
+        blockers = []
+        for tid in task_keys:
+            for t in ('notes', 'handoffs', 'receipts'):
+                for r in c.execute(f'SELECT id FROM {t} WHERE task_id=?', (tid,)):
+                    if json.dumps(r['id'], sort_keys=True) not in journal_ids[t]:
+                        blockers.append({'table': t, 'id': r['id'], 'task_id': tid})
+            for r in c.execute(
+                    'SELECT task_id,depends_on FROM task_deps WHERE task_id=? OR depends_on=?',
+                    (tid, tid)):
+                if json.dumps([r['task_id'], r['depends_on']], sort_keys=True) \
+                        not in journal_ids['task_deps']:
+                    blockers.append({'table': 'task_deps',
+                                     'key': [r['task_id'], r['depends_on']], 'task_id': tid})
+        plan = {
+            'ok': True, 'dry_run': True, 'source_id': doc.get('source_id'),
+            'result_doc': str(args.result),
+            'would_remove': {t: present.get(t, []) for t in _MIGRATION_TABLES},
+            'already_removed': {t: len(gone.get(t, [])) for t in _MIGRATION_TABLES},
+            'audit_events_would_remove': sum(
+                1 for aid in rb.get('audit_event_ids', [])
+                if c.execute('SELECT 1 FROM audit_events WHERE id=?', (aid,)).fetchone()),
+            'receipt_files_would_delete': [
+                f['id'] for f in rb.get('receipt_files', [])
+                if (autopilot.RECEIPTS / f"{f['id']}.json").exists()],
+            'drifted_rows': drift, 'local_dependents': blockers,
+            'force_required': bool(drift or blockers)}
+        if dry:
+            print(json.dumps(plan, sort_keys=True))
+            return
+        if (drift or blockers) and not force:
+            detail = '; '.join(
+                [f"drifted: {d['table']} {d['key']}" for d in drift]
+                + [f"local dependent: {b['table']} {b.get('id') or b.get('key')} -> {b['task_id']}"
+                   for b in blockers])
+            raise SystemExit(
+                'refusing to roll back changed execution truth'
+                + (' (pass --force to cascade it away anyway)' if not force else '')
+                + f': {detail}')
+        try:
+            c.execute('BEGIN')
+            removed = {}
+            n = 0
+            for key in rb['tables']['task_deps']['keys']:
+                n += c.execute('DELETE FROM task_deps WHERE task_id=? AND depends_on=?',
+                               tuple(key)).rowcount
+            removed['task_deps'] = n
+            for t in ('receipts', 'notes', 'handoffs'):
+                n = 0
+                for key in rb['tables'][t]['keys']:
+                    cur = c.execute(f'DELETE FROM {t} WHERE id=?', (key,))
+                    n += cur.rowcount
+                removed[t] = n
+            n = 0
+            for key in rb['tables']['tasks']['keys']:
+                cur = c.execute('DELETE FROM tasks WHERE id=?', (key,))
+                n += cur.rowcount
+            removed['tasks'] = n
+            audit_removed = 0
+            for aid in rb.get('audit_event_ids', []):
+                cur = c.execute('DELETE FROM audit_events WHERE id=?', (aid,))
+                audit_removed += cur.rowcount
+            if audit_removed:
+                _rechain_audit(c)
+            autopilot.audit(c, 'system', doc.get('source_id', ''), 'migration_rollback_applied',
+                            {'result_doc_sha256': doc.get('sha256'),
+                             'source_id': doc.get('source_id'),
+                             'removed': removed, 'audit_events_removed': audit_removed,
+                             'forced': force})
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+        # Receipt files: delete only what this import wrote and only while it
+        # still matches its sealed hash; locally changed files are kept and
+        # reported rather than destroyed.
+        deleted_files, withheld_files = [], []
+        for f in rb.get('receipt_files', []):
+            path = autopilot.RECEIPTS / f"{f['id']}.json"
+            if not path.exists():
+                continue
+            text = path.read_text()
+            expected = f.get('file_hash', '')
+            if expected and hashlib.sha256(text.encode()).hexdigest() != expected:
+                withheld_files.append(f['id'])
+                continue
+            path.unlink()
+            deleted_files.append(f['id'])
+        health_problems = []
+        if c.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+            health_problems.append('integrity_check failed on the target database')
+        chain_problems = autopilot.audit_chain_problems(c)
+        health_problems += [f'audit chain: {p}' for p in chain_problems]
+        result = {
+            'ok': not health_problems, 'rolled_back': True,
+            'source_id': doc.get('source_id'), 'removed': removed,
+            'already_removed': {t: len(gone.get(t, [])) for t in _MIGRATION_TABLES},
+            'audit_events_removed': audit_removed,
+            **({'cascade_removed': len(blockers)} if force and blockers else {}),
+            'receipt_files_deleted': deleted_files,
+            **({'receipt_files_withheld': withheld_files} if withheld_files else {}),
+            'health': {'problems': health_problems,
+                       'chain_problem_count': len(chain_problems)}}
+        print(json.dumps(result, sort_keys=True))
+        if health_problems:
+            sys.exit('migration rollback failed its health check:\n  '
+                     + '\n  '.join(health_problems))
+    finally:
+        c.close()
 
 def policy(args):
     path=Path.home()/'.hermes/autopilot/policies'/f'{args.project.lower()}.yaml'
@@ -1910,4 +2101,5 @@ x=s.add_parser('policy'); x.add_argument('project'); x.add_argument('action'); x
 x=s.add_parser('migrate-inventory'); x.add_argument('--root',required=True); x.add_argument('--out',default=None); x.set_defaults(fn=migrate_inventory)
 x=s.add_parser('migrate-inventory-check'); x.add_argument('path'); x.set_defaults(fn=migrate_inventory_check)
 x=s.add_parser('migrate-import'); x.add_argument('--inventory',required=True); x.add_argument('--source-id',dest='source_id',required=True); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--out',default=None,help='write a sealed autopilot-migration-result-v1 document'); x.add_argument('--redact',action='store_true'); x.add_argument('--allow-secret',action='store_true'); x.add_argument('--relink-audit',dest='relink_audit',action='store_true',help='merge into a non-empty audit ledger and relink the combined chain'); x.set_defaults(fn=migrate_import)
+x=s.add_parser('migrate-rollback'); x.add_argument('result'); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--force',action='store_true',help='cascade away drifted rows and local dependents of imported tasks'); x.set_defaults(fn=migrate_rollback)
 args=p.parse_args(); args.fn(args)

@@ -2120,6 +2120,72 @@ with tempfile.TemporaryDirectory() as td:
         'SELECT content FROM notes').fetchone()[0]
     assert '[REDACTED:aws_access_key]' in note_content, note_content
     assert 'AKIAIOSFODNN7EXAMPLE' not in note_content          # value never crosses the boundary
+    # Migration rollback: stage three of the installer/migrator. A sealed
+    # apply writes a rollback journal (exact rows + insert-time hashes,
+    # merged audit event ids, restored receipt files); migrate-rollback
+    # consumes it dry-run first, refuses drifted rows and local dependents
+    # fail-closed (--force cascades deliberately), relinks the audit chain,
+    # keeps locally changed receipt files, and deduplicates re-runs.
+    rdoc = json.loads((Path(td) / 'migration-result.json').read_text())
+    assert set(rdoc['rollback']['tables']['tasks']['keys']) == {'mig-1', 'mig-2'}, rdoc
+    def mroll(*a, fail=False):
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-rollback',
+                            str(Path(td) / 'migration-result.json'), *a],
+                           env=tenv, text=True, capture_output=True)
+        if fail:
+            assert p.returncode != 0, ('expected refusal', a, p.stdout, p.stderr)
+            return p.stdout + p.stderr
+        assert p.returncode == 0, (a, p.stdout, p.stderr)
+        return json.loads(p.stdout)
+    tdoc = json.loads((Path(td) / 'migration-result.json').read_text())
+    tdoc['sources'] = 'tampered'
+    tamp = Path(td) / 'migration-result-tampered.json'
+    tamp.write_text(json.dumps(tdoc, sort_keys=True))
+    err = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-rollback',
+                          str(tamp)], env=tenv, text=True, capture_output=True)
+    assert err.returncode != 0 and 'integrity check failed' in err.stdout + err.stderr
+    plan = mroll()
+    assert plan['dry_run'] is True and plan['would_remove']['tasks'] == ['mig-1', 'mig-2'], plan
+    assert rid in plan['receipt_files_would_delete'], plan
+    assert plan['force_required'] is False and plan['drifted_rows'] == [], plan
+    assert sqlite3.connect(tgt / 'state.db').execute(
+        "SELECT COUNT(*) FROM tasks WHERE id LIKE 'mig-%'").fetchone()[0] == 2   # dry-run touched nothing
+    raw = sqlite3.connect(tgt / 'state.db')
+    raw.execute("UPDATE tasks SET title='locally edited' WHERE id='mig-1'"); raw.commit(); raw.close()
+    dplan = mroll()
+    assert dplan['drifted_rows'] == [{'table': 'tasks', 'key': 'mig-1'}], dplan
+    err = mroll('--apply', fail=True)
+    assert 'refusing to roll back changed execution truth' in err and 'drifted' in err, err
+    raw = sqlite3.connect(tgt / 'state.db')
+    raw.execute("UPDATE tasks SET title='carried work' WHERE id='mig-1'"); raw.commit(); raw.close()
+    hrun(tenv, 'note', 'mig-1', '--content', 'local follow-up written after import')
+    err = mroll('--apply', fail=True)
+    assert 'local dependent' in err and '--force' in err, err   # never-imported child blocks removal
+    rb = mroll('--apply', '--force')
+    assert rb['ok'] is True and rb['removed']['tasks'] == 2, rb
+    assert rb['removed']['notes'] == 1, rb                      # imported note removed by journal
+    assert rb['cascade_removed'] == 1, rb                       # local dependent cascaded with --force
+    assert rb['receipt_files_deleted'] == [rid], rb             # byte-exact file removed with its row
+    assert rb['audit_events_removed'] > 0 and rb['health']['problems'] == [], rb
+    con = sqlite3.connect(tgt / 'state.db')
+    assert con.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    assert con.execute("SELECT COUNT(*) FROM receipts").fetchone()[0] == 0
+    acts = {r[0] for r in con.execute('SELECT action FROM audit_events')}
+    con.close()
+    assert 'migration_rollback_applied' in acts and 'migration_import_applied' in acts, acts
+    assert not (tgt / 'receipts' / f'{rid}.json').exists()
+    assert hrun(tenv, 'verify-chain')['ok'] is True             # chain relinked over removed events
+    rb2 = mroll('--apply')
+    assert all(v == 0 for v in rb2['removed'].values()) and rb2['audit_events_removed'] == 0, rb2
+    stale = json.loads((Path(td) / 'migration-result.json').read_text())
+    stale.pop('rollback')
+    body = {k: v for k, v in stale.items() if k not in ('sha256', 'format', 'created_at')}
+    stale['sha256'] = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    oldfmt = Path(td) / 'migration-result-oldfmt.json'
+    oldfmt.write_text(json.dumps(stale, sort_keys=True))
+    err = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-rollback',
+                          str(oldfmt)], env=tenv, text=True, capture_output=True)
+    assert err.returncode != 0 and 'no rollback journal' in err.stdout + err.stderr
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
