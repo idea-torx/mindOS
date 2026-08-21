@@ -565,21 +565,27 @@ def _redact_doc(node):
         return [_redact_doc(v) for v in node]
     return node
 
-def _apply_workorder_secret_policy(tables, redact, allow, task_id, action):
+def _apply_workorder_secret_policy(tables, redact, allow, task_id, action, conn=None):
     """Shared privacy boundary for export/import: block by default, redact or
-    allow explicitly. Returns (kinds, tables_after). Audits the decision."""
+    allow explicitly. Returns (kinds, tables_after). Audits the decision.
+
+    `conn` lets the caller share its own database connection: opening a fresh
+    one here and never closing it left a second live writer in the same
+    process, which on slow CI disks locked the caller's next audit write out
+    of the database."""
     kinds = sorted(_doc_secret_kinds(tables))
     if not kinds:
         return [], tables
+    ac = conn if conn is not None else autopilot.conn()
     if allow:
-        autopilot.audit(autopilot.conn(), 'task', task_id, 'secret_allowed',
+        autopilot.audit(ac, 'task', task_id, 'secret_allowed',
                         {'fields': ['workorder'], 'kinds': kinds})
         return kinds, tables
     if redact:
-        autopilot.audit(autopilot.conn(), 'task', task_id, 'secret_redacted',
+        autopilot.audit(ac, 'task', task_id, 'secret_redacted',
                         {'fields': ['workorder'], 'kinds': kinds})
         return kinds, _redact_doc(tables)
-    autopilot.audit(autopilot.conn(), 'task', task_id, 'secret_blocked',
+    autopilot.audit(ac, 'task', task_id, 'secret_blocked',
                     {'fields': ['workorder'], 'kinds': kinds})
     raise SystemExit(
         'refusing to %s credential-shaped content (%s); re-run with --redact '
@@ -629,7 +635,7 @@ def export_task(args=None):
                 'receipt_files': receipt_files}
         kinds, tables = _apply_workorder_secret_policy(
             tables, getattr(args, 'redact', False), getattr(args, 'allow_secret', False),
-            tid, 'export')
+            tid, 'export', conn=c)
         if kinds:
             body['tables'] = tables
             body['secret_kinds'] = kinds
