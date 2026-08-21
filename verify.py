@@ -64,4 +64,37 @@ with tempfile.TemporaryDirectory() as td:
     assert m['tasks_by_status'].get('failed') == 1
     assert m['tasks_by_status'].get('claimed') == 1
     assert m['stale_leases'] == 0 and m['receipts'] >= 1 and m['audit_events'] >= 4
+    # Dependencies: dispatch skips blocked tasks; claim enforces dependency order.
+    run('create','--project','Verify','--title','blocker','--id','dep-a','--priority','P1')
+    run('create','--project','Verify','--title','dependent','--id','dep-b','--priority','P0')
+    run('dep','dep-b','dep-a')
+    nx = run('next')
+    assert nx['task']['id'] == 'dep-a', ('expected unblocked dep-a despite lower priority', nx)
+    err = run_fail('claim','dep-b','--owner','tester','--minutes','5')
+    assert 'unsatisfied dependencies' in err and 'dep-a(queued)' in err
+    m = run('metrics'); assert m['queued_blocked_by_deps'] == 1
+    got = run('next','--claim','--owner','tester','--minutes','5')
+    assert got['claimed'] is True and got['task']['id'] == 'dep-a' and got['lease_expires_at']
+    run('update','dep-a','--status','completed')
+    got = run('next','--claim','--owner','tester','--minutes','5')
+    assert got['task']['id'] == 'dep-b'
+    detail = run('show','dep-b')
+    dep = next(d for d in detail['dependencies'] if d['id'] == 'dep-a')
+    assert dep['satisfied'] == 1 and dep['status'] == 'completed'
+    # Cycle protection: a->b then b->a must be rejected.
+    run('create','--project','Verify','--title','cyc1','--id','cyc-1')
+    run('create','--project','Verify','--title','cyc2','--id','cyc-2')
+    run('dep','cyc-2','cyc-1')
+    err = run_fail('dep','cyc-1','cyc-2')
+    assert 'cycle' in err
+    # Self-dependency rejected.
+    run('create','--project','Verify','--title','self','--id','dep-c')
+    run_fail('dep','dep-c','dep-c')
+    # create --depends-on wires dependencies at creation time.
+    run('create','--project','Verify','--title','chained','--id','dep-d','--depends-on','dep-c')
+    detail = run('show','dep-d')
+    assert [d['id'] for d in detail['dependencies']] == ['dep-c']
+    # Dispatch with no eligible work returns a null task.
+    empty = run('next','--project','NoSuchProject')
+    assert empty['task'] is None
 print('autopilot verification: PASS')

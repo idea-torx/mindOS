@@ -17,10 +17,27 @@ python3 "$A" claim <task-id> --owner hermes --minutes 30
 python3 "$A" heartbeat <task-id> --owner hermes --note "Running verification"
 python3 "$A" receipt <task-id> --kind verification --payload '{"tests":"pass","health":200}'
 python3 "$A" update <task-id> --status waiting_for_user --next-action "Leo review"
-python3 "$A" show <task-id>          # task detail + receipts + audit trail
+python3 "$A" show <task-id>          # task detail + receipts + audit trail + dependencies
 python3 "$A" metrics                 # JSON observability snapshot
 python3 "$A" dashboard
 ```
+
+## Dependency-aware dispatch
+
+Tasks can declare dependencies on other tasks. A task with an incomplete
+dependency cannot be claimed, and `next` skips it when dispatching:
+
+```bash
+python3 "$A" create --project Trove --title "Dependent task" --depends-on <prereq-id>
+python3 "$A" dep <task-id> <prereq-id>   # add a dependency edge (cycles rejected)
+python3 "$A" next                        # highest-priority queued task whose deps are completed
+python3 "$A" next --project Trove --claim --owner hermes --minutes 30
+```
+
+`next` orders by priority (`P0` first), then oldest-created. With `--claim`, the
+picked task's lease is acquired atomically in the same step, so concurrent
+dispatchers can never double-claim. `metrics` reports
+`queued_blocked_by_deps` for tasks waiting on prerequisites.
 
 ## Safe operations (ops.py)
 

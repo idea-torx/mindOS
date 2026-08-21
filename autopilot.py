@@ -68,6 +68,13 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_events(entity_type, entity_id, created_at);
+CREATE TABLE IF NOT EXISTS task_deps (
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  depends_on TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (task_id, depends_on)
+);
+CREATE INDEX IF NOT EXISTS idx_task_deps_dep ON task_deps(depends_on);
 """
 STATUSES = {"queued", "claimed", "running", "waiting_for_agent", "waiting_for_user", "waiting_for_review", "ready_to_merge", "ready_to_deploy", "blocked", "completed", "failed", "cancelled"}
 PRIORITIES = {"P0", "P1", "P2", "P3"}
@@ -102,12 +109,49 @@ def task_row(db, task_id: str):
         raise SystemExit(f"task not found: {task_id}")
     return row
 
+def unsatisfied_deps(db, task_id: str):
+    """Dependencies of a task that are not yet completed (missing deps count as unsatisfied)."""
+    return [dict(r) for r in db.execute(
+        "SELECT d.depends_on AS id, COALESCE(t.status,'missing') AS status FROM task_deps d "
+        "LEFT JOIN tasks t ON t.id=d.depends_on WHERE d.task_id=? AND COALESCE(t.status,'')!='completed'",
+        (task_id,)).fetchall()]
+
+def would_cycle(db, task_id: str, depends_on: str) -> bool:
+    """True if adding edge task_id->depends_on creates a cycle (i.e. task_id is reachable from depends_on)."""
+    row = db.execute(
+        "WITH RECURSIVE up(x) AS (SELECT ? UNION SELECT d.depends_on FROM task_deps d JOIN up ON d.task_id=up.x) "
+        "SELECT 1 FROM up WHERE x=? LIMIT 1", (depends_on, task_id)).fetchone()
+    return row is not None
+
+def add_dependency(db, task_id: str, depends_on: str) -> None:
+    if task_id == depends_on:
+        raise SystemExit("task cannot depend on itself")
+    task_row(db, task_id)
+    task_row(db, depends_on)
+    if would_cycle(db, task_id, depends_on):
+        raise SystemExit(f"dependency would create a cycle: {task_id} <-> {depends_on}")
+    db.execute("INSERT INTO task_deps(task_id,depends_on,created_at) VALUES(?,?,?) ON CONFLICT DO NOTHING",
+               (task_id, depends_on, now()))
+    audit(db, "task", task_id, "dependency_added", {"depends_on": depends_on})
+
+def _acquire(db, task_id: str, owner: str, minutes: int):
+    """Atomically acquire/renew a lease; returns (acquired, expires_at)."""
+    exp = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + minutes * 60, timezone.utc).replace(microsecond=0).isoformat()
+    t = now()
+    cur = db.execute(
+        "UPDATE tasks SET status='claimed', lease_owner=?, lease_expires_at=?, updated_at=? "
+        "WHERE id=? AND (lease_owner=? OR lease_owner='' OR lease_expires_at='' OR lease_expires_at<=?)",
+        (owner, exp, t, task_id, owner, t))
+    return cur.rowcount == 1, exp
+
 def create(args):
     task_id = args.id or f"{args.project.lower().replace(' ', '-')}-{uuid.uuid4().hex[:8]}"
     t = now()
     with conn() as db:
         db.execute("INSERT INTO tasks(id,project,title,description,owner,status,priority,next_action,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (task_id,args.project,args.title,args.description,args.owner,"queued",args.priority,args.next_action,t,t))
         audit(db, "task", task_id, "created", {"project": args.project, "owner": args.owner, "priority": args.priority})
+        for dep in getattr(args, "depends_on", []) or []:
+            add_dependency(db, task_id, dep)
     json_out({"ok": True, "id": task_id, "status": "queued"})
 
 def update(args):
@@ -128,24 +172,53 @@ def update(args):
         json_out(dict(task_row(db, args.id)))
 
 def claim(args):
-    expires = datetime.now(timezone.utc).timestamp() + args.minutes * 60
-    exp = datetime.fromtimestamp(expires, timezone.utc).replace(microsecond=0).isoformat()
-    t = now()
     with conn() as db:
         row = task_row(db, args.id)
         if row["status"] in {"completed", "cancelled"}:
             raise SystemExit(f"cannot claim terminal task: {row['status']}")
+        pending = unsatisfied_deps(db, args.id)
+        if pending:
+            raise SystemExit("unsatisfied dependencies: " + ", ".join(f"{d['id']}({d['status']})" for d in pending))
         # Atomic acquire: the WHERE guard makes the lease check-and-set a single
         # statement so concurrent claimers cannot both win the same lease.
-        cur = db.execute(
-            "UPDATE tasks SET status='claimed', lease_owner=?, lease_expires_at=?, updated_at=? "
-            "WHERE id=? AND (lease_owner=? OR lease_owner='' OR lease_expires_at='' OR lease_expires_at<=?)",
-            (args.owner, exp, t, args.id, args.owner, t))
-        if cur.rowcount != 1:
+        acquired, exp = _acquire(db, args.id, args.owner, args.minutes)
+        if not acquired:
             raise SystemExit(f"lease owned by {row['lease_owner']}")
         db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"claimed",now(),"lease claimed"))
         audit(db, "task", args.id, "claimed", {"owner": args.owner, "lease_expires_at": exp})
         json_out(dict(task_row(db, args.id)))
+
+def add_dep(args):
+    with conn() as db:
+        add_dependency(db, args.id, args.depends_on)
+    json_out({"ok": True, "task_id": args.id, "depends_on": args.depends_on})
+
+def next_task(args):
+    """Dispatch: highest-priority queued task whose dependencies are all completed."""
+    with conn() as db:
+        q = "SELECT * FROM tasks WHERE status='queued'"
+        vals = []
+        if args.project:
+            q += " AND project=?"; vals.append(args.project)
+        q += " ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END, created_at ASC"
+        picked = None
+        for r in db.execute(q, vals).fetchall():
+            if not unsatisfied_deps(db, r["id"]):
+                picked = r
+                break
+        out = {"ok": True, "task": dict(picked) if picked else None}
+        if picked is None:
+            json_out(out)
+            return
+        if args.claim:
+            acquired, exp = _acquire(db, picked["id"], args.owner, args.minutes)
+            if not acquired:
+                raise SystemExit(f"lost race for {picked['id']}")
+            db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (picked["id"],args.owner,"claimed",now(),"claimed via next"))
+            audit(db, "task", picked["id"], "claimed", {"owner": args.owner, "lease_expires_at": exp, "via": "next"})
+            out["claimed"] = True
+            out["lease_expires_at"] = exp
+        json_out(out)
 
 def heartbeat(args):
     with conn() as db:
@@ -193,12 +266,17 @@ def show(args):
         events = [dict(r) for r in db.execute(
             "SELECT action,payload_json,created_at FROM audit_events WHERE entity_type='task' AND entity_id=? ORDER BY id DESC LIMIT ?",
             (args.id, args.limit)).fetchall()]
+        deps = [dict(r) for r in db.execute(
+            "SELECT d.depends_on AS id, COALESCE(t.status,'missing') AS status, (COALESCE(t.status,'')='completed') AS satisfied "
+            "FROM task_deps d LEFT JOIN tasks t ON t.id=d.depends_on WHERE d.task_id=? ORDER BY d.created_at",
+            (args.id,)).fetchall()]
     for r in receipts:
         r["payload"] = json.loads(r.pop("payload_json"))
     for e in events:
         e["payload"] = json.loads(e.pop("payload_json"))
     out["receipts"] = receipts
     out["audit"] = events
+    out["dependencies"] = deps
     json_out(out)
 
 def metrics(args):
@@ -210,6 +288,9 @@ def metrics(args):
             "SELECT COUNT(*) n FROM tasks WHERE lease_expires_at!='' AND lease_expires_at<? AND status IN ('claimed','running','waiting_for_agent')",
             (t,)).fetchone()["n"]
         retries = db.execute("SELECT COALESCE(SUM(retry_count),0) s,COALESCE(MAX(retry_count),0) m FROM tasks").fetchone()
+        blocked_by_deps = db.execute(
+            "SELECT COUNT(*) n FROM tasks t WHERE t.status='queued' AND EXISTS("
+            "SELECT 1 FROM task_deps d JOIN tasks dt ON dt.id=d.depends_on WHERE d.task_id=t.id AND dt.status!='completed')").fetchone()["n"]
         receipts = db.execute("SELECT COUNT(*) n FROM receipts").fetchone()["n"]
         events = db.execute("SELECT COUNT(*) n FROM audit_events").fetchone()["n"]
     json_out({
@@ -218,6 +299,7 @@ def metrics(args):
         "tasks_by_status": by_status,
         "tasks_by_project": by_project,
         "stale_leases": stale,
+        "queued_blocked_by_deps": blocked_by_deps,
         "total_retries": retries["s"],
         "max_retries_seen": retries["m"],
         "receipts": receipts,
@@ -262,7 +344,7 @@ def main():
     ap = argparse.ArgumentParser(prog="autopilot")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p=sub.add_parser("init"); p.set_defaults(fn=lambda a: (ensure(), json_out({"ok":True,"db":str(DB)})))
-    p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--id"); p.set_defaults(fn=create)
+    p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.set_defaults(fn=create)
     p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.set_defaults(fn=update)
     p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.set_defaults(fn=claim)
     p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.set_defaults(fn=heartbeat)
@@ -271,6 +353,8 @@ def main():
     p=sub.add_parser("show"); p.add_argument("id"); p.add_argument("--limit",type=int,default=20); p.set_defaults(fn=show)
     p=sub.add_parser("metrics"); p.set_defaults(fn=metrics)
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
+    p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.set_defaults(fn=next_task)
     args=ap.parse_args(); args.fn(args)
 
 if __name__ == "__main__": main()
