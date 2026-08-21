@@ -262,6 +262,65 @@ def snapshot_check(args):
                       'created_at': body.get('created_at'), 'counts': counts}))
     if not ok: sys.exit(1)
 
+CHECKPOINT_FORMAT = 'autopilot-checkpoint-v1'
+
+def _checkpoint_doc():
+    """Pin the audit chain head: the seal that makes tail truncation detectable."""
+    with db() as c:
+        row = c.execute('SELECT COUNT(*) n, COALESCE(MAX(id),0) mx FROM audit_events').fetchone()
+        total, last_id = row['n'], row['mx']
+        head = c.execute('SELECT hash FROM audit_events WHERE id=?', (last_id,)).fetchone() if last_id else None
+    body = {'format': CHECKPOINT_FORMAT, 'created_at': utc(),
+            'last_event_id': last_id,
+            'last_event_hash': head['hash'] if head else '',
+            'total_events': total}
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    return {'checkpoint': body, 'sha256': digest}
+
+def checkpoint(args=None):
+    """Seal a point-in-time audit-chain checkpoint.
+
+    The hash chain is tamper-evident for *modification* but blind to tail
+    truncation: deleting the newest events leaves every remaining link valid.
+    A checkpoint pins the head hash + event id + count at a moment in time;
+    later `verify-chain --checkpoint`, `checkpoint-check`, and `doctor` compare
+    against it so history rewriting or event deletion becomes observable.
+    """
+    if args is not None and getattr(args, 'out', None):
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_path = autopilot.ROOT / 'backups'
+        out_path.mkdir(parents=True, exist_ok=True)
+        out_path = out_path / f"checkpoint-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    doc = _checkpoint_doc()
+    fd, tmp = tempfile.mkstemp(prefix='.checkpoint.', dir=str(out_path.parent))
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(json.dumps(doc, sort_keys=True)); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, str(out_path))
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+    body = doc['checkpoint']
+    print(json.dumps({'ok': True, 'path': str(out_path), 'sha256': doc['sha256'],
+                      'last_event_id': body['last_event_id'], 'total_events': body['total_events']}))
+
+def checkpoint_check(args):
+    """Verify a checkpoint file's integrity and its containment in the live chain."""
+    path = Path(args.path)
+    cp = autopilot._load_checkpoint(str(path))
+    problems = []
+    with db() as c:
+        problems.extend(autopilot.audit_chain_problems(c))
+        problems.extend(autopilot.checkpoint_problems(c, cp))
+    print(json.dumps({'ok': not problems, 'path': str(path),
+                      'last_event_id': cp['last_event_id'],
+                      'last_event_hash': cp['last_event_hash'],
+                      'total_events': cp['total_events'], 'created_at': cp['created_at'],
+                      'problems': problems}, sort_keys=True))
+    if problems: sys.exit(1)
+
 ARCHIVE_TABLES = ('tasks', 'task_deps', 'heartbeats', 'receipts', 'notes', 'handoffs')
 ARCHIVE_FORMAT = 'autopilot-archive-v1'
 
@@ -458,6 +517,17 @@ def doctor(args=None):
                 if p.stem not in indexed:
                     problems.append({'kind': 'receipt_row_missing', 'path': p.name})
         problems.extend(autopilot.audit_chain_problems(c))
+        # Sealed chain checkpoints: any divergence from a pinned head proves
+        # tail truncation or history rewriting (the chain alone cannot).
+        backups = autopilot.ROOT / 'backups'
+        if backups.exists():
+            for p in sorted(backups.glob('checkpoint-*.json')):
+                try:
+                    cp = autopilot._load_checkpoint(str(p))
+                except SystemExit:
+                    problems.append({'kind': 'checkpoint_file_invalid', 'path': p.name})
+                    continue
+                problems.extend(autopilot.checkpoint_problems(c, cp))
         stale = c.execute(
             "SELECT id FROM tasks WHERE lease_expires_at!='' AND lease_expires_at<=? "
             "AND status IN ('claimed','running','waiting_for_agent')", (utc(),)).fetchall()
@@ -656,6 +726,8 @@ x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x
 x=s.add_parser('escalate'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=escalate)
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)
 x=s.add_parser('snapshot-check'); x.add_argument('path'); x.set_defaults(fn=snapshot_check)
+x=s.add_parser('checkpoint'); x.add_argument('--out',default=None); x.set_defaults(fn=checkpoint)
+x=s.add_parser('checkpoint-check'); x.add_argument('path'); x.set_defaults(fn=checkpoint_check)
 x=s.add_parser('snapshot-restore'); x.add_argument('path'); x.add_argument('--force',action='store_true'); x.set_defaults(fn=snapshot_restore)
 x=s.add_parser('archive'); x.add_argument('--before',required=True); x.add_argument('--out',default=None); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=archive)
 x=s.add_parser('archive-check'); x.add_argument('path'); x.set_defaults(fn=archive_check)

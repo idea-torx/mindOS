@@ -175,6 +175,10 @@ Design properties:
 - **Lineage**: `note-history <note-id>` walks a temporal fact chain end to end
   (oldest predecessor → newest live successor), so agents can reconstruct how
   a fact evolved without manual `--all` archaeology.
+- **Handoff lineage**: `handoff-history <handoff-id>` is the same walk for the
+  resume point: given any link in a task's supersession chain, it reconstructs
+  the full sequence oldest → newest, showing how the handoff (owner, objective,
+  evidence) evolved across agents.
 
 `metrics` reports `notes_total`, `notes_superseded`, and `notes_pinned_live`;
 `ops.py doctor` checks for orphaned notes and dangling supersession links.
@@ -694,9 +698,36 @@ Existing databases are migrated and backfilled automatically on first use.
 `hash_mismatch` or `broken_link`, giving tamper-evident history. `ops.py
 doctor` runs the same check as part of a broader consistency sweep.
 
+## Audit checkpoints (truncation detection)
+
+A hash chain is tamper-evident for *modification* but blind to tail
+truncation: deleting the newest events leaves every remaining link perfectly
+valid. Checkpoints close that gap by pinning the chain head — last event id,
+head hash, and total count — into a self-hash-sealed
+`autopilot-checkpoint-v1` file:
+
 ```bash
 O=~/.hermes/autopilot/ops.py
-python3 "$O" doctor   # orphan deps, receipt index/file drift, audit chain, stale leases, note integrity
+python3 "$O" checkpoint                 # seal the current head (default under backups/)
+python3 "$O" checkpoint-check <file>    # verify the seal + containment in the live chain
+python3 "$A" verify-chain --checkpoint <file>   # chain recompute + checkpoint pin in one call
+```
+
+Design properties:
+
+- **Divergence is proof**: a missing pinned event (`chain_truncated`), a
+  changed head hash (`checkpoint_head_mismatch`), or a shrunken event count
+  (`events_removed_since_checkpoint`) each prove history was deleted or
+  rewritten after the checkpoint was sealed. Growth past the checkpoint is
+  normal operation and never flagged.
+- **Seal-then-compare**: the checkpoint file carries its own integrity hash;
+  a modified file is refused outright rather than trusted.
+- **Doctor-integrated**: `ops.py doctor` validates every
+  `checkpoint-*.json` under `backups/` against the live ledger on every sweep,
+  so a stale operator checkpoint turns truncation into a routine finding.
+
+```bash
+python3 "$O" doctor   # orphan deps, receipt index/file drift, audit chain, stale leases, note integrity, checkpoint pins
 ```
 
 ## Task lifecycle

@@ -986,6 +986,54 @@ with tempfile.TemporaryDirectory() as td:
         'superseded handoffs must leave the sweep'
     doc = ops('doctor')
     assert doc['ok'] is True and doc['problems'] == [], doc
+    # Handoff lineage: handoff-history walks the supersession chain oldest → newest.
+    run('create','--project','Verify','--title','lineage host','--id','lin-1')
+    lh1 = run('handoff','lin-1','--from-agent','codex','--to-agent','claude-code',
+              '--objective','first pass','--next-action','draft')
+    lh2 = run('handoff','lin-1','--from-agent','claude-code','--to-agent','opencode',
+              '--objective','second pass','--next-action','review')
+    assert lh2['superseded'] == lh1['id'], lh2
+    hist = run('handoff-history', lh1['id'])
+    assert [h['id'] for h in hist] == [lh1['id'], lh2['id']], hist
+    hist_rev = run('handoff-history', lh2['id'])
+    assert [h['id'] for h in hist_rev] == [lh1['id'], lh2['id']], \
+        'walking from any link must reconstruct the full chain'
+    err = run_fail('handoff-history', 'no-such-handoff')
+    assert 'handoff not found' in err
+    # Audit chain checkpoints: pin the head so tail truncation becomes detectable.
+    cp = ops('checkpoint')
+    assert cp['ok'] is True and cp['last_event_id'] > 0 and len(cp['sha256']) == 64, cp
+    vc = run('verify-chain','--checkpoint',cp['path'])
+    assert vc['ok'] is True and vc['checkpoint']['ok'] is True, vc
+    cc = ops('checkpoint-check',cp['path'])
+    assert cc['ok'] is True and cc['problems'] == [], cc
+    err = run_fail('verify-chain','--checkpoint',str(Path(td) / 'backups' / 'missing.json'))
+    assert 'checkpoint not found' in err
+    # Growth past the checkpoint is normal operation and never flagged.
+    run('create','--project','Verify','--title','post checkpoint','--id','pc-1')
+    vc = run('verify-chain','--checkpoint',cp['path'])
+    assert vc['ok'] is True, vc
+    doc = ops('doctor')
+    assert doc['ok'] is True and doc['problems'] == [], doc
+    # Tail truncation: deleting the pinned head (and everything after it) leaves
+    # every remaining link valid — only the checkpoint exposes the loss.
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        db.execute('DELETE FROM audit_events WHERE id>=?', (cp['last_event_id'],))
+    vc_plain = run('verify-chain')
+    assert vc_plain['ok'] is True, 'the bare chain must stay internally valid under truncation'
+    vc = run('verify-chain','--checkpoint',cp['path'])
+    assert vc['ok'] is False and any(p['kind'] == 'chain_truncated' for p in vc['problems']), vc
+    ops_fail('checkpoint-check',cp['path'])
+    doc = ops('doctor')
+    assert any(p['kind'] == 'chain_truncated' for p in doc['problems']), doc
+    # A tampered checkpoint file itself is refused outright (self-hash mismatch).
+    cpf = Path(cp['path']); orig_cp = cpf.read_text()
+    doc_json = json.loads(orig_cp); doc_json['checkpoint']['total_events'] += 5
+    cpf.write_text(json.dumps(doc_json))
+    ops_fail('checkpoint-check',cp['path'])
+    err = run_fail('verify-chain','--checkpoint',cp['path'])
+    assert 'integrity check failed' in err
+    cpf.write_text(orig_cp)
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

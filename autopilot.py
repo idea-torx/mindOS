@@ -267,6 +267,46 @@ def audit_chain_problems(db) -> list:
         prev = r[7]
     return problems
 
+CHECKPOINT_FORMAT = "autopilot-checkpoint-v1"
+
+def _load_checkpoint(path: str) -> dict:
+    """Read and integrity-check a checkpoint file; returns its body."""
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"checkpoint not found: {path}")
+    try:
+        doc = json.loads(p.read_text())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"checkpoint is not valid JSON: {e}")
+    body = doc.get("checkpoint")
+    if not body or body.get("format") != CHECKPOINT_FORMAT:
+        raise SystemExit("unrecognized checkpoint format")
+    recomputed = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    if recomputed != doc.get("sha256"):
+        raise SystemExit("checkpoint integrity check failed; refusing to use a tampered file")
+    return body
+
+def checkpoint_problems(db, cp: dict) -> list:
+    """Compare a sealed chain checkpoint against the live audit ledger.
+
+    A hash chain alone cannot detect tail truncation (deleting the newest
+    events leaves every remaining link valid). A checkpoint pins the head at a
+    point in time; divergence from it proves events were removed or rewritten.
+    Growth past the checkpoint is normal and never flagged.
+    """
+    problems = []
+    ev = db.execute("SELECT id,hash FROM audit_events WHERE id=?", (cp["last_event_id"],)).fetchone()
+    if ev is None:
+        problems.append({"kind": "chain_truncated", "missing_event_id": cp["last_event_id"]})
+    elif ev["hash"] != cp["last_event_hash"]:
+        problems.append({"kind": "checkpoint_head_mismatch", "event_id": cp["last_event_id"],
+                         "expected": cp["last_event_hash"], "actual": ev["hash"]})
+    total = db.execute("SELECT COUNT(*) n FROM audit_events").fetchone()["n"]
+    if total < cp["total_events"]:
+        problems.append({"kind": "events_removed_since_checkpoint",
+                         "checkpointed_total": cp["total_events"], "current_total": total})
+    return problems
+
 def conn() -> sqlite3.Connection:
     ensure()
     c = sqlite3.connect(DB, timeout=10)
@@ -474,6 +514,34 @@ def note_history(args):
         while True:
             prv = db.execute(
                 "SELECT * FROM notes WHERE superseded_by=? LIMIT 1", (node["id"],)).fetchone()
+            if not prv or prv["id"] in seen:
+                break
+            chain.insert(0, dict(prv)); seen.add(prv["id"]); node = prv
+    json_out(chain)
+
+def handoff_history(args):
+    """Walk a handoff's supersession chain: oldest predecessor → newest live successor.
+
+    The temporal mirror of note-history for the handoff protocol: given any
+    handoff id, reconstruct how the resume point evolved — who handed to whom,
+    what changed at each link — without manual `handoffs --all` archaeology.
+    """
+    with conn() as db:
+        cur = db.execute("SELECT * FROM handoffs WHERE id=?", (args.handoff_id,)).fetchone()
+        if not cur:
+            raise SystemExit(f"handoff not found: {args.handoff_id}")
+        chain = [dict(cur)]
+        seen = {cur["id"]}
+        node = cur
+        while node["superseded_by"] and node["superseded_by"] not in seen:
+            nxt = db.execute("SELECT * FROM handoffs WHERE id=?", (node["superseded_by"],)).fetchone()
+            if not nxt:
+                break
+            chain.append(dict(nxt)); seen.add(nxt["id"]); node = nxt
+        node = cur
+        while True:
+            prv = db.execute(
+                "SELECT * FROM handoffs WHERE superseded_by=? LIMIT 1", (node["id"],)).fetchone()
             if not prv or prv["id"] in seen:
                 break
             chain.insert(0, dict(prv)); seen.add(prv["id"]); node = prv
@@ -1293,10 +1361,24 @@ def blocked_by(args):
               "blockers": rows})
 
 def verify_chain(args):
+    """Recompute the audit hash chain; optionally pin-check against a sealed
+    checkpoint file to also detect tail truncation or history rewriting."""
     with conn() as db:
         problems = audit_chain_problems(db)
         total = db.execute("SELECT COUNT(*) n FROM audit_events").fetchone()["n"]
-    json_out({"ok": not problems, "events": total, "problems": problems})
+        out = {"ok": not problems, "events": total, "problems": problems}
+        cp_path = (getattr(args, "checkpoint", "") or "").strip()
+        if cp_path:
+            cp = _load_checkpoint(cp_path)
+            cprobs = checkpoint_problems(db, cp)
+            out["problems"] = problems + cprobs
+            out["ok"] = not out["problems"]
+            out["checkpoint"] = {"path": cp_path, "ok": not cprobs,
+                                 "last_event_id": cp["last_event_id"],
+                                 "last_event_hash": cp["last_event_hash"],
+                                 "total_events": cp["total_events"],
+                                 "created_at": cp["created_at"]}
+    json_out(out)
 
 def events(args):
     """Query the global audit event stream with filters; newest first.
@@ -1652,7 +1734,7 @@ def main():
     p=sub.add_parser("block"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=block)
     p=sub.add_parser("unblock"); p.add_argument("id"); p.add_argument("--owner",required=True); p.set_defaults(fn=unblock)
     p=sub.add_parser("blocked-by"); p.add_argument("id"); p.set_defaults(fn=blocked_by)
-    p=sub.add_parser("verify-chain"); p.set_defaults(fn=verify_chain)
+    p=sub.add_parser("verify-chain"); p.add_argument("--checkpoint",default=""); p.set_defaults(fn=verify_chain)
     p=sub.add_parser("events"); p.add_argument("--entity-type"); p.add_argument("--entity-id"); p.add_argument("--action"); p.add_argument("--since",default=""); p.add_argument("--until",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--verify",action="store_true"); p.set_defaults(fn=events)
     p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=claim)
     p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=heartbeat)
@@ -1673,6 +1755,7 @@ def main():
     p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.set_defaults(fn=recall_verify)
     p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_notes)
     p=sub.add_parser("note-history"); p.add_argument("note_id"); p.set_defaults(fn=note_history)
+    p=sub.add_parser("handoff-history"); p.add_argument("handoff_id"); p.set_defaults(fn=handoff_history)
     p=sub.add_parser("handoff"); p.add_argument("task_id"); p.add_argument("--from-agent",required=True); p.add_argument("--to-agent",default=""); p.add_argument("--status",default=""); p.add_argument("--objective",default=""); p.add_argument("--evidence",action="append",default=[]); p.add_argument("--constraint",dest="constraints",action="append",default=[]); p.add_argument("--decision",dest="decisions",action="append",default=[]); p.add_argument("--file",dest="files",action="append",default=[]); p.add_argument("--commit",dest="commit_ref",default=""); p.add_argument("--next-action",dest="next_actions",action="append",default=[]); p.add_argument("--risk",dest="risks",action="append",default=[]); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.set_defaults(fn=add_handoff)
     p=sub.add_parser("handoffs"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_handoffs)
     p=sub.add_parser("handoff-current"); p.add_argument("task_id"); p.set_defaults(fn=current_handoff)
