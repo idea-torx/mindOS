@@ -1896,6 +1896,8 @@ def metrics(args):
         handoffs = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded, "
                               "SUM(CASE WHEN recall_digest!='' THEN 1 ELSE 0 END) proven, "
                               "SUM(CASE WHEN acked_by!='' THEN 1 ELSE 0 END) acked FROM handoffs").fetchone()
+        consolidated = db.execute(
+            "SELECT COUNT(*) n FROM audit_events WHERE action='note_consolidated'").fetchone()["n"]
     json_out({
         "generated_at": t,
         "tasks_total": sum(by_status.values()),
@@ -1916,6 +1918,7 @@ def metrics(args):
         "notes_superseded": notes["superseded"] or 0,
         "notes_pinned_live": notes["pinned"] or 0,
         "notes_expired_live": notes["expired"] or 0,
+        "notes_consolidated_total": consolidated,
         "handoffs_total": handoffs["total"] or 0,
         "handoffs_superseded": handoffs["superseded"] or 0,
         "handoffs_with_recall_proof": handoffs["proven"] or 0,

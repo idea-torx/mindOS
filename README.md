@@ -195,9 +195,46 @@ Design properties:
   the full sequence oldest → newest, showing how the handoff (owner, objective,
   evidence) evolved across agents.
 
-`metrics` reports `notes_total`, `notes_superseded`, `notes_pinned_live`, and
-`notes_expired_live`; `ops.py doctor` checks for orphaned notes and dangling
-supersession links.
+`metrics` reports `notes_total`, `notes_superseded`, `notes_pinned_live`,
+`notes_expired_live`, and `notes_consolidated_total`; `ops.py doctor` checks
+for orphaned notes and dangling supersession links.
+
+## Memory consolidation (ops.py consolidate)
+
+The `note` command's near-duplicate guard only *flags* rephrased restatements;
+over weeks of agent traffic, shared memory still accumulates near-identical
+facts that all consume context budget and all surface in retrieval.
+`ops.py consolidate` finishes the job: live notes on each task are clustered by
+token-Jaccard similarity (the same measure as the guard), and every
+non-canonical member is superseded into its cluster's canonical note — the
+pinned note when a cluster has one, else the newest:
+
+```bash
+python3 ops.py consolidate --dry-run        # preview clusters without mutating
+python3 ops.py consolidate                  # merge fleet-wide
+python3 ops.py consolidate --task <task-id> # scope to one task
+python3 ops.py consolidate --threshold 0.7  # looser matching (default: 0.8 / env)
+```
+
+Design properties:
+
+- **Deterministic clustering**: notes are processed oldest→newest; each joins
+  the first cluster whose canonical note it matches at or above the threshold,
+  else founds its own cluster. Same rows always yield the same plan.
+- **Pin-aware canonical choice**: a pinned note beats an unpinned one for
+  survival regardless of age, so critical constraints never dissolve into a
+  newer paraphrase; among equals the newest wins.
+- **History-preserving**: losers are superseded (never deleted) — they point at
+  their canonical note via `superseded_by`, so `note-history` still reconstructs
+  how a fact was restated, and audit retains every step.
+- **Audited + observable**: each merge records a `note_consolidated` event
+  carrying the kept note id and similarity; `metrics` reports
+  `notes_consolidated_total`.
+- **Idempotent**: consolidated notes leave the live set, so repeated passes
+  find nothing new; concurrent supersedes lose safely against the
+  `WHERE superseded_by=''` guard.
+- **Retired notes excluded**: expired unpinned notes are already invisible to
+  packs and retrieval, so consolidation never resurrects them.
 
 ## Agent handoff protocol (provider-neutral)
 
@@ -687,6 +724,7 @@ python3 "$O" archive --before "..." --dry-run                  # preview without
 python3 "$O" archive-check <file>      # verify an archive's integrity hash
 python3 "$O" archive-restore <file> [--force]  # re-import archived tasks
 python3 "$O" notes-expired             # list live notes past their TTL (read-only)
+python3 "$O" consolidate [--task ID] [--dry-run]   # merge near-duplicate notes into canonical facts
 ```
 
 `snapshot` writes an atomic, `autopilot-snapshot-v1` JSON document (default

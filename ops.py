@@ -754,6 +754,118 @@ def notes_expired(args=None):
                       'pinned_expired': sum(1 for i in items if i['pinned']),
                       'items': items}, sort_keys=True))
 
+def _cluster_live_notes(rows, threshold):
+    """Greedy near-duplicate clustering over one task's live notes.
+
+    Rows arrive oldest→newest; each note joins the first cluster whose
+    canonical note it matches at >= threshold token-Jaccard similarity,
+    else founds a new cluster. Deterministic: same rows, same clusters.
+    """
+    clusters = []
+    for r in rows:
+        toks = autopilot._tokens(r['content'])
+        for c in clusters:
+            sim = autopilot._jaccard(toks, autopilot._tokens(c['kept']['content']))
+            if sim >= threshold:
+                c['members'].append((r, round(sim, 3)))
+                break
+        else:
+            clusters.append({'kept': r, 'members': []})
+    return clusters
+
+def consolidate(args=None):
+    """Memory consolidation: merge near-duplicate live notes into canonical facts.
+
+    The `note` command's near-duplicate guard only *flags* rephrased
+    restatements; over weeks of agent traffic shared memory still accumulates
+    near-identical facts that all pack into context budgets and all surface in
+    retrieval. This sweep finishes the job: live notes on a task are clustered
+    by token-Jaccard similarity (same measure as the guard, default threshold
+    from AUTOPILOT_NEAR_DUP_THRESHOLD, override with --threshold), and every
+    non-canonical member is superseded into its cluster's canonical note —
+    the pinned note when the cluster has one, else the newest. Superseded
+    losers keep their audit trail via note-history; retrieval and context
+    packs shrink immediately because they filter on superseded_by.
+
+    Retired (expired unpinned) notes are invisible already and never cluster.
+    Each consolidation is guarded (`WHERE superseded_by=''`) so a concurrent
+    supersede wins safely, and audited as `note_consolidated`. `--dry-run`
+    previews the plan without mutating; `--task` scopes the sweep to one task.
+    """
+    t = utc()
+    threshold = getattr(args, 'threshold', None) if args is not None else None
+    if threshold is None:
+        threshold = autopilot._near_dup_threshold()
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        raise SystemExit('--threshold must be a number between 0 and 1')
+    if not 0 < threshold <= 1:
+        raise SystemExit('--threshold must be a number between 0 and 1')
+    dry = bool(getattr(args, 'dry_run', False))
+    scope_task = getattr(args, 'task', '') or ''
+    clusters_out = []
+    consolidated = 0
+    tasks_scanned = 0
+    with db() as c:
+        q = ("SELECT n.id,n.task_id,n.kind,n.content,n.source,n.created_at,n.pinned,n.expires_at,n.rowid AS ord "
+             "FROM notes n WHERE n.superseded_by='' "
+             "AND (n.expires_at='' OR n.expires_at>? OR n.pinned=1)")
+        vals = [t]
+        if scope_task:
+            if not c.execute("SELECT 1 FROM tasks WHERE id=?", (scope_task,)).fetchone():
+                raise SystemExit(f'task not found: {scope_task}')
+            q += " AND n.task_id=?"
+            vals.append(scope_task)
+        q += " ORDER BY n.task_id,n.created_at,n.rowid"
+        by_task = {}
+        for r in c.execute(q, vals).fetchall():
+            by_task.setdefault(r['task_id'], []).append(dict(r))
+        for task_id in sorted(by_task):
+            rows = by_task[task_id]
+            tasks_scanned += 1
+            for cl in _cluster_live_notes(rows, threshold):
+                members = cl['members']
+                if not members:
+                    continue
+                # Canonical: pinned beats unpinned, then newest wins. It may be
+                # a member rather than the founder, so the loser pool must
+                # include the founder too. rowid breaks same-second ties
+                # deterministically (created_at is second-precision; ids are
+                # random uuids).
+                candidates = [cl['kept']] + [m for m, _ in members]
+                kept = max(candidates, key=lambda r: (r['pinned'], r['created_at'], r['ord']))
+                pool = [(cl['kept'], round(autopilot._jaccard(
+                            autopilot._tokens(kept['content']),
+                            autopilot._tokens(cl['kept']['content'])), 3))]
+                pool += sorted(members, key=lambda x: x[0]['id'])
+                losers = [(m, sim) for m, sim in pool if m['id'] != kept['id']]
+                if not losers:
+                    continue
+                entry = {'task_id': task_id, 'kept_note_id': kept['id'],
+                         'consolidated': [{'note_id': m['id'], 'kind': m['kind'],
+                                           'pinned': bool(m['pinned']), 'similarity': sim}
+                                          for m, sim in losers]}
+                clusters_out.append(entry)
+                if dry:
+                    continue
+                for m, sim in losers:
+                    if m['id'] == kept['id']:
+                        continue
+                    cur = c.execute(
+                        "UPDATE notes SET superseded_by=? WHERE id=? AND superseded_by=''",
+                        (kept['id'], m['id']))
+                    if cur.rowcount != 1:
+                        continue  # concurrently superseded; the winner keeps history
+                    autopilot.audit(c, 'task', task_id, 'note_consolidated',
+                                    {'note_id': m['id'], 'kept_note_id': kept['id'],
+                                     'kind': m['kind'], 'similarity': sim})
+                    consolidated += 1
+    print(json.dumps({'ok': True, 'dry_run': dry, 'generated_at': t,
+                      'threshold': threshold, 'tasks_scanned': tasks_scanned,
+                      'clusters': clusters_out, 'consolidated_count': consolidated},
+                     sort_keys=True))
+
 def policy(args):
     path=Path.home()/'.hermes/autopilot/policies'/f'{args.project.lower()}.yaml'
     if not path.exists(): print(json.dumps({'allowed':False,'reason':'no project policy'})); return
@@ -768,6 +880,7 @@ for name,fn in [('processes',processes),('github',github),('sentry',sentry),('mo
 x=s.add_parser('handoff-check'); x.add_argument('--task',default=''); x.add_argument('--ack-sla-hours',dest='ack_sla_hours',type=float,default=24); x.set_defaults(fn=handoff_check)
 x=s.add_parser('recall-stale'); x.set_defaults(fn=recall_stale)
 x=s.add_parser('notes-expired'); x.set_defaults(fn=notes_expired)
+x=s.add_parser('consolidate'); x.add_argument('--task',default=''); x.add_argument('--threshold',type=float,default=None); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=consolidate)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--backoff-base',type=int,default=60); x.add_argument('--backoff-cap',type=int,default=3600); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('escalate'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=escalate)
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)

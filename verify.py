@@ -1232,6 +1232,58 @@ with tempfile.TemporaryDirectory() as td:
     nn = next(n for n in run('notes','ttl-1') if n['id'] == sup3['new_note_id'])
     assert nn['pinned'] == 1 and 'expired' not in nn, nn
     doc = ops('doctor'); assert doc['ok'] is True and doc['problems'] == [], doc
+    # Memory consolidation: near-duplicate live notes are clustered and
+    # superseded into one canonical fact per cluster (dry-run previews first).
+    run('create','--project','ConsolTest','--title','memory host','--id','con-1')
+    ca = run('note','con-1','--kind','fact','--content','postgres pool size is sixty connections','--source','hermes')
+    cb = run('note','con-1','--kind','fact','--content','postgres pool size is sixty total connections','--source','codex')
+    cc = run('note','con-1','--kind','fact','--content','deploy window is friday morning','--source','hermes')
+    cd = run('note','con-1','--kind','constraint','--content','MUST rotate api keys weekly','--source','leo','--pinned')
+    ce = run('note','con-1','--kind','constraint','--content','MUST rotate the api keys weekly','--source','leo','--pinned')
+    dry = ops('consolidate','--dry-run')
+    assert dry['dry_run'] is True and dry['consolidated_count'] == 0, dry
+    dry_c1 = [c for c in dry['clusters'] if c['task_id'] == 'con-1']
+    assert len(dry_c1) == 2 and dry['tasks_scanned'] >= 2, dry
+    err = ops_fail('consolidate','--threshold','1.5')
+    assert '--threshold must be a number between 0 and 1' in err
+    out = ops('consolidate')
+    assert out['ok'] is True and out['dry_run'] is False and out['consolidated_count'] >= 2, out
+    # Canonical picks: newest unpinned for the postgres pair; the pinned pair
+    # keeps a pinned canonical (pin beats recency).
+    pg = next(c for c in out['clusters'] if c['kept_note_id'] == cb['id'])
+    assert {m['note_id'] for m in pg['consolidated']} == {ca['id']}, pg
+    pins = next(c for c in out['clusters'] if c['kept_note_id'] == ce['id'])
+    assert {m['note_id'] for m in pins['consolidated']} == {cd['id']}, pins
+    rows = run('notes','con-1')
+    ids = {n['id'] for n in rows}
+    assert ids == {cb['id'], cc['id'], ce['id']}, ('losers must leave live views', ids)
+    # History still resolves through the consolidation link (loser → canonical).
+    hist = run('note-history',ca['id'])
+    assert [h['id'] for h in hist] == [ca['id'], cb['id']], hist
+    hist = run('note-history',cd['id'])
+    assert [h['id'] for h in hist] == [cd['id'], ce['id']], hist
+    # Retrieval shrinks immediately; the canonical fact is the survivor.
+    hits = run('search-notes','postgres','--project','ConsolTest')
+    assert {h['id'] for h in hits} == {cb['id']}, hits
+    # Every consolidation is audited with its kept note and similarity.
+    evs = run('events','--entity-id','con-1','--action','note_consolidated')['events']
+    assert len(evs) == 2 and all(e['payload']['kept_note_id'] and e['payload']['similarity'] >= 0.8 for e in evs), evs
+    m = run('metrics'); assert m['notes_consolidated_total'] >= 2, m
+    # Idempotent: a second pass finds nothing left to merge.
+    again = ops('consolidate')
+    assert again['consolidated_count'] == 0 and again['clusters'] == [], again
+    # --task scoping: new duplicates on another task are untouched by a sweep
+    # scoped to the first task, and merged when scoped correctly.
+    run('create','--project','ConsolTest','--title','second host','--id','con-2')
+    da = run('note','con-2','--kind','fact','--content','redis cache ttl is 300 seconds','--source','hermes')
+    db_ = run('note','con-2','--kind','fact','--content','redis cache ttl is 300 seconds now','--source','codex')
+    scoped = ops('consolidate','--task','con-1')
+    assert scoped['consolidated_count'] == 0 and scoped['clusters'] == [], scoped
+    scoped = ops('consolidate','--task','con-2')
+    assert scoped['consolidated_count'] == 1, scoped
+    assert {n['id'] for n in run('notes','con-2')} == {db_['id']}, run('notes','con-2')
+    doc = ops('doctor'); assert doc['ok'] is True and doc['problems'] == [], doc
+    assert run('verify-chain')['ok'] is True
     # Audit chain checkpoints: pin the head so tail truncation becomes detectable.
     cp = ops('checkpoint')
     assert cp['ok'] is True and cp['last_event_id'] > 0 and len(cp['sha256']) == 64, cp
