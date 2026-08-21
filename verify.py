@@ -697,12 +697,30 @@ with tempfile.TemporaryDirectory() as td:
     rv2 = run('recall-verify','ho-1','--digest',r3['digest'],'--agent','opencode','--budget','100000')
     assert rv2['fresh'] is False and rv2['current_digest'] != r3['digest'], rv2
     assert run_fail('recall-verify','ho-1','--digest','not-a-digest'), 'malformed digest must be rejected'
+    # recall-diff: names exactly which sections moved since a cited recall.
+    rd = run('recall-diff','ho-1','--digest',r3['digest'])
+    assert rd['ok'] is True and rd['fresh'] is False and rd['state'] == 'stale', rd
+    assert 'notes' in rd['sections_changed'], rd
+    drift_id = rd['changes']['notes']['added']
+    assert len(drift_id) == 1, rd
+    assert any(n['id'] in drift_id for n in run('notes','ho-1')), rd
+    # Fresh against itself: no changes at all.
+    rfresh = run('recall','ho-1','--agent','opencode','--budget','100000')
+    rdf = run('recall-diff','ho-1','--digest',rfresh['digest'])
+    assert rdf['fresh'] is True and rdf['unchanged'] is True and rdf['changes'] == {}, rdf
+    # Fabricated digest: unproven, not stale.
+    rdx = run('recall-diff','ho-1','--digest','f'*64)
+    assert rdx['state'] == 'unproven_recall_digest' and 'fresh' not in rdx, rdx
     # Recall provenance: handoffs and completions cite the digest they acted on.
     h3 = run('handoff','ho-1','--from-agent','opencode','--to-agent','claude-code',
              '--objective','finish retry path','--recall-digest',r3['digest'])
     assert h3['id'] != h2['id'], 'new objective supersedes the live handoff'
     cur3 = run('handoff-current','ho-1')
     assert cur3['recall_digest'] == r3['digest'], cur3
+    # A handoff recorded after the cited recall shows up as a handoff-section change.
+    rdh = run('recall-diff','ho-1','--digest',r3['digest'])
+    assert rdh['changes']['handoff']['from'] != h3['id'], rdh
+    assert rdh['changes']['handoff']['to'] == h3['id'], rdh
     assert run_fail('handoff','ho-1','--from-agent','opencode','--recall-digest','zzz'), 'bad digest rejected'
     m2 = run('metrics')
     assert m2['handoffs_with_recall_proof'] >= 1, m2

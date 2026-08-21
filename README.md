@@ -433,9 +433,35 @@ context detectable after the fact.
 ```bash
 python3 "$A" recall <task-id> --agent codex --budget 6000 --related 5
 python3 "$A" recall-verify <task-id> --digest <sha256> --agent codex --budget 6000 --related 5
+python3 "$A" recall-diff <task-id> --digest <sha256>
 python3 "$A" events --action context_recalled --entity-id <task-id>
 python3 ops.py recall-stale   # fleet sweep: which live handoffs cite drifted context?
 ```
+
+### Recall diff (what exactly moved)
+
+`recall-verify` answers "is my context still fresh?" with a boolean;
+`recall-diff` answers the follow-up an agent actually acts on — "what
+changed?". Every `recall`, `resume`, and `next --claim --recall` now records a
+compact per-section manifest of the bundle alongside its digest in the audited
+event (never hashed into the digest itself, so digests stay byte-compatible
+with pre-manifest recalls). Given a cited digest, `recall-diff` looks up that
+event, recomputes the current bundle *exactly as it was originally recalled*
+(recorded budget/related/scope/rerank parameters), and diffs section by
+section:
+
+- `task` — status/priority/due_at/next_action/blocked_reason field moves
+- `dependencies` — satisfied vs newly-added prerequisite ids
+- `handoff` — the live resume point was recorded or superseded (`from`/`to`)
+- `notes` — added/removed note ids plus pinned/expired flag flips
+- `related_notes` — cross-task retrieval candidates that appeared or left
+- `lease` — owner/epoch/expiry/liveness changes (`from`/`to`)
+- `receipts` — evidence receipts posted or rotated out of the top 3
+
+The result carries `fresh`, `unchanged`, `changes`, and `sections_changed`.
+A digest with no audited provenance reports `unproven_recall_digest`; events
+recorded before manifests existed degrade to the plain fresh/stale verdict
+(`legacy_event: true`) instead of guessing. Exit code stays 0 either way.
 
 ## Dispatch-and-recall (next --claim --recall)
 

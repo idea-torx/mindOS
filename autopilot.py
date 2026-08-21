@@ -1072,6 +1072,69 @@ def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: i
     bundle["core_digest"] = core
     return bundle
 
+def _bundle_sections(bundle: dict) -> dict:
+    """Compact per-section manifest of a recall bundle.
+
+    Recorded alongside the digest in `context_recalled` / `session_resumed`
+    audit payloads so `recall-diff` can name *which* sections moved since a
+    cited recall (notes added/removed, handoff superseded, lease changed…)
+    instead of only "something drifted". Derived purely from the bundle
+    contents and never hashed into the digest itself, so digests stay
+    byte-compatible with pre-manifest recalls.
+    """
+    notes = bundle.get("notes", [])
+    h = bundle.get("handoff")
+    return {
+        "task": {k: bundle["task"].get(k)
+                 for k in ("status", "priority", "due_at", "next_action", "blocked_reason")},
+        "deps": [d["id"] for d in bundle.get("unsatisfied_dependencies", [])],
+        "handoff": h["id"] if h else None,
+        "notes": [{"id": n["id"], "pinned": bool(n["pinned"]), "expired": bool(n.get("expired"))}
+                  for n in notes if not n.get("related")],
+        "related_notes": [n["id"] for n in notes if n.get("related")],
+        "lease": {k: bundle["lease"][k]
+                  for k in ("owner", "epoch", "expires_at", "live")},
+        "receipts": [r["id"] for r in bundle.get("latest_receipts", [])],
+    }
+
+def _diff_sections(old: dict, new: dict) -> dict:
+    """Section-level diff between a recorded manifest and current state."""
+    changes = {}
+    tf = {k: {"from": old["task"].get(k), "to": new["task"].get(k)}
+          for k in old["task"] if old["task"].get(k) != new["task"].get(k)}
+    if tf:
+        changes["task"] = tf
+    od, nd = set(old["deps"]), set(new["deps"])
+    if od != nd:
+        changes["dependencies"] = {"satisfied": sorted(od - nd), "added": sorted(nd - od)}
+    if old["handoff"] != new["handoff"]:
+        changes["handoff"] = {"from": old["handoff"], "to": new["handoff"]}
+    on = {n["id"]: n for n in old["notes"]}
+    nn = {n["id"]: n for n in new["notes"]}
+    nc = {}
+    added = sorted(set(nn) - set(on))
+    removed = sorted(set(on) - set(nn))
+    if added:
+        nc["added"] = added
+    if removed:
+        nc["removed"] = removed
+    flags = {i: {f: [on[i][f], nn[i][f]]}
+             for i in set(on) & set(nn)
+             for f in ("pinned", "expired") if on[i][f] != nn[i][f]}
+    if flags:
+        nc["flags"] = flags
+    if nc:
+        changes["notes"] = nc
+    orr, nrr = set(old["related_notes"]), set(new["related_notes"])
+    if orr != nrr:
+        changes["related_notes"] = {"added": sorted(nrr - orr), "removed": sorted(orr - nrr)}
+    if old["lease"] != new["lease"]:
+        changes["lease"] = {"from": old["lease"], "to": new["lease"]}
+    orec, nrec = set(old["receipts"]), set(new["receipts"])
+    if orec != nrec:
+        changes["receipts"] = {"added": sorted(nrec - orec), "removed": sorted(orec - nrec)}
+    return changes
+
 def recall(args):
     """Session bootstrap: everything an agent needs before acting on a task.
 
@@ -1100,7 +1163,8 @@ def recall(args):
                "related_scope": getattr(args, "related_scope", "project"),
                "rerank": bool(getattr(args, "rerank", False)),
                "recency_half_life_hours": getattr(args, "recency_half_life_hours", 168.0),
-               "pinned_boost": getattr(args, "pinned_boost", 0.5)})
+               "pinned_boost": getattr(args, "pinned_boost", 0.5),
+               "sections": _bundle_sections(bundle)})
     json_out(bundle)
 
 def recall_verify(args):
@@ -1128,6 +1192,75 @@ def recall_verify(args):
     json_out({"ok": True, "task_id": args.task_id,
               "fresh": bundle["digest"] == digest,
               "recalled_digest": digest, "current_digest": bundle["digest"]})
+
+def recall_diff(args):
+    """Explain *what* moved since a previously recalled context digest.
+
+    `recall-verify` answers "is my context still fresh?" with a boolean;
+    this answers the follow-up an agent actually acts on: "what changed?".
+    It looks up the audited recall/resume event that produced the cited
+    digest (the event stores a per-section manifest of the original bundle),
+    recomputes the current bundle exactly as it was originally recalled
+    (recorded parameters), and diffs section by section:
+
+    - `task` — status/priority/due_at/next_action/blocked_reason field moves
+    - `dependencies` — satisfied vs newly-added prerequisite ids
+    - `handoff` — the live resume point was recorded/superseded
+    - `notes` — added/removed note ids plus pinned/expired flag flips
+    - `related_notes` — cross-task retrieval candidates that appeared/left
+    - `lease` — owner/epoch/expiry/liveness changes
+    - `receipts` — evidence receipts posted or rotated out of the top 3
+
+    A digest with no audited provenance reports `unproven_recall_digest`;
+    events recorded before section manifests existed degrade to the plain
+    fresh/stale verdict (`legacy_event: true`) instead of guessing.
+    Exit code stays 0 either way; callers branch on the JSON.
+    """
+    digest = _require_digest(args.digest, "--digest")
+    if not digest:
+        raise SystemExit("--digest is required")
+    with conn() as db:
+        task_row(db, args.task_id)
+        ev = db.execute(
+            "SELECT payload_json FROM audit_events WHERE entity_type='task' AND entity_id=? "
+            "AND action IN ('context_recalled','session_resumed') "
+            "AND payload_json LIKE ? ORDER BY id DESC LIMIT 1",
+            (args.task_id, '%"digest": "' + digest + '"%')).fetchone()
+        out = {"ok": True, "task_id": args.task_id, "recalled_digest": digest}
+        if not ev:
+            out["state"] = "unproven_recall_digest"
+            json_out(out)
+            return
+        payload = json.loads(ev["payload_json"])
+        params = {k: payload.get(k) for k in ("budget", "related", "related_scope")}
+        rerank = bool(payload.get("rerank"))
+        half_life = payload.get("recency_half_life_hours")
+        boost = payload.get("pinned_boost")
+        if any(v is None for v in params.values()) or (rerank and (half_life is None or boost is None)):
+            out["state"] = "unknown_recall_params"
+            json_out(out)
+            return
+        bundle = _build_recall_bundle(db, args.task_id, payload.get("agent") or "",
+                                      params["budget"], params["related"], params["related_scope"],
+                                      rerank=rerank,
+                                      recency_half_life_hours=168.0 if half_life is None else half_life,
+                                      pinned_boost=0.5 if boost is None else boost)
+        fresh = bundle["digest"] == digest
+        out["current_digest"] = bundle["digest"]
+        out["fresh"] = fresh
+        sections = payload.get("sections")
+        if sections is None:
+            # Pre-manifest event: the digest math still works, but there is no
+            # per-section record to diff against — report the verdict only.
+            out["state"] = "fresh" if fresh else "stale"
+            out["legacy_event"] = True
+        else:
+            changes = _diff_sections(sections, _bundle_sections(bundle))
+            out["state"] = "fresh" if fresh else "stale"
+            out["unchanged"] = not changes
+            out["changes"] = changes
+            out["sections_changed"] = sorted(changes.keys())
+        json_out(out)
 
 def resume(args):
     """Idempotent cross-agent recovery: recreate a killed session in one call.
@@ -1191,7 +1324,8 @@ def resume(args):
                "related_scope": getattr(args, "related_scope", "project"),
                "rerank": bool(getattr(args, "rerank", False)),
                "recency_half_life_hours": getattr(args, "recency_half_life_hours", 168.0),
-               "pinned_boost": getattr(args, "pinned_boost", 0.5)})
+               "pinned_boost": getattr(args, "pinned_boost", 0.5),
+               "sections": _bundle_sections(bundle)})
     json_out({"ok": True, "task_id": args.task_id, "action": action, **bundle})
 
 def search_notes(args):
@@ -1783,6 +1917,7 @@ def next_task(args):
                        "rerank": bool(getattr(args, "rerank", False)),
                        "recency_half_life_hours": getattr(args, "recency_half_life_hours", 168.0),
                        "pinned_boost": getattr(args, "pinned_boost", 0.5),
+                       "sections": _bundle_sections(bundle),
                        "via": "next"})
                 out["recall"] = bundle
                 out["recall_digest"] = bundle["digest"]
@@ -2119,6 +2254,7 @@ def main():
     p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
     p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
     p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
+    p=sub.add_parser("recall-diff"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.set_defaults(fn=recall_diff)
     p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--include-expired",dest="include_expired",action="store_true"); _add_rerank_flags(p); p.set_defaults(fn=search_notes)
     p=sub.add_parser("note-history"); p.add_argument("note_id"); p.set_defaults(fn=note_history)
     p=sub.add_parser("handoff-history"); p.add_argument("handoff_id"); p.set_defaults(fn=handoff_history)
