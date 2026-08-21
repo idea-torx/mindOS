@@ -189,6 +189,7 @@ from sibling work without manual searching:
 ```bash
 python3 "$A" context <task-id> --budget 4000 --related 5
 python3 "$A" context <task-id> --budget 4000 --related 5 --related-scope global
+python3 "$A" recall <task-id> --agent opencode   # session bootstrap: pack + lease + receipts + digest
 ```
 
 Design properties:
@@ -206,6 +207,31 @@ Design properties:
 - **Graceful fallback**: on non-FTS builds it degrades to any-token substring
   matching (same shape, minus `score`); tokenless task text yields zero
   related matches instead of an error.
+
+## Session bootstrap (recall)
+
+`recall` is the one-call pre-action ritual the handoff protocol requires: every
+agent recalls the relevant context pack *before* acting. It bundles everything
+in `context --related` (task header, unsatisfied deps, live handoff,
+pinned-first notes, cross-task related notes) plus:
+
+- **Lease awareness**: current lease owner/expiry/fencing epoch, whether it is
+  live, and `held_by_caller` when `--agent` matches — so an agent knows if it
+  must claim before editing.
+- **Latest receipts**: the 3 most recent receipts with parsed payloads.
+- **Sealed digest**: a deterministic SHA-256 over the durable context (the
+  recall timestamp is excluded), so identical state yields an identical,
+  referenceable digest. Any state change moves it.
+
+Each recall is audited as a `context_recalled` event carrying the agent and
+digest, so a receipt can later prove exactly which context was recalled before
+acting. A self-report is never execution truth without a receipt; a digest ties
+the two together.
+
+```bash
+python3 "$A" recall <task-id> --agent codex --budget 6000 --related 5
+python3 "$A" events --action context_recalled --entity-id <task-id>
+```
 
 ## Ranked retrieval (FTS5)
 

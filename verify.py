@@ -669,6 +669,27 @@ with tempfile.TemporaryDirectory() as td:
     assert m['handoffs_total'] == 2 and m['handoffs_superseded'] == 1, m
     doc = ops('doctor')
     assert doc['ok'] is True and doc['problems'] == [], doc
+    # recall: session bootstrap bundle with a stable digest, lease awareness,
+    # and an audited context_recalled event proving what was recalled.
+    run('claim','ho-1','--owner','codex','--minutes','30')
+    r1 = run('recall','ho-1','--agent','opencode','--budget','100000','--related','3')
+    assert r1['task_id'] == 'ho-1' and len(r1['digest']) == 64, r1
+    assert r1['handoff_packed'] is True and r1['handoff']['id'] == h2['id'], r1
+    assert r1['lease']['owner'] == 'codex' and r1['lease']['live'] is True, r1['lease']
+    assert r1['lease']['held_by_caller'] is False, 'caller (opencode) does not hold the lease'
+    assert r1['latest_receipts'] == [] or all('payload' in x for x in r1['latest_receipts'])
+    # Deterministic: identical state yields the identical digest.
+    r1b = run('recall','ho-1','--agent','opencode','--budget','100000','--related','3')
+    assert r1b['digest'] == r1['digest'], (r1['digest'], r1b['digest'])
+    # A different caller sees held_by_caller flip; digest changes with state.
+    r2 = run('recall','ho-1','--agent','codex','--budget','100000')
+    assert r2['lease']['held_by_caller'] is True and r2['digest'] != r1['digest'], r2['lease']
+    # State change (new note) must move the digest.
+    run('note','ho-1','--kind','fact','--content','recalled context marker','--source','verify')
+    r3 = run('recall','ho-1','--agent','opencode','--budget','100000')
+    assert r3['digest'] != r1['digest'], 'digest must track context state'
+    evs = run('events','--entity-id','ho-1','--action','context_recalled','--limit','10')
+    assert evs['count'] >= 3, evs
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

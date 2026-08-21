@@ -560,32 +560,28 @@ def _related_note_candidates(db, task_id: str, text: str, limit: int, scope: str
         vals = [*( "%" + t + "%" for t in toks), task_id, *scope_vals, limit]
     return [dict(r) for r in db.execute(sql, vals).fetchall()]
 
-def task_context(args):
-    """Pack a prompt-ready context bundle within a character budget.
+def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str) -> dict:
+    """Assemble the prompt-ready context bundle for a task within a char budget.
 
-    Includes a task summary header and unsatisfied dependencies, then the live
-    agent handoff (if any), then live notes packed pinned-first (oldest→newest within each group) so critical
-    facts survive tight budgets. With --related N, up to N BM25-ranked live
-    notes from other tasks (matching this task's title/description/next_action
-    text) are appended afterwards within the same budget, each tagged with its
-    source task for provenance.
+    Shared by `context` and `recall`: task summary header + unsatisfied
+    dependencies, then the live handoff, then live notes pinned-first
+    (oldest→newest within each group), then cross-task related notes.
     """
-    budget = max(0, args.budget)
-    rel_limit = max(0, getattr(args, "related", 0))
-    rel_scope = getattr(args, "related_scope", "project") or "project"
-    with conn() as db:
-        row = task_row(db, args.task_id)
-        summary = {k: row[k] for k in ("id", "project", "title", "status", "priority", "next_action", "blocked_reason", "due_at")}
-        pending = unsatisfied_deps(db, args.task_id)
-        rows = [dict(r) for r in db.execute(
-            "SELECT id,kind,content,source,created_at,pinned FROM notes "
-            "WHERE task_id=? AND superseded_by='' ORDER BY rowid ASC",
-            (args.task_id,)).fetchall()]
-        related = _related_note_candidates(
-            db, args.task_id,
-            " ".join(filter(None, (row["title"], row["description"], row["next_action"]))),
-            rel_limit, rel_scope)
-        hrow = _live_handoff(db, args.task_id)
+    budget = max(0, budget)
+    rel_limit = max(0, rel_limit)
+    rel_scope = rel_scope or "project"
+    row = task_row(db, task_id)
+    summary = {k: row[k] for k in ("id", "project", "title", "status", "priority", "next_action", "blocked_reason", "due_at")}
+    pending = unsatisfied_deps(db, task_id)
+    rows = [dict(r) for r in db.execute(
+        "SELECT id,kind,content,source,created_at,pinned FROM notes "
+        "WHERE task_id=? AND superseded_by='' ORDER BY rowid ASC",
+        (task_id,)).fetchall()]
+    related = _related_note_candidates(
+        db, task_id,
+        " ".join(filter(None, (row["title"], row["description"], row["next_action"]))),
+        rel_limit, rel_scope)
+    hrow = _live_handoff(db, task_id)
     # Stable sort: pinned notes first, original (oldest→newest) order within groups.
     ordered = sorted(rows, key=lambda r: not r["pinned"])
     header_cost = 64 + len(summary["title"]) + len(summary["next_action"]) + len(summary["blocked_reason"])
@@ -618,16 +614,78 @@ def task_context(args):
             truncated = True
             continue
         packed.append(r); used += cost; related_packed += 1
-    json_out({"task_id": args.task_id, "budget": budget, "used_chars": used,
-              "truncated": truncated, "task": summary,
-              "unsatisfied_dependencies": pending,
-              "handoff": handoff if handoff_packed else None,
-              "handoff_packed": handoff_packed,
-              "notes_total": len(rows), "notes_packed": len(packed) - related_packed,
-              "notes_pinned_packed": pinned_packed,
-              "related_requested": rel_limit, "related_matched": len(related),
-              "related_packed": related_packed,
-              "notes": packed})
+    return {"task_id": task_id, "budget": budget, "used_chars": used,
+            "truncated": truncated, "task": summary,
+            "unsatisfied_dependencies": pending,
+            "handoff": handoff if handoff_packed else None,
+            "handoff_packed": handoff_packed,
+            "notes_total": len(rows), "notes_packed": len(packed) - related_packed,
+            "notes_pinned_packed": pinned_packed,
+            "related_requested": rel_limit, "related_matched": len(related),
+            "related_packed": related_packed,
+            "notes": packed}
+
+def task_context(args):
+    """Pack a prompt-ready context bundle within a character budget.
+
+    Includes a task summary header and unsatisfied dependencies, then the live
+    agent handoff (if any), then live notes packed pinned-first (oldest→newest within each group) so critical
+    facts survive tight budgets. With --related N, up to N BM25-ranked live
+    notes from other tasks (matching this task's title/description/next_action
+    text) are appended afterwards within the same budget, each tagged with its
+    source task for provenance.
+    """
+    with conn() as db:
+        json_out(_build_pack(db, args.task_id, args.budget,
+                             getattr(args, "related", 0),
+                             getattr(args, "related_scope", "project")))
+
+def recall(args):
+    """Session bootstrap: everything an agent needs before acting on a task.
+
+    Bundles the context pack (task header, deps, live handoff, notes) with the
+    lease state — including whether the calling agent holds it — and the latest
+    receipts, then seals the bundle with a deterministic `digest`. The digest is
+    audited (`context_recalled`) so an agent can prove exactly which context it
+    recalled before acting; handoffs and receipts can reference it downstream.
+    Identical state yields an identical digest (stable across repeated calls).
+    """
+    agent = (getattr(args, "agent", "") or "").strip()
+    t = now()
+    with conn() as db:
+        row = task_row(db, args.task_id)
+        pack = _build_pack(db, args.task_id, args.budget,
+                           getattr(args, "related", 0),
+                           getattr(args, "related_scope", "project"))
+        lease_live = bool(row["lease_owner"]) and row["lease_expires_at"] > t
+        bundle = {
+            **pack,
+            "agent": agent or None,
+            "recalled_at": t,
+            "lease": {
+                "owner": row["lease_owner"],
+                "expires_at": row["lease_expires_at"],
+                "epoch": row["lease_epoch"],
+                "live": lease_live,
+                "held_by_caller": bool(agent) and lease_live and row["lease_owner"] == agent,
+            },
+            "latest_receipts": [
+                {**{k: r[k] for k in ("id", "kind", "created_at")},
+                 "payload": json.loads(r["payload_json"])}
+                for r in db.execute(
+                    "SELECT id,kind,payload_json,created_at FROM receipts "
+                    "WHERE task_id=? ORDER BY created_at DESC, id DESC LIMIT 3",
+                    (args.task_id,)).fetchall()],
+        }
+        # Digest covers durable context only — not the recall timestamp — so
+        # identical state yields an identical, referenceable digest.
+        digest = hashlib.sha256(json.dumps(
+            {k: v for k, v in bundle.items() if k != "recalled_at"},
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        bundle["digest"] = digest
+        audit(db, "task", args.task_id, "context_recalled",
+              {"agent": agent or None, "digest": digest})
+    json_out(bundle)
 
 def search_notes(args):
     """Keyword retrieval over note content with kind/project/status filters via the task join.
@@ -1294,6 +1352,7 @@ def main():
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.set_defaults(fn=supersede_note)
     p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.set_defaults(fn=task_context)
+    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.set_defaults(fn=recall)
     p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_notes)
     p=sub.add_parser("note-history"); p.add_argument("note_id"); p.set_defaults(fn=note_history)
     p=sub.add_parser("handoff"); p.add_argument("task_id"); p.add_argument("--from-agent",required=True); p.add_argument("--to-agent",default=""); p.add_argument("--status",default=""); p.add_argument("--objective",default=""); p.add_argument("--evidence",action="append",default=[]); p.add_argument("--constraint",dest="constraints",action="append",default=[]); p.add_argument("--decision",dest="decisions",action="append",default=[]); p.add_argument("--file",dest="files",action="append",default=[]); p.add_argument("--commit",dest="commit_ref",default=""); p.add_argument("--next-action",dest="next_actions",action="append",default=[]); p.add_argument("--risk",dest="risks",action="append",default=[]); p.set_defaults(fn=add_handoff)
