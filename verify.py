@@ -474,6 +474,58 @@ with tempfile.TemporaryDirectory() as td:
     Path(arc['path']).write_text(json.dumps(evil, sort_keys=True))
     err = ops_fail('archive-check', arc['path'])
     assert '"ok": false' in err or 'integrity check failed' in err
+    # Block/unblock: audited operator transitions with lease guards.
+    run('create','--project','Verify','--title','pause me','--id','blk-1')
+    run('claim','blk-1','--owner','holder-b','--minutes','5')
+    err = run_fail('block','blk-1','--owner','leo','--reason','x')
+    assert 'lease owned by holder-b' in err
+    blk = run('block','blk-1','--owner','holder-b','--reason','waiting on credentials')
+    assert blk['status'] == 'blocked' and blk['blocked_reason'] == 'waiting on credentials', blk
+    assert blk['lease_owner'] == '', 'blocking must release the held lease'
+    err = run_fail('claim','blk-1','--owner','tester','--minutes','5')
+    assert 'task is blocked' in err and 'credentials' in err
+    detail = run('show','blk-1')
+    assert any(e['action'] == 'blocked' for e in detail['audit'])
+    ub = run('unblock','blk-1','--owner','leo')
+    assert ub['status'] == 'queued' and ub['blocked_reason'] == '', ub
+    err = run_fail('unblock','blk-1','--owner','leo')
+    assert 'not blocked' in err
+    run_fail('block','fin-1','--owner','leo','--reason','x')  # terminal tasks cannot be blocked
+    detail = run('show','blk-1')
+    assert any(e['action'] == 'unblocked' for e in detail['audit'])
+    # Transitive blockers: blocked-by walks the dependency DAG with depth + satisfaction.
+    run('create','--project','Verify','--title','dag root','--id','dag-1')
+    run('create','--project','Verify','--title','dag mid','--id','dag-2','--depends-on','dag-1')
+    run('create','--project','Verify','--title','dag leaf','--id','dag-3','--depends-on','dag-2')
+    bb = run('blocked-by','dag-3')
+    assert bb['ok'] is True and bb['blocked'] is True, bb
+    assert {b['id']: b['depth'] for b in bb['blockers']} == {'dag-2': 1, 'dag-1': 2}, bb
+    assert all(b['satisfied'] == 0 for b in bb['blockers'])
+    run('update','dag-1','--status','completed')
+    bb = run('blocked-by','dag-3')
+    assert {b['id']: b['satisfied'] for b in bb['blockers']} == {'dag-1': 1, 'dag-2': 0}, bb
+    leafless = run('blocked-by','dag-1')
+    assert leafless['blockers'] == [] and leafless['blocked'] is False
+    err = run_fail('blocked-by','no-such-task')
+    assert 'task not found' in err
+    # show surfaces reverse edges (dependents) alongside dependencies.
+    detail = run('show','dag-1')
+    assert any(d['id'] == 'dag-2' for d in detail['dependents']), detail.get('dependents')
+    detail = run('show','dag-3')
+    assert detail['dependents'] == []
+    # Dispatch diagnostics: next --explain reports skipped candidates and reasons.
+    run('create','--project','ExplainTest','--title','blocked leaf','--id','exp-1',
+        '--priority','P0','--depends-on','dag-2')
+    nx = run('next','--project','ExplainTest','--explain')
+    assert nx['task'] is None and nx['considered'] == 1, nx
+    assert nx['skipped'] == [{'task_id': 'exp-1', 'reason': 'unsatisfied_dependencies',
+                              'blocked_by': ['dag-2']}], nx
+    plain = run('next','--project','ExplainTest')
+    assert plain['task'] is None and 'skipped' not in plain and 'considered' not in plain, \
+        'default output shape must stay unchanged without --explain'
+    run('update','dag-2','--status','completed')
+    nx = run('next','--project','ExplainTest','--explain')
+    assert nx['task']['id'] == 'exp-1' and nx['skipped'] == [], nx
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

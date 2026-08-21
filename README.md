@@ -191,6 +191,44 @@ Timestamps accept any ISO 8601 form (naive values are assumed UTC) and are
 stored normalized; invalid timestamps are rejected. `context` includes
 `due_at` in the task summary so agents see deadlines in their prompt pack.
 
+## Blocking & unblocking
+
+Operators and agents can park work with a reason without cancelling it:
+
+```bash
+python3 "$A" block <task-id> --owner leo --reason "waiting on credentials"
+python3 "$A" unblock <task-id> --owner leo          # requeues, clears the reason
+python3 "$A" blocked-by <task-id>                   # transitive blockers, depth-tagged
+```
+
+Design properties:
+
+- **Lease-safe**: `block` never overrides a foreign or expired lease; blocking
+  a task you hold a live lease on releases that lease so blocked tasks cannot
+  look active to recovery or dispatch.
+- **Audited**: transitions are recorded as `blocked` (with `previous_status`)
+  and `unblocked` events in the hash chain.
+- **Claim guard**: claiming a blocked task is rejected with its reason —
+  deliberate migration from earlier behavior where blocked tasks were directly
+  claimable; call `unblock` first.
+- **DAG visibility**: `blocked-by` walks all transitive prerequisites via a
+  recursive CTE, reporting each blocker's `depth` (direct deps at 1), live
+  status, title, and `satisfied` flag, plus a top-level `blocked` boolean.
+- **Reverse edges**: `show` now includes `dependents` — the tasks waiting on
+  this one — so operators can see what completing a task unblocks.
+
+## Dispatch diagnostics
+
+`next --explain` reports how many queued candidates were considered and why
+each skipped candidate was not picked (`unsatisfied_dependencies` with the
+blocking ids). Without the flag the output shape is unchanged:
+
+```bash
+python3 "$A" next --project Trove --explain
+# → { "task": null, "considered": 3, "skipped": [{"task_id": "t2",
+#      "reason": "unsatisfied_dependencies", "blocked_by": ["t1"]}] }
+```
+
 ## Operator search
 
 `search` does a substring match across `id`, `project`, `title`,
@@ -292,6 +330,8 @@ Design properties:
   rejected.
 - `cancel` is an operator transition that tolerates an unleased task but never
   overrides a foreign or expired lease.
+- `block`/`unblock` park and requeue work with audited reasons; blocked tasks
+  cannot be claimed until unblocked (see "Blocking & unblocking").
 - Any `update --status` to a terminal state (`completed`, `failed`,
   `cancelled`) releases the held lease so terminal tasks cannot look active.
 

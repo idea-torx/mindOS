@@ -669,6 +669,61 @@ def cancel(args):
         audit(db, "task", args.id, "cancelled", {"owner": args.owner, "reason": args.reason})
         json_out(dict(task_row(db, args.id)))
 
+def block(args):
+    """Operator transition to blocked: park work with a reason without cancelling it.
+
+    Never overrides a foreign or expired lease. Blocking a task the caller
+    holds a live lease on releases that lease so blocked tasks cannot look
+    active to recovery or dispatch.
+    """
+    with conn() as db:
+        row = task_row(db, args.id)
+        if row["status"] in TERMINAL_STATUSES:
+            raise SystemExit(f"cannot block terminal task: {row['status']}")
+        if row["status"] == "blocked":
+            raise SystemExit("task is already blocked")
+        _require_not_foreign_lease(row, args.owner, "blocking")
+        t = now()
+        db.execute("UPDATE tasks SET status='blocked',blocked_reason=?,lease_owner='',lease_expires_at='',updated_at=? WHERE id=?",
+                   (args.reason or 'blocked by operator', t, args.id))
+        audit(db, "task", args.id, "blocked",
+              {"owner": args.owner, "reason": args.reason, "previous_status": row["status"]})
+        json_out(dict(task_row(db, args.id)))
+
+def unblock(args):
+    """Requeue a blocked task, clearing its blocked reason."""
+    with conn() as db:
+        row = task_row(db, args.id)
+        if row["status"] != "blocked":
+            raise SystemExit(f"task is not blocked (status: {row['status']})")
+        t = now()
+        db.execute("UPDATE tasks SET status='queued',blocked_reason='',updated_at=? WHERE id=?", (t, args.id))
+        audit(db, "task", args.id, "unblocked", {"owner": args.owner})
+        json_out(dict(task_row(db, args.id)))
+
+def blocked_by(args):
+    """Transitive blockers: walk the dependency DAG upward from a task.
+
+    Returns every prerequisite reachable through task_deps with its depth
+    (direct deps at depth 1), live status, and satisfaction flag. The graph is
+    acyclic by construction (would_cycle guards every edge insert), so the
+    recursive walk always terminates.
+    """
+    with conn() as db:
+        task_row(db, args.id)
+        rows = [dict(r) for r in db.execute(
+            "WITH RECURSIVE up(id,depth) AS ("
+            " SELECT ?,0 UNION"
+            " SELECT d.depends_on,up.depth+1 FROM task_deps d JOIN up ON d.task_id=up.id"
+            ") "
+            "SELECT up.id,up.depth,COALESCE(t.status,'missing') AS status,"
+            "COALESCE(t.title,'') AS title,(COALESCE(t.status,'')='completed') AS satisfied "
+            "FROM up LEFT JOIN tasks t ON t.id=up.id WHERE up.depth>0 "
+            "ORDER BY up.depth,up.id", (args.id,)).fetchall()]
+    json_out({"ok": True, "task_id": args.id,
+              "blocked": any(not r["satisfied"] for r in rows),
+              "blockers": rows})
+
 def verify_chain(args):
     with conn() as db:
         problems = audit_chain_problems(db)
@@ -714,6 +769,9 @@ def claim(args):
         row = task_row(db, args.id)
         if row["status"] in {"completed", "cancelled"}:
             raise SystemExit(f"cannot claim terminal task: {row['status']}")
+        if row["status"] == "blocked":
+            raise SystemExit("task is blocked: %s; unblock before claiming"
+                             % (row["blocked_reason"] or "no reason recorded"))
         pending = unsatisfied_deps(db, args.id)
         if pending:
             raise SystemExit("unsatisfied dependencies: " + ", ".join(f"{d['id']}({d['status']})" for d in pending))
@@ -733,19 +791,36 @@ def add_dep(args):
     json_out({"ok": True, "task_id": args.id, "depends_on": args.depends_on})
 
 def next_task(args):
-    """Dispatch: highest-priority queued task whose dependencies are all completed."""
+    """Dispatch: highest-priority queued task whose dependencies are all completed.
+
+    With --explain, the result also reports how many queued candidates were
+    considered and why each skipped candidate was not picked (currently
+    unsatisfied_dependencies with the blocking ids), giving dispatchers
+    visibility into why work is not flowing.
+    """
+    explain = bool(getattr(args, "explain", False))
     with conn() as db:
         q = "SELECT * FROM tasks WHERE status='queued'"
         vals = []
         if args.project:
             q += " AND project=?"; vals.append(args.project)
         q += _due_order()
+        rows = db.execute(q, vals).fetchall()
         picked = None
-        for r in db.execute(q, vals).fetchall():
-            if not unsatisfied_deps(db, r["id"]):
-                picked = r
-                break
+        skipped = []
+        for r in rows:
+            pending = unsatisfied_deps(db, r["id"])
+            if pending:
+                if explain:
+                    skipped.append({"task_id": r["id"], "reason": "unsatisfied_dependencies",
+                                    "blocked_by": [d["id"] for d in pending]})
+                continue
+            picked = r
+            break
         out = {"ok": True, "task": dict(picked) if picked else None}
+        if explain:
+            out["considered"] = len(rows)
+            out["skipped"] = skipped
         if picked is None:
             json_out(out)
             return
@@ -813,6 +888,10 @@ def show(args):
             "SELECT d.depends_on AS id, COALESCE(t.status,'missing') AS status, (COALESCE(t.status,'')='completed') AS satisfied "
             "FROM task_deps d LEFT JOIN tasks t ON t.id=d.depends_on WHERE d.task_id=? ORDER BY d.created_at",
             (args.id,)).fetchall()]
+        dependents = [dict(r) for r in db.execute(
+            "SELECT d.task_id AS id, COALESCE(t.status,'missing') AS status FROM task_deps d "
+            "LEFT JOIN tasks t ON t.id=d.task_id WHERE d.depends_on=? ORDER BY d.created_at",
+            (args.id,)).fetchall()]
     for r in receipts:
         r["payload"] = json.loads(r.pop("payload_json"))
     for e in events:
@@ -820,6 +899,7 @@ def show(args):
     out["receipts"] = receipts
     out["audit"] = events
     out["dependencies"] = deps
+    out["dependents"] = dependents
     json_out(out)
 
 def metrics(args):
@@ -961,6 +1041,9 @@ def main():
     p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.set_defaults(fn=update)
     p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=complete)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
+    p=sub.add_parser("block"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=block)
+    p=sub.add_parser("unblock"); p.add_argument("id"); p.add_argument("--owner",required=True); p.set_defaults(fn=unblock)
+    p=sub.add_parser("blocked-by"); p.add_argument("id"); p.set_defaults(fn=blocked_by)
     p=sub.add_parser("verify-chain"); p.set_defaults(fn=verify_chain)
     p=sub.add_parser("events"); p.add_argument("--entity-type"); p.add_argument("--entity-id"); p.add_argument("--action"); p.add_argument("--since",default=""); p.add_argument("--until",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--verify",action="store_true"); p.set_defaults(fn=events)
     p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=claim)
@@ -971,7 +1054,7 @@ def main():
     p=sub.add_parser("metrics"); p.set_defaults(fn=metrics)
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
-    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=next_task)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
