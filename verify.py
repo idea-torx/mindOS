@@ -2004,6 +2004,122 @@ with tempfile.TemporaryDirectory() as td:
     d1.pop('created_at'); d2.pop('created_at')
     assert d1 == d2, 'identical sources must reproduce an identical manifest'
     assert tree_digest() == before, 'discovery must never mutate a scanned source'
+    # Migration import: stage two of the installer/migrator. A sealed stage-one
+    # inventory binds the import; drift since sealing is refused; active leases
+    # are sanitized to queued (the prior owner does not exist here); receipt
+    # files are restored byte-exactly with hash verification; re-runs dedupli-
+    # cate idempotently; a lived-in target demands an explicit --relink-audit
+    # decision before a foreign audit chain may be merged; and credential-
+    # shaped content is refused by default with --redact as the middle path.
+    def mkhome(path):
+        path.mkdir(parents=True)
+        henv = os.environ.copy(); henv['HERMES_AUTOPILOT_HOME'] = str(path)
+        p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), 'init'],
+                           env=henv, text=True, capture_output=True)
+        assert p.returncode == 0, p.stderr
+        return henv
+    def hrun(henv_, *a):
+        p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *a],
+                           env=henv_, text=True, capture_output=True)
+        assert p.returncode == 0, (a, p.stdout, p.stderr)
+        return json.loads(p.stdout) if p.stdout.strip() else {}
+    impsrc = Path(td) / 'impsrc/autopilot'
+    senv = mkhome(impsrc)
+    hrun(senv, 'create', '--project', 'Legacy', '--title', 'carried work', '--id', 'mig-1')
+    hrun(senv, 'create', '--project', 'Legacy', '--title', 'active job', '--id', 'mig-2')
+    hrun(senv, 'claim', 'mig-1', '--owner', 'old-agent')
+    hrun(senv, 'claim', 'mig-2', '--owner', 'old-agent')       # left mid-flight on purpose
+    hrun(senv, 'receipt', 'mig-1', '--kind', 'verification', '--payload', '{"evidence":"tests pass"}')
+    rid = next((impsrc / 'receipts').glob('*.json')).stem
+    hrun(senv, 'complete', 'mig-1', '--owner', 'old-agent', '--receipt', rid)
+    hrun(senv, 'note', 'mig-1', '--content', 'context note for the next agent')
+    inv2_path = Path(td) / 'inventory-import.json'
+    inv2 = ops('migrate-inventory', '--root', str(Path(td) / 'impsrc'), '--out', str(inv2_path))
+    sid = inv2['sources'][0]['id']
+    tgt = Path(td) / 'imptgt/autopilot'
+    tenv = mkhome(tgt)
+    def mimpo(tenv_, *a, fail=False):
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-import',
+                            '--inventory', str(inv2_path), '--source-id', sid, *a],
+                           env=tenv_, text=True, capture_output=True)
+        if fail:
+            assert p.returncode != 0, ('expected refusal', a, p.stdout, p.stderr)
+            return p.stdout + p.stderr
+        assert p.returncode == 0, (a, p.stdout, p.stderr)
+        return json.loads(p.stdout)
+    dry = mimpo(tenv)
+    assert dry['dry_run'] is True and dry['sanitized_tasks'] == ['mig-2'], dry
+    assert dry['tables']['tasks']['source_rows'] == 2, dry
+    assert dry['heartbeats_skipped_disposable'] >= 1, dry      # disposable cache reported, not carried
+    res = mimpo(tenv, '--apply', '--out', str(Path(td) / 'migration-result.json'))
+    assert res['ok'] is True and res['inserted']['tasks'] == 2, res
+    assert res['audit_events_imported'] > 0 and not res['audit_relinked'], res
+    assert res['receipt_files_written'] == 1, res
+    assert res['health']['problems'] == [], res                # post-apply health report clean
+    rdoc = json.loads((Path(td) / 'migration-result.json').read_text())
+    rbody = {k: v for k, v in rdoc.items() if k not in ('sha256', 'format', 'created_at')}
+    assert rdoc['format'] == 'autopilot-migration-result-v1'
+    assert hashlib.sha256(json.dumps(rbody, sort_keys=True).encode()).hexdigest() == rdoc['sha256']
+    st, owner = sqlite3.connect(tgt / 'state.db').execute(
+        "SELECT status, lease_owner FROM tasks WHERE id='mig-2'").fetchone()
+    assert st == 'queued' and owner == '', (st, owner)         # active lease sanitized on arrival
+    assert (tgt / 'receipts' / f'{rid}.json').read_bytes() \
+        == (impsrc / 'receipts' / f'{rid}.json').read_bytes()  # byte-exact receipt restore
+    assert hrun(tenv, 'verify-chain')['ok'] is True            # imported chain verifies verbatim
+    res2 = mimpo(tenv, '--apply')
+    assert res2['deduplicated'] is True, res2                  # identical re-run deduplicates to nothing
+    assert res2['audit_events_imported'] == 0, res2
+    assert all(v == 0 for v in res2['inserted'].values()), res2
+    err = ops_fail('migrate-import', '--inventory', str(inv2_path), '--source-id', sid, '--apply')
+    assert '--relink-audit' in err, err                        # lived-in home: no silent chain merge
+    mp = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-import',
+                         '--inventory', str(inv2_path), '--source-id', sid,
+                         '--apply', '--relink-audit'], env=env, text=True, capture_output=True)
+    assert mp.returncode == 0, (mp.stdout, mp.stderr)
+    merged = json.loads(mp.stdout)
+    assert merged['audit_relinked'] is True and merged['health']['problems'] == [], merged
+    assert run('verify-chain')['ok'] is True                   # relinked combined ledger still verifies
+    hrun(senv, 'create', '--project', 'Legacy', '--title', 'post-seal drift', '--id', 'mig-3')
+    err = mimpo(tenv, '--apply', fail=True)
+    assert 'changed since the inventory was sealed' in err, err  # drift caught before any data moves
+    fc_path = Path(td) / 'inventory-fc.json'
+    ops_fail('migrate-inventory', '--root', str(mig), '--out', str(fc_path))  # seals before failing closed
+    err = ops_fail('migrate-import', '--inventory', str(fc_path), '--source-id', sid, '--apply')
+    assert 'failed closed' in err, err                         # fail-closed inventories never import
+    vinv_path = Path(td) / 'inventory-vault.json'
+    vinv = ops('migrate-inventory', '--root', str(mig / 'vault'), '--out', str(vinv_path))
+    err = ops_fail('migrate-import', '--inventory', str(vinv_path),
+                   '--source-id', vinv['sources'][0]['id'])
+    assert 'only autopilot_sqlite' in err, err                 # non-execution-truth sources refused
+    err = ops_fail('migrate-import', '--inventory', str(inv2_path), '--source-id', 'src-absent')
+    assert 'not found in inventory' in err, err
+    secsrc = Path(td) / 'secsrc/autopilot'
+    secenv = mkhome(secsrc)
+    hrun(secenv, 'create', '--project', 'Legacy', '--title', 'secret work', '--id', 'sec-1')
+    hrun(secenv, 'note', 'sec-1', '--content',
+         'deploy key AKIAIOSFODNN7EXAMPLE rotate soon', '--allow-secret')  # legacy-style row
+    sinv_path = Path(td) / 'inventory-secret.json'
+    sinv = ops('migrate-inventory', '--root', str(Path(td) / 'secsrc'), '--out', str(sinv_path))
+    ssid = sinv['sources'][0]['id']
+    stgt = Path(td) / 'sectgt/autopilot'
+    stenv = mkhome(stgt)
+    def simpo(*a, fail=False):
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-import',
+                            '--inventory', str(sinv_path), '--source-id', ssid, *a],
+                           env=stenv, text=True, capture_output=True)
+        if fail:
+            assert p.returncode != 0, ('expected refusal', a, p.stdout, p.stderr)
+            return p.stdout + p.stderr
+        assert p.returncode == 0, (a, p.stdout, p.stderr)
+        return json.loads(p.stdout)
+    err = simpo('--apply', fail=True)
+    assert 'refusing to import credential-shaped content' in err and 'aws_access_key' in err, err
+    red = simpo('--apply', '--redact')
+    assert red['secret_kinds'] == ['aws_access_key'] and red['ok'] is True, red
+    note_content = sqlite3.connect(stgt / 'state.db').execute(
+        'SELECT content FROM notes').fetchone()[0]
+    assert '[REDACTED:aws_access_key]' in note_content, note_content
+    assert 'AKIAIOSFODNN7EXAMPLE' not in note_content          # value never crosses the boundary
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

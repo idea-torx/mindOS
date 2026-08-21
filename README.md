@@ -1409,6 +1409,54 @@ Design rules, enforced and tested:
   `migrate-inventory-check` refuses the document; manifests are written
   atomically with `0600` permissions.
 
+## Migration import (installer stage two)
+
+`migrate-import` turns a sealed stage-one inventory into an actual import of
+Autopilot execution truth — tasks, dependency edges, receipts, notes, and
+handoffs — into this home. It binds to the inventory (`--inventory` +
+`--source-id`), refuses fail-closed manifests, re-verifies both the manifest
+seal and the source database checksum (so drift since discovery is caught
+before any data moves), opens the source read-only, and merges every table in
+one transaction with `INSERT OR IGNORE` on natural keys:
+
+```bash
+python3 "$O" migrate-import --inventory inventory.json --source-id src-…            # dry-run plan
+python3 "$O" migrate-import --inventory inventory.json --source-id src-… --apply    # do it
+```
+
+Design rules, enforced and tested:
+
+- **Dry-run first**: without `--apply` nothing is written; the plan reports
+  per-table source/already-present counts, sanitized tasks, secret kinds,
+  skipped disposable heartbeats, and whether the target would need
+  `--relink-audit`.
+- **Idempotent**: an identical re-run deduplicates to nothing (`deduplicated:
+  true`) — interrupted migrations resume by simply re-running; audit events
+  already absorbed by a prior import are recognized by content twin and never
+  double-inserted.
+- **Lease sanitization**: tasks that arrive mid-flight (`claimed`, `running`,
+  `waiting_for_agent`) are reset to `queued` with leases cleared, because the
+  prior owner does not exist here; heartbeats are disposable liveness cache
+  and are deliberately not carried.
+- **Audit-chain integrity**: a fresh home imports the source chain verbatim;
+  a home with genuine history refuses to merge a foreign chain (that would
+  break tamper evidence) unless `--relink-audit` explicitly relinks the
+  combined ledger. Stage-one's own bookkeeping does not make a home
+  "lived-in", so the canonical init → inventory → import flow needs no flags.
+- **Secret boundary**: notes/handoffs/receipts pass through the same guard as
+  the shared-memory write path — credential-shaped content is refused by
+  default, `--redact` imports `[REDACTED:<kind>]` copies (their source receipt
+  files are withheld rather than reintroducing the secret), `--allow-secret`
+  overrides audited.
+- **Restore verification**: receipt files reappear byte-exactly, each checked
+  against its sealed `file_hash`; a post-apply health report (integrity check,
+  FK violations introduced by the import, audit-chain problems, per-table
+  coverage) exits non-zero on any problem. Pre-existing target conditions
+  (e.g. intentionally dangling dep edges) are baselined before the import and
+  reported separately instead of falsely failing the migration.
+- **Sealed result**: `--out` writes an sha256-sealed
+  `autopilot-migration-result-v1` document for operator records.
+
 ## Next integration
 
 The hourly control tower should read this registry and report task changes. Existing project-specific policies should be added under `policies/` before allowing automatic side effects.

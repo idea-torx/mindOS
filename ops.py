@@ -1501,9 +1501,8 @@ def migrate_inventory(args=None):
                    for s in sources if s['status'] != 'ok']
         sys.exit('migration inventory failed closed:\n  ' + '\n  '.join(blocked))
 
-def migrate_inventory_check(args):
-    """Verify a sealed inventory manifest without touching any database."""
-    path = Path(args.path)
+def _load_inventory(path: Path):
+    """Read and seal-verify an inventory manifest; returns its body."""
     if not path.exists(): raise SystemExit(f'inventory not found: {path}')
     try:
         doc = json.loads(path.read_text())
@@ -1516,10 +1515,365 @@ def migrate_inventory_check(args):
     actual = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
     if actual != expected:
         raise SystemExit('inventory integrity check failed; refusing a tampered manifest')
-    print(json.dumps({'ok': True, 'path': str(path), 'created_at': body.get('created_at'),
+    body['sha256'] = expected   # re-attach the verified seal for provenance
+    return body
+
+def migrate_inventory_check(args):
+    """Verify a sealed inventory manifest without touching any database."""
+    body = _load_inventory(Path(args.path))
+    print(json.dumps({'ok': True, 'path': str(args.path), 'created_at': body.get('created_at'),
                       'root': body.get('root'), 'summary': body.get('summary'),
                       'fail_closed': body.get('fail_closed', False),
-                      'expected_sha256': expected, 'actual_sha256': actual}, sort_keys=True))
+                      'sha256': body.get('sha256')}, sort_keys=True))
+
+MIGRATION_RESULT_FORMAT = 'autopilot-migration-result-v1'
+# Execution-truth tables imported by migrate-import, in FK-safe insert order.
+# Heartbeats are deliberately excluded: liveness state for owners who do not
+# exist on this machine is disposable cache, not history worth carrying.
+_MIGRATION_TABLES = ('tasks', 'task_deps', 'receipts', 'notes', 'handoffs')
+_MIGRATION_REQUIRED_COLS = {
+    'tasks': ('id',), 'task_deps': ('task_id', 'depends_on'),
+    'receipts': ('id',), 'notes': ('id',), 'handoffs': ('id',),
+}
+
+def _rechain_audit(c):
+    """Recompute the audit hash chain over every event in id order.
+
+    Only ever needed when foreign events are merged into a ledger that already
+    has its own chain (the --relink-audit path); a fresh home imports the
+    source chain verbatim and never touches existing seals.
+    """
+    prev = ''
+    for row in c.execute('SELECT id FROM audit_events ORDER BY id').fetchall():
+        r = c.execute('SELECT entity_type,entity_id,action,payload_json,created_at '
+                      'FROM audit_events WHERE id=?', (row[0],)).fetchone()
+        h = autopilot._chain_hash(prev, *tuple(r))
+        c.execute('UPDATE audit_events SET prev_hash=?,hash=? WHERE id=?', (prev, h, row[0]))
+        prev = h
+
+_MIGRATION_BOOKKEEPING_SECRET_ACTIONS = ('secret_blocked', 'secret_redacted', 'secret_allowed')
+
+def _foreign_audit_total(c):
+    """Count target audit events that are genuine local history.
+
+    System-scoped migration bookkeeping (inventory seals, this migrator's own
+    secret decisions) never makes a home "lived-in" — the canonical
+    init -> migrate-inventory -> migrate-import flow must work with no special
+    flags. Any other event is operator/agent history that demands the explicit
+    --relink-audit decision before a foreign chain can be merged.
+    """
+    return c.execute(
+        "SELECT COUNT(*) FROM audit_events WHERE NOT (entity_type='system' AND ("
+        "(action LIKE 'migration\\_%' ESCAPE '\\') OR action IN (?,?,?)))",
+        _MIGRATION_BOOKKEEPING_SECRET_ACTIONS).fetchone()[0]
+
+def _migration_secret_policy(rows_by_table, redact, allow, source_id, applying):
+    """Shared-memory secret guard over the rows about to be imported.
+
+    Same boundary as work orders: refuse credential-shaped content by default,
+    --redact stores [REDACTED:<kind>] copies, --allow-secret overrides. The
+    decision is audited kind-only. Returns (kinds, rows_after_policy).
+    """
+    kinds = sorted(_doc_secret_kinds({t: rs for t, rs in rows_by_table.items()}))
+    if not kinds:
+        return [], rows_by_table
+    if allow:
+        if applying:
+            with autopilot.conn() as c:
+                autopilot.audit(c, 'system', source_id, 'secret_allowed',
+                                {'fields': ['migration_import'], 'kinds': kinds})
+        return kinds, rows_by_table
+    if redact:
+        if applying:
+            with autopilot.conn() as c:
+                autopilot.audit(c, 'system', source_id, 'secret_redacted',
+                                {'fields': ['migration_import'], 'kinds': kinds})
+        return kinds, {t: _redact_doc(rs) for t, rs in rows_by_table.items()}
+    if applying:
+        with autopilot.conn() as c:
+            autopilot.audit(c, 'system', source_id, 'secret_blocked',
+                            {'fields': ['migration_import'], 'kinds': kinds})
+    raise SystemExit(
+        'refusing to import credential-shaped content (%s); re-run with --redact '
+        'to import redacted copies or --allow-secret to override' % ', '.join(kinds))
+
+def migrate_import(args=None):
+    """Import Autopilot execution truth from an inventoried source into this home.
+
+    Stage two of the installer/migrator: binds to the sealed stage-one
+    inventory (`--inventory` + `--source-id`), refuses fail-closed manifests,
+    re-verifies both the seal and the source database checksum so drift since
+    discovery is caught before any data moves, then merges every execution
+    table idempotently (INSERT OR IGNORE on natural keys — an identical re-run
+    deduplicates to nothing). Tasks that arrive mid-flight are sanitized to
+    queued with leases cleared, because the prior owner does not exist here.
+    The audit hash chain is preserved verbatim when this home's ledger is
+    empty; merging into a live ledger breaks every link and is refused unless
+    `--relink-audit` explicitly relinks the whole merged chain.
+
+    Dry-run is the default: nothing is written until `--apply` is passed.
+    Everything lands in one transaction (rollback on any failure), receipt
+    files are restored from the source home with their sealed hashes
+    verified, and a post-apply health report (integrity, FK, chain, coverage)
+    exits non-zero on any problem. Sources are only ever opened read-only.
+    """
+    inv = _load_inventory(Path(args.inventory))
+    if inv.get('fail_closed'):
+        raise SystemExit('inventory failed closed; resolve blocked sources before importing')
+    sid = args.source_id
+    src_meta = next((s_ for s_ in inv.get('sources', []) if s_.get('id') == sid), None)
+    if src_meta is None:
+        raise SystemExit(f'source {sid} not found in inventory')
+    if src_meta['kind'] != 'autopilot_sqlite':
+        raise SystemExit(f"source {sid} is kind '{src_meta['kind']}'; only autopilot_sqlite sources can be imported")
+    if src_meta['status'] != 'ok':
+        raise SystemExit(f"source {sid} is not healthy ({'; '.join(src_meta['problems'])}); resolve it first")
+    db_path = Path(src_meta['path'])
+    entry = next((f for f in src_meta.get('files', [])
+                  if (db_path.parent / f['path']) == db_path), None)
+    if entry is None:
+        raise SystemExit(f'source database {db_path} has no checksum in the inventory; re-run migrate-inventory')
+    if _scan_sha256(db_path) != entry['sha256']:
+        raise SystemExit(
+            f'source database changed since the inventory was sealed ({db_path}); re-run migrate-inventory')
+    dry = not getattr(args, 'apply', False)
+    autopilot.ensure()
+    try:
+        src = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=5)
+        src.row_factory = sqlite3.Row
+        integrity = src.execute('PRAGMA integrity_check').fetchone()[0]
+        if integrity != 'ok':
+            raise SystemExit(f'source integrity check failed at import time: {integrity}')
+        tgt = sqlite3.connect(DB, timeout=10)
+        tgt.row_factory = sqlite3.Row
+        tgt.execute('PRAGMA foreign_keys=ON')
+        # Schema-drift tolerance: import the intersection of columns, but never
+        # a row whose identity cannot be represented locally.
+        cols = {}
+        for t in _MIGRATION_TABLES:
+            tcols = {r[1] for r in tgt.execute(f'PRAGMA table_info({t})')}
+            scols = {r[1] for r in src.execute(f'PRAGMA table_info({t})')}
+            missing = [c_ for c_ in _MIGRATION_REQUIRED_COLS[t] if c_ not in scols or c_ not in tcols]
+            if missing:
+                raise SystemExit(f'source schema for {t} is missing required columns: {missing}')
+            cols[t] = sorted(scols & tcols)
+        rows = {}
+        for t in _MIGRATION_TABLES:
+            sel = ','.join(f'"{c_}"' for c_ in cols[t])
+            order = 'id' if t == 'tasks' else 'rowid'
+            rows[t] = [dict(r) for r in src.execute(f'SELECT {sel} FROM {t} ORDER BY {order}')]
+        hb_count = src.execute('SELECT COUNT(*) FROM heartbeats').fetchone()[0] \
+            if 'heartbeats' in {r[0] for r in src.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")} else 0
+        sanitized_ids = sorted(r['id'] for r in rows['tasks']
+                               if r['status'] in WORKORDER_ACTIVE_STATUSES)
+        for r in rows['tasks']:
+            if r['status'] in WORKORDER_ACTIVE_STATUSES:
+                r.update(status='queued', lease_owner='', lease_expires_at='',
+                         blocked_reason='migrated active lease sanitized')
+        secret_tables = {t: rows[t] for t in ('notes', 'handoffs', 'receipts')}
+        pre_secret = {r['id']: json.dumps(r, sort_keys=True) for r in secret_tables['receipts']}
+        kinds, secret_tables = _migration_secret_policy(
+            secret_tables, getattr(args, 'redact', False),
+            getattr(args, 'allow_secret', False), sid, applying=not dry)
+        rows.update(secret_tables)
+        # A redacted receipt row no longer matches its verbatim source file;
+        # restoring that file would reintroduce the very secret --redact
+        # removed, so those files are withheld and reported instead.
+        withheld_receipts = sorted(
+            rid for rid, j in pre_secret.items()
+            if json.dumps(next(r for r in rows['receipts'] if r['id'] == rid),
+                          sort_keys=True) != j)
+        src_audit = [dict(r) for r in src.execute(
+            'SELECT id,entity_type,entity_id,action,payload_json,created_at,prev_hash,hash '
+            'FROM audit_events ORDER BY id')]
+        present = {t: tgt.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
+                   for t in _MIGRATION_TABLES}
+        target_audit_total = tgt.execute('SELECT COUNT(*) FROM audit_events').fetchone()[0]
+        # Baseline FK state: a target may legitimately carry pre-existing
+        # dangling dep edges (missing prerequisites are a modeled state), so
+        # the post-apply health check must fail on violations the import
+        # INTRODUCED, not on damage that was already there.
+        baseline_fk = {tuple(r) for r in tgt.execute('PRAGMA foreign_key_check').fetchall()}
+        if dry:
+            print(json.dumps({
+                'ok': True, 'dry_run': True, 'source_id': sid, 'source_path': str(db_path),
+                'inventory_sha256': inv['sha256'],
+                'tables': {t: {'source_rows': len(rows[t]),
+                               'already_present': present[t]} for t in _MIGRATION_TABLES},
+                'sanitized_tasks': sanitized_ids, 'secret_kinds': kinds,
+                **({'receipt_files_withheld': withheld_receipts} if withheld_receipts else {}),
+                'heartbeats_skipped_disposable': hb_count,
+                'audit_events_source': len(src_audit),
+                'target_audit_ledger_empty': target_audit_total == 0,
+                'relink_required': _foreign_audit_total(tgt) > 0}, sort_keys=True))
+            return
+        relink = bool(getattr(args, 'relink_audit', False))
+        # Interrupted-migration resume: if every source event already exists
+        # here with identical content, this ledger already absorbed that chain
+        # and a re-run must deduplicate quietly rather than refuse or
+        # double-insert. Chain fields are deliberately excluded from the
+        # comparison: a prior --relink-audit merge legitimately rewrote them.
+        twins = 0
+        for r in src_audit:
+            hit = tgt.execute(
+                'SELECT 1 FROM audit_events WHERE entity_type=? AND entity_id=? AND '
+                'action=? AND payload_json=? AND created_at=?',
+                (r['entity_type'], r['entity_id'], r['action'], r['payload_json'],
+                 r['created_at'])).fetchone()
+            twins += 1 if hit else 0
+        resume = bool(src_audit) and twins == len(src_audit)
+        if target_audit_total > 0 and src_audit and not resume:
+            # Stage one's own bookkeeping (inventory seals, migration secret
+            # decisions) does not make a home "lived-in": the canonical
+            # init -> migrate-inventory -> migrate-import flow must work with
+            # no special flags. Only genuine operator/agent history demands
+            # the explicit --relink-audit decision.
+            foreign_total = _foreign_audit_total(tgt)
+            if foreign_total > 0 and not relink:
+                raise SystemExit(
+                    'this home already has audit history; importing a foreign chain would break '
+                    'tamper evidence. Start from a fresh home, or pass --relink-audit to '
+                    'explicitly merge and relink the combined ledger.')
+        try:
+            tgt.execute('BEGIN')
+            inserted, skipped_existing = {}, {}
+            for t in _MIGRATION_TABLES:
+                n = 0
+                for r in rows[t]:
+                    cur = tgt.execute(
+                        f'INSERT OR IGNORE INTO {t}({",".join(cols[t])}) '
+                        f'VALUES({",".join("?" * len(cols[t]))})',
+                        [r[c_] for c_ in cols[t]])
+                    n += cur.rowcount
+                inserted[t] = n
+                skipped_existing[t] = len(rows[t]) - n
+            audit_offset = 0
+            if target_audit_total > 0 and src_audit:
+                audit_offset = tgt.execute(
+                    'SELECT COALESCE(MAX(id),0) FROM audit_events').fetchone()[0]
+            audit_imported = 0
+            for r in src_audit:
+                # Per-event content twin: an event already absorbed by a prior
+                # import (verbatim or relink-shifted) is skipped rather than
+                # re-inserted, making re-runs and interrupted resumes
+                # idempotent over the audit ledger itself.
+                if tgt.execute(
+                        'SELECT 1 FROM audit_events WHERE entity_type=? AND entity_id=? AND '
+                        'action=? AND payload_json=? AND created_at=?',
+                        (r['entity_type'], r['entity_id'], r['action'], r['payload_json'],
+                         r['created_at'])).fetchone():
+                    continue
+                cur = tgt.execute(
+                    'INSERT OR IGNORE INTO audit_events(id,entity_type,entity_id,action,'
+                    'payload_json,created_at,prev_hash,hash) VALUES(?,?,?,?,?,?,?,?)',
+                    (r['id'] + audit_offset, r['entity_type'], r['entity_id'], r['action'],
+                     r['payload_json'], r['created_at'], r['prev_hash'], r['hash']))
+                audit_imported += cur.rowcount
+            autopilot.audit(tgt, 'system', sid, 'migration_import_applied',
+                            {'inventory_sha256': inv['sha256'], 'source_id': sid,
+                             'source_path': str(db_path), 'inserted': inserted,
+                             'skipped_existing': skipped_existing,
+                             'sanitized_tasks': sanitized_ids,
+                             **({'secret_kinds': kinds} if kinds else {}),
+                             **({'receipt_files_withheld': withheld_receipts}
+                                if withheld_receipts else {}),
+                             'audit_relinked': bool(audit_offset and audit_imported)})
+            if audit_offset and audit_imported:
+                _rechain_audit(tgt)
+            tgt.commit()
+        except Exception:
+            tgt.rollback()
+            raise
+        # Restore verification: receipt files reappear here exactly as sealed,
+        # byte-checked against the file_hash recorded in each imported row.
+        written, hash_mismatches = 0, []
+        src_receipts = db_path.parent / 'receipts'
+        for r in rows['receipts']:
+            rid = r['id']
+            if rid in withheld_receipts:
+                continue
+            target_file = autopilot.RECEIPTS / f'{rid}.json'
+            if target_file.exists():
+                continue
+            source_file = src_receipts / f'{rid}.json'
+            if not source_file.exists():
+                continue
+            text = source_file.read_text()
+            if r.get('file_hash') and hashlib.sha256(text.encode()).hexdigest() != r['file_hash']:
+                hash_mismatches.append(rid)
+                continue
+            fd, tmp = tempfile.mkstemp(prefix=f'.{rid}.', dir=str(autopilot.RECEIPTS))
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    f.write(text); f.flush(); os.fsync(f.fileno())
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, str(target_file))
+                written += 1
+            finally:
+                if os.path.exists(tmp): os.unlink(tmp)
+        health_problems = []
+        if tgt.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+            health_problems.append('integrity_check failed on the target database')
+        current_fk = {tuple(r) for r in tgt.execute('PRAGMA foreign_key_check').fetchall()}
+        new_fk = current_fk - baseline_fk
+        pre_existing_fk = len(baseline_fk & current_fk)
+        health_problems += [f'fk_violation: {v}' for v in sorted(new_fk)]
+        chain_problems = autopilot.audit_chain_problems(tgt)
+        health_problems += [f'audit chain: {p}' for p in chain_problems]
+        coverage = {}
+        for t in _MIGRATION_TABLES:
+            s_count = src.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
+            t_count = tgt.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
+            coverage[t] = {'source': s_count, 'target': t_count}
+            if t_count < s_count:
+                health_problems.append(f'{t}: target has {t_count} rows, source has {s_count}')
+        health_problems += [f'receipt file hash mismatch: {rid}' for rid in hash_mismatches]
+        deduplicated = all(v == 0 for v in inserted.values()) and audit_imported == 0
+        result = {
+            'ok': not health_problems, 'applied': True, 'deduplicated': deduplicated,
+            'source_id': sid, 'source_path': str(db_path),
+            'inventory_sha256': inv['sha256'],
+            'inserted': inserted, 'skipped_existing': skipped_existing,
+            'sanitized_tasks': sanitized_ids,
+            **({'secret_kinds': kinds} if kinds else {}),
+            'audit_events_imported': audit_imported,
+            'audit_relinked': bool(audit_offset and audit_imported),
+            'heartbeats_skipped_disposable': hb_count,
+            'receipt_files_written': written,
+            **({'receipt_files_withheld': withheld_receipts} if withheld_receipts else {}),
+            'health': {'problems': health_problems, 'coverage': coverage,
+                       'chain_problem_count': len(chain_problems),
+                       'pre_existing_fk_violations': pre_existing_fk}}
+        out = getattr(args, 'out', None)
+        if out:
+            body_doc = {k: v for k, v in result.items() if k != 'ok'}
+            doc = {**body_doc, 'format': MIGRATION_RESULT_FORMAT, 'created_at': utc(),
+                   'sha256': hashlib.sha256(
+                       json.dumps(body_doc, sort_keys=True).encode()).hexdigest()}
+            out_path = Path(out); out_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix='.migration-result.', dir=str(out_path.parent))
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    f.write(json.dumps(doc, sort_keys=True)); f.flush(); os.fsync(f.fileno())
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, str(out_path))
+            finally:
+                if os.path.exists(tmp): os.unlink(tmp)
+            result['result_doc'] = str(out_path)
+        print(json.dumps(result, sort_keys=True))
+        if health_problems:
+            sys.exit('migration import failed its health check:\n  '
+                     + '\n  '.join(health_problems))
+    finally:
+        try:
+            src.close()
+        except Exception:
+            pass
+        try:
+            tgt.close()
+        except Exception:
+            pass
 
 def policy(args):
     path=Path.home()/'.hermes/autopilot/policies'/f'{args.project.lower()}.yaml'
@@ -1555,4 +1909,5 @@ x=s.add_parser('approval'); x.add_argument('action',choices=['approve','reject',
 x=s.add_parser('policy'); x.add_argument('project'); x.add_argument('action'); x.set_defaults(fn=policy)
 x=s.add_parser('migrate-inventory'); x.add_argument('--root',required=True); x.add_argument('--out',default=None); x.set_defaults(fn=migrate_inventory)
 x=s.add_parser('migrate-inventory-check'); x.add_argument('path'); x.set_defaults(fn=migrate_inventory_check)
+x=s.add_parser('migrate-import'); x.add_argument('--inventory',required=True); x.add_argument('--source-id',dest='source_id',required=True); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--out',default=None,help='write a sealed autopilot-migration-result-v1 document'); x.add_argument('--redact',action='store_true'); x.add_argument('--allow-secret',action='store_true'); x.add_argument('--relink-audit',dest='relink_audit',action='store_true',help='merge into a non-empty audit ledger and relink the combined chain'); x.set_defaults(fn=migrate_import)
 args=p.parse_args(); args.fn(args)
