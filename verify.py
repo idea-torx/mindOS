@@ -1774,6 +1774,34 @@ with tempfile.TemporaryDirectory() as td:
     cpg = run('critical-path','--project','Chain')
     assert cpg['length'] == 3, cpg
     assert [(n['id'], n['status']) for n in cpg['path']] == [('cp-g2','missing'),('cp-g1','missing'),('cp-c','queued')], cpg
+    # Task deduplication: creating work that restates an open same-project task
+    # flags it at create time (audited), `similar` triages from any task, and
+    # ops.py dup-tasks sweeps clusters fleet-wide; settled tasks and other
+    # projects never count as duplicates.
+    run('create','--project','Dupes','--title','fix login redirect loop','--id','tdup-1')
+    d2 = run('create','--project','Dupes','--title','fix login redirect loop bug','--id','tdup-2')
+    sims = d2.get('similar_open_tasks') or []
+    assert len(sims) == 1 and sims[0]['task_id'] == 'tdup-1' and sims[0]['similarity'] >= 0.8, d2
+    d3 = run('create','--project','Dupes','--title','write onboarding docs','--id','tdup-3')
+    assert 'similar_open_tasks' not in d3, d3                       # unrelated work stays quiet
+    dx = run('create','--project','Other','--title','fix login redirect loop','--id','tdup-x')
+    assert 'similar_open_tasks' not in dx, dx                       # cross-project is a different seam
+    ev = next(e for e in run('show','tdup-2')['audit'] if e['action'] == 'created')
+    assert ev['payload']['similar_open_tasks'] == ['tdup-1'], ev     # provenance in the audit chain
+    sim = run('similar','tdup-1')
+    assert sim['ok'] is True and [s['task_id'] for s in sim['similar']] == ['tdup-2'], sim
+    assert run('similar','tdup-3')['count'] == 0
+    assert run('similar','tdup-2','--threshold','0.99')['count'] == 0   # threshold is honored
+    dt = ops('dup-tasks')
+    cl = next(c for c in dt['clusters'] if c['project'] == 'Dupes')
+    assert cl['canonical']['task_id'] == 'tdup-1', dt                # oldest is canonical
+    assert [d['task_id'] for d in cl['duplicates']] == ['tdup-2'], dt
+    assert dt['duplicate_tasks'] >= 1
+    run('claim','tdup-1','--owner','tester','--minutes','5')
+    run('complete','tdup-1','--owner','tester')
+    run('cancel','tdup-2','--owner','tester')
+    d4 = run('create','--project','Dupes','--title','fix login redirect loop','--id','tdup-4')
+    assert 'similar_open_tasks' not in d4, d4                       # settled work is history, not a collision
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

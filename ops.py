@@ -1185,6 +1185,65 @@ def consolidate(args=None):
                       'clusters': clusters_out, 'consolidated_count': consolidated},
                      sort_keys=True))
 
+def dup_tasks(args=None):
+    """Fleet sweep: cluster open tasks whose text restates the same work.
+
+    Task-layer memory hygiene (the mirror of `consolidate` for notes): two
+    open tasks describing the same work split agent effort across two seams,
+    both surface in dispatch, and neither inherits the other's context. Open
+    (non-terminal) tasks are grouped per project and clustered by token-Jaccard
+    similarity over title+description — the same measure and greedy algorithm
+    as note consolidation. Unlike notes, tasks cannot be auto-superseded:
+    merging them is a lifecycle decision (cancel one, or fold it via dep), so
+    this sweep is strictly read-only and reports clusters with a suggested
+    action. Deterministic: same rows, same clusters, canonical = oldest.
+    """
+    t = utc()
+    threshold = getattr(args, 'threshold', None) if args is not None else None
+    if threshold is None:
+        threshold = autopilot._near_dup_threshold()
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        raise SystemExit('--threshold must be a number between 0 and 1')
+    if not 0 < threshold <= 1:
+        raise SystemExit('--threshold must be a number between 0 and 1')
+    clusters_out = []
+    with db() as c:
+        rows = c.execute(
+            "SELECT id,project,title,description,status,priority,created_at FROM tasks "
+            "WHERE status NOT IN ('completed','failed','cancelled') "
+            "ORDER BY project,created_at,id").fetchall()
+        by_project = {}
+        for r in rows:
+            d = dict(r)
+            # Reuse the note-clustering machinery: it clusters on 'content'.
+            d['content'] = f"{r['title']} {r['description']}".strip()
+            by_project.setdefault(r['project'], []).append(d)
+        for project in sorted(by_project):
+            prows = by_project[project]
+            if len(prows) < 2:
+                continue
+            for cl in _cluster_live_notes(prows, threshold):
+                members = cl['members']
+                if not members:
+                    continue
+                kept = cl['kept']
+                clusters_out.append({
+                    'project': project,
+                    'canonical': {'task_id': kept['id'], 'title': kept['title'],
+                                  'status': kept['status'], 'created_at': kept['created_at']},
+                    'duplicates': [{'task_id': m['id'], 'title': m['title'],
+                                    'status': m['status'], 'similarity': sim}
+                                   for m, sim in sorted(members, key=lambda x: x[0]['id'])],
+                    'suggested_action': 'cancel the duplicates or fold them into the '
+                                        'canonical task via dep; record why in a handoff',
+                })
+    print(json.dumps({'ok': True, 'generated_at': t, 'threshold': threshold,
+                      'clusters': clusters_out, 'cluster_count': len(clusters_out),
+                      'duplicate_tasks': sum(len(cl['duplicates']) for cl in clusters_out)},
+                     sort_keys=True))
+
 def policy(args):
     path=Path.home()/'.hermes/autopilot/policies'/f'{args.project.lower()}.yaml'
     if not path.exists(): print(json.dumps({'allowed':False,'reason':'no project policy'})); return
@@ -1201,6 +1260,7 @@ x=s.add_parser('recall-stale'); x.set_defaults(fn=recall_stale)
 x=s.add_parser('notes-expired'); x.set_defaults(fn=notes_expired)
 x=s.add_parser('secret-scan'); x.add_argument('--all',action='store_true'); x.set_defaults(fn=secret_scan)
 x=s.add_parser('consolidate'); x.add_argument('--task',default=''); x.add_argument('--threshold',type=float,default=None); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=consolidate)
+x=s.add_parser('dup-tasks'); x.add_argument('--threshold',type=float,default=None); x.set_defaults(fn=dup_tasks)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--backoff-base',type=int,default=60); x.add_argument('--backoff-cap',type=int,default=3600); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('escalate'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=escalate)
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)

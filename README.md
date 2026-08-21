@@ -321,6 +321,40 @@ Design properties:
 - **Retired notes excluded**: expired unpinned notes are already invisible to
   packs and retrieval, so consolidation never resurrects them.
 
+## Task deduplication (similar / ops.py dup-tasks)
+
+The same dedup discipline that keeps shared memory clean applies to the work
+queue itself: two open tasks describing the same work split agent effort across
+two seams, both surface in dispatch, and neither inherits the other's context.
+Task creation now flags this at the source — when a new task's
+title+description text overlaps an open (non-terminal) same-project task at or
+above the near-duplicate threshold, the response carries `similar_open_tasks`
+and the audited `created` event records `similar_open_tasks`, so provenance
+shows the collision was visible from birth:
+
+```bash
+python3 autopilot.py similar <task-id>              # triage: what restates this task?
+python3 autopilot.py similar <task-id> --threshold 0.7   # looser matching
+python3 ops.py dup-tasks                            # fleet-wide cluster sweep
+python3 ops.py dup-tasks --threshold 0.7 --dry-run  # (read-only either way)
+```
+
+Design properties:
+
+- **Open tasks only**: settled work is history, not a collision — completed,
+  failed, and cancelled tasks never count as duplicates.
+- **Same-project only**: by the seam rule, the same title under a different
+  project is a different checkout and never conflicts.
+- **Informational, never blocking**: creation is never refused; agents and
+  operators decide whether to cancel a duplicate or fold it into the canonical
+  task via `dep`.
+- **Read-only fleet sweep**: unlike notes, tasks cannot be auto-superseded —
+  merging them is a lifecycle decision — so `dup-tasks` clusters with the same
+  greedy token-Jaccard algorithm as `consolidate` (canonical = oldest) and
+  reports each cluster with a suggested action instead of mutating.
+- **Deterministic**: similarity descending, then id; same rows always yield
+  the same clusters.
+
 ## Secret guard (privacy boundary for shared memory)
 
 The contract is explicit: credentials, private tokens, and raw personal data

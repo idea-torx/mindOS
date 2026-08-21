@@ -551,6 +551,38 @@ def _near_duplicates(db, task_id: str, content: str) -> list:
     similar.sort(key=lambda s: (-s["similarity"], s["note_id"]))
     return similar
 
+def _similar_open_tasks(db, project: str, text: str, exclude_id: str = "",
+                        threshold: float | None = None) -> list:
+    """Open tasks in one project whose title/description text overlaps heavily.
+
+    Task-layer deduplication (the mirror of the note near-dup guard): two open
+    tasks describing the same work split agent effort across two seams and
+    both surface in dispatch. Only non-terminal tasks count — settled work is
+    history, not a collision — and only within the same project, since the
+    same title under a different project is a different checkout by the seam
+    rule. Informational only: creation is never blocked. Deterministic:
+    similarity descending, then id.
+    """
+    toks = _tokens(text)
+    if not toks:
+        return []
+    if threshold is None:
+        threshold = _near_dup_threshold()
+    similar = []
+    for r in db.execute(
+            "SELECT id,title,description FROM tasks WHERE project=? "
+            "AND status NOT IN ('completed','failed','cancelled') ORDER BY id",
+            (project,)).fetchall():
+        if r["id"] == exclude_id:
+            continue
+        other = _tokens(r["title"] + " " + r["description"])
+        sim = _jaccard(toks, other)
+        if sim >= threshold:
+            similar.append({"task_id": r["id"], "title": r["title"],
+                            "similarity": round(sim, 3)})
+    similar.sort(key=lambda s: (-s["similarity"], s["task_id"]))
+    return similar
+
 def live_note(db, task_id: str, content_hash: str):
     return db.execute(
         "SELECT * FROM notes WHERE task_id=? AND content_hash=? AND superseded_by='' ORDER BY created_at DESC LIMIT 1",
@@ -1980,10 +2012,42 @@ def create(args):
     tags = sorted({_valid_tag(x) for x in (getattr(args, "tag", None) or [])})
     with conn() as db:
         db.execute("INSERT INTO tasks(id,project,title,description,owner,status,priority,next_action,due_at,not_before,tags,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (task_id,args.project,args.title,args.description,args.owner,"queued",args.priority,args.next_action,due_at,not_before,json.dumps(tags),t,t))
-        audit(db, "task", task_id, "created", {"project": args.project, "owner": args.owner, "priority": args.priority, "due_at": due_at, "not_before": not_before, **({"tags": tags} if tags else {})})
+        # Task-layer deduplication: flag open tasks in the same project whose
+        # text restates this one. Informational — creation is never blocked.
+        similar = _similar_open_tasks(db, args.project,
+                                      f"{args.title} {args.description}", task_id)
+        audit(db, "task", task_id, "created", {"project": args.project, "owner": args.owner, "priority": args.priority, "due_at": due_at, "not_before": not_before, **({"tags": tags} if tags else {}), **({"similar_open_tasks": [s["task_id"] for s in similar]} if similar else {})})
         for dep in getattr(args, "depends_on", []) or []:
             add_dependency(db, task_id, dep)
-    json_out({"ok": True, "id": task_id, "status": "queued"})
+    out = {"ok": True, "id": task_id, "status": "queued"}
+    if similar:
+        out["similar_open_tasks"] = similar
+    json_out(out)
+
+def similar_tasks(args):
+    """Triage view: open tasks in this task's project that restate its work.
+
+    The read-side of create-time duplicate flagging: given any task, list the
+    open (non-terminal) same-project tasks whose title/description text
+    overlaps it at or above the near-duplicate threshold. Use it before
+    claiming or merging duplicate work; `ops.py dup-tasks` sweeps the fleet.
+    """
+    threshold = getattr(args, "threshold", None)
+    if threshold is not None:
+        try:
+            threshold = float(threshold)
+        except (TypeError, ValueError):
+            raise SystemExit("--threshold must be a number between 0 and 1")
+        if not 0 < threshold <= 1:
+            raise SystemExit("--threshold must be a number between 0 and 1")
+    with conn() as db:
+        row = task_row(db, args.id)
+        similar = _similar_open_tasks(
+            db, row["project"], f"{row['title']} {row['description']}", args.id,
+            threshold=threshold)
+    json_out({"ok": True, "task_id": args.id, "project": row["project"],
+              "threshold": threshold if threshold is not None else _near_dup_threshold(),
+              "count": len(similar), "similar": similar})
 
 def update(args):
     fields = {}
@@ -2957,6 +3021,7 @@ def main():
     p=sub.add_parser("unblock"); p.add_argument("id"); p.add_argument("--owner",required=True); p.set_defaults(fn=unblock)
     p=sub.add_parser("defer"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--until",default=""); p.set_defaults(fn=defer)
     p=sub.add_parser("blocked-by"); p.add_argument("id"); p.set_defaults(fn=blocked_by)
+    p=sub.add_parser("similar"); p.add_argument("id"); p.add_argument("--threshold",type=float,default=None,help="token-Jaccard cutoff (default: 0.8 / AUTOPILOT_NEAR_DUP_THRESHOLD)"); p.set_defaults(fn=similar_tasks)
     p=sub.add_parser("impact"); p.add_argument("id"); p.set_defaults(fn=impact)
     p=sub.add_parser("critical-path"); p.add_argument("--project",default=""); p.set_defaults(fn=critical_path)
     p=sub.add_parser("verify-chain"); p.add_argument("--checkpoint",default=""); p.set_defaults(fn=verify_chain)
