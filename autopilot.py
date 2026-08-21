@@ -1517,6 +1517,7 @@ def next_task(args):
     aging_minutes = getattr(args, "aging_minutes", 360)
     aging_boost = getattr(args, "aging_boost", 2)
     with conn() as db:
+        inherited = _inherit_priorities(db)
         q = "SELECT * FROM tasks WHERE status='queued'"
         vals = []
         if args.project:
@@ -1543,17 +1544,22 @@ def next_task(args):
                                     "recover_after": r["recover_after"]})
                 continue
             eff, boost = _effective_priority(r, t_dt, aging_minutes, aging_boost)
-            eligible.append((eff, boost, r))
+            inh = inherited.get(r["id"])
+            via = None
+            if inh is not None and _prio_rank(inh[0]) < _prio_rank(eff):
+                eff, via = inh[0], inh[1]
+            eligible.append((eff, boost, r, via))
         picked = None
         picked_eff = None
         picked_boost = 0
+        picked_via = None
         if eligible:
             # Effective priority first, then earliest deadline (undated last),
             # then oldest-created first: within one effective tier the
             # longest-waiting task wins, which is what makes aging fair.
             eligible.sort(key=lambda e: (_prio_rank(e[0]), e[2]["due_at"] == "",
                                          e[2]["due_at"], e[2]["created_at"]))
-            picked_eff, picked_boost, picked = eligible[0]
+            picked_eff, picked_boost, picked, picked_via = eligible[0]
         out = {"ok": True, "task": dict(picked) if picked else None}
         if explain:
             out["considered"] = len(rows)
@@ -1561,6 +1567,8 @@ def next_task(args):
             if picked is not None:
                 out["effective_priority"] = picked_eff
                 out["priority_boost"] = picked_boost
+                if picked_via:
+                    out["inherited_via"] = picked_via
         if picked is None:
             json_out(out)
             return
@@ -1748,6 +1756,42 @@ _PRIO_LEVELS = ("P0", "P1", "P2", "P3")
 
 def _prio_rank(p: str) -> int:
     return _PRIO_LEVELS.index(p) if p in _PRIO_LEVELS else len(_PRIO_LEVELS)
+
+def _inherit_priorities(db):
+    """Map prerequisite task id -> (urgency priority, nearest dependent id).
+
+    Walks reverse dependency edges to a fixpoint so a high-priority task makes
+    its whole transitive prerequisite chain dispatch-urgent: if a P0 task
+    depends on a P2 which depends on a P3, all three dispatch at P0 urgency.
+    Terminal dependents confer nothing (their chain is already satisfied).
+    Cycles are impossible (edges are cycle-checked), so the fixpoint terminates.
+    """
+    terminal = ("completed", "failed", "cancelled")
+    rev = {}
+    own = {}
+    status = {}
+    for r in db.execute(
+            "SELECT d.depends_on AS dep, t.id AS id, t.status AS status, t.priority AS priority "
+            "FROM task_deps d JOIN tasks t ON t.id=d.task_id"):
+        rev.setdefault(r["dep"], []).append(r["id"])
+        own[r["id"]] = r["priority"]
+        status[r["id"]] = r["status"]
+    inherited = {}
+    changed = True
+    while changed:
+        changed = False
+        for dep, dependents in rev.items():
+            for did in dependents:
+                if status.get(did) in terminal:
+                    continue
+                # The dependent's effective urgency is min(own, what it inherited).
+                ip, _via = inherited.get(did, ("P3", None))
+                cand = min(_prio_rank(own.get(did, "P3")), _prio_rank(ip))
+                cur = inherited.get(dep)
+                if cur is None or cand < _prio_rank(cur[0]):
+                    inherited[dep] = (_PRIO_LEVELS[cand] if cand < len(_PRIO_LEVELS) else "P3", did)
+                    changed = True
+    return inherited
 
 def _effective_priority(row, t_dt, aging_minutes: int, aging_boost: int):
     """Virtual dispatch priority after queue aging; returns (priority, boost).

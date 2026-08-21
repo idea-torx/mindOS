@@ -1043,6 +1043,45 @@ with tempfile.TemporaryDirectory() as td:
     assert row['priority'] == 'P3', 'aging must never mutate stored priority'
     static = run('next','--project','DeferTest','--aging-minutes','0')
     assert static['task']['id'] == 'def-1', '--aging-minutes 0 restores strict ordering'
+    # Dependency priority inheritance: an urgent dependent makes its prerequisite
+    # chain dispatch-urgent without mutating any stored priority.
+    run('create','--project','InheritTest','--title','boring prereq','--id','inh-a','--priority','P3')
+    run('create','--project','InheritTest','--title','urgent dependent','--id','inh-b','--priority','P0',
+        '--depends-on','inh-a')
+    run('create','--project','InheritTest','--title','medium bystander','--id','inh-c','--priority','P2')
+    nx = run('next','--project','InheritTest','--explain')
+    assert nx['task']['id'] == 'inh-a', ('inherited P0 urgency must beat the P2 bystander', nx)
+    assert nx['effective_priority'] == 'P0' and nx['inherited_via'] == 'inh-b', nx
+    row = next(r for r in run('list') if r['id'] == 'inh-a')
+    assert row['priority'] == 'P3', 'inheritance must never mutate stored priority'
+    plain = run('next','--project','InheritTest')
+    assert plain['task']['id'] == 'inh-a' and 'inherited_via' not in plain \
+        and 'effective_priority' not in plain, 'default output shape must stay unchanged'
+    # Transitive chains inherit through the whole DAG; via names the nearest dependent.
+    run('create','--project','ChainTest','--title','chain root','--id','ch-a','--priority','P3')
+    run('create','--project','ChainTest','--title','chain mid','--id','ch-b','--priority','P2',
+        '--depends-on','ch-a')
+    run('create','--project','ChainTest','--title','chain tip','--id','ch-c','--priority','P0',
+        '--depends-on','ch-b')
+    nx = run('next','--project','ChainTest','--explain')
+    assert nx['task']['id'] == 'ch-a' and nx['effective_priority'] == 'P0', nx
+    assert nx['inherited_via'] == 'ch-b', nx
+    # Completing the root unblocks the mid link, which keeps its inherited urgency.
+    got = run('next','--claim','--project','ChainTest','--owner','tester','--minutes','5')
+    assert got['task']['id'] == 'ch-a', got
+    run('complete','ch-a','--owner','tester','--note','root done')
+    nx = run('next','--project','ChainTest','--explain')
+    assert nx['task']['id'] == 'ch-b' and nx['effective_priority'] == 'P0', nx
+    assert nx['inherited_via'] == 'ch-c', nx
+    # A terminal dependent confers nothing: its prerequisites keep their own tier.
+    run('create','--project','TermTest','--title','orphan prereq','--id','tm-a','--priority','P3')
+    run('create','--project','TermTest','--title','done dependent','--id','tm-b','--priority','P0',
+        '--depends-on','tm-a')
+    run('update','tm-b','--status','cancelled')
+    run('create','--project','TermTest','--title','calm bystander','--id','tm-c','--priority','P2')
+    nx = run('next','--project','TermTest','--explain')
+    assert nx['task']['id'] == 'tm-c', ('terminal dependent must not confer urgency', nx)
+    assert 'inherited_via' not in nx, nx
     # Dispatch-and-recall: next --claim --recall takes work AND seals its context
     # in one call, auditing context_recalled so the dispatch→recall→act chain is contiguous.
     run('create','--project','DispatchRecall','--title','one call work','--id','dr-1')

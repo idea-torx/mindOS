@@ -521,6 +521,23 @@ With `--explain`, a boosted pick reports `effective_priority` and
 (oldest `created_at` first), so equal-priority work drains FIFO instead of
 last-touched-first.
 
+## Dependency priority inheritance (urgency flows upstream)
+
+A P0 task is useless if its P3 prerequisite never gets dispatched. `next`
+therefore walks the dependency DAG in reverse to a fixpoint: every queued
+prerequisite inherits the urgency of its dependents, so if a P0 task depends on
+a P2 which depends on a P3, all three dispatch at P0 urgency. Stored priorities
+are never mutated — inheritance is a dispatch-time view, composable with aging
+(the better of the two effective levels wins). Terminal dependents confer
+nothing (their chain is already satisfied), and cycle-checked edges guarantee
+the fixpoint terminates. With `--explain`, an inherited pick reports
+`effective_priority` and `inherited_via` (the nearest dependent that conferred
+the urgency):
+
+```bash
+python3 "$A" next --explain    # inherited_via shows which dependent made this urgent
+```
+
 ## Blocking & unblocking
 
 Operators and agents can park work with a reason without cancelling it:
