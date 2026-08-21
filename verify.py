@@ -2227,6 +2227,105 @@ with tempfile.TemporaryDirectory() as td:
     assert res_lg['ok'] is True and res_lg['inserted']['tasks'] == 1 \
         and res_lg['inserted'].get('facts', 0) == 0, res_lg
     assert res_lg['health']['problems'] == [], res_lg
+    # Orphan receipts: a disposable verification receipt left in the source
+    # pointing at a purged task used to abort the whole import on foreign-key
+    # integrity. Now it is quarantined: never inserted (no broken execution
+    # truth, no invented attachment), never silently lost (identity + kind +
+    # file/content hashes reported in the plan, the sealed result doc, and a
+    # dedicated digest-only audit event), its bytes stay behind in the
+    # immutable source, rollback accounting covers only what really landed,
+    # and re-runs stay idempotent.
+    def tree_digest_under(root_):
+        g = hashlib.sha256()
+        for q in sorted(Path(root_).rglob('*')):
+            # -wal/-shm are transient SQLite plumbing whose bytes churn on
+            # every open; the durable source is the db plus its sealed files.
+            if q.is_file() and not q.is_symlink() and not q.name.endswith(('-wal', '-shm')):
+                g.update(str(q.relative_to(root_)).encode()); g.update(q.read_bytes())
+        return g.hexdigest()
+    orphsrc = Path(td) / 'orphsrc/autopilot'
+    oenv = mkhome(orphsrc)
+    hrun(oenv, 'create', '--project', 'Legacy', '--title', 'kept work', '--id', 'orph-keep')
+    hrun(oenv, 'receipt', 'orph-keep', '--kind', 'verification',
+         '--payload', '{"evidence":"kept-task proof"}')
+    keep_rid = next((orphsrc / 'receipts').glob('*.json')).stem
+    ocon = sqlite3.connect(orphsrc / 'state.db')
+    ocon.execute("INSERT INTO receipts(id,task_id,kind,payload_json,created_at,file_hash) "
+                 "VALUES('orph-disposable-1','orph-purged','verification',"
+                 "'{\"probe\":\"throwaway\"}','2026-01-01T00:00:00Z','')")
+    ocon.commit(); ocon.close()
+    (orphsrc / 'receipts' / 'orph-disposable-1.json').write_text('{"probe":"throwaway"}')
+    src_digest_before = tree_digest_under(Path(td) / 'orphsrc')
+    orph_inv_path = Path(td) / 'inventory-orphan.json'
+    orph_inv = ops('migrate-inventory', '--root', str(Path(td) / 'orphsrc'),
+                   '--out', str(orph_inv_path))
+    assert orph_inv['sources'][0]['status'] == 'ok', orph_inv   # orphan is healthy shape, not corruption
+    orph_tgt = Path(td) / 'orphtgt/autopilot'
+    orenc = mkhome(orph_tgt)
+    def oimpo(*a, fail=False):
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-import',
+                            '--inventory', str(orph_inv_path),
+                            '--source-id', orph_inv['sources'][0]['id'], *a],
+                           env=orenc, text=True, capture_output=True)
+        if fail:
+            assert p.returncode != 0, ('expected refusal', a, p.stdout, p.stderr)
+            return p.stdout + p.stderr
+        assert p.returncode == 0, (a, p.stdout, p.stderr)
+        return json.loads(p.stdout)
+    odry = oimpo()
+    oq = odry['orphan_receipts_quarantined']
+    assert len(oq) == 1 and oq[0]['id'] == 'orph-disposable-1' \
+        and oq[0]['task_id'] == 'orph-purged' and len(oq[0]['row_sha256']) == 64, odry
+    assert odry['tables']['receipts']['source_rows'] == 1, odry   # one importable, one withheld
+    ores_path = Path(td) / 'orphan-migration-result.json'
+    ores = oimpo('--apply', '--out', str(ores_path))
+    assert ores['ok'] is True and ores['inserted']['receipts'] == 1, ores
+    assert ores['health']['problems'] == [], ores                 # no phantom coverage shortfall
+    assert [o['id'] for o in ores['orphan_receipts_quarantined']] == ['orph-disposable-1'], ores
+    ordb = sqlite3.connect(orph_tgt / 'state.db')
+    assert ordb.execute("SELECT COUNT(*) FROM receipts WHERE id='orph-disposable-1'").fetchone()[0] == 0
+    assert ordb.execute('SELECT COUNT(*) FROM receipts').fetchone()[0] == 1      # the kept receipt only
+    assert ordb.execute('PRAGMA foreign_key_check').fetchall() == []             # nothing dangling arrived
+    quar = ordb.execute("SELECT payload_json FROM audit_events "
+                        "WHERE action='migration_orphan_receipt_quarantined'").fetchall()
+    assert len(quar) == 1, quar                                  # explicit audited report
+    assert 'orph-disposable-1' in quar[0][0] and 'row_sha256' in quar[0][0], quar
+    assert 'throwaway' not in quar[0][0], quar                   # digest-only: values never enter the ledger
+    ordb.close()
+    assert hrun(orenc, 'verify-chain')['ok'] is True
+    assert not (orph_tgt / 'receipts' / 'orph-disposable-1.json').exists()       # file stays behind
+    assert (orph_tgt / 'receipts' / f'{keep_rid}.json').read_bytes() \
+        == (orphsrc / 'receipts' / f'{keep_rid}.json').read_bytes()              # normal path untouched
+    assert tree_digest_under(Path(td) / 'orphsrc') == src_digest_before          # source immutability
+    ores_doc = json.loads(ores_path.read_text())
+    assert [o['id'] for o in ores_doc['orphan_receipts_quarantined']] == ['orph-disposable-1']
+    assert ores_doc['rollback']['tables']['receipts']['keys'] == [keep_rid], ores_doc
+    ores2 = oimpo('--apply')                                     # re-run idempotency
+    assert ores2['deduplicated'] is True and ores2['ok'] is True, ores2
+    assert all(v == 0 for v in ores2['inserted'].values()), ores2
+    assert [o['id'] for o in ores2['orphan_receipts_quarantined']] == ['orph-disposable-1'], ores2
+    ordb = sqlite3.connect(orph_tgt / 'state.db')
+    assert ordb.execute('SELECT COUNT(*) FROM receipts').fetchone()[0] == 1      # quarantine does not grow
+    ordb.close()
+    def oroll(*a, fail=False):                                   # rollback covers only what landed
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-rollback',
+                            str(ores_path), *a], env=orenc, text=True, capture_output=True)
+        if fail:
+            assert p.returncode != 0, ('expected refusal', a, p.stdout, p.stderr)
+            return p.stdout + p.stderr
+        assert p.returncode == 0, (a, p.stdout, p.stderr)
+        return json.loads(p.stdout)
+    oplan = oroll()
+    assert oplan['would_remove']['receipts'] == [keep_rid] \
+        and oplan['force_required'] is False, oplan              # quarantined row is not journal debt
+    orb = oroll('--apply')
+    assert orb['ok'] is True and orb['removed']['receipts'] == 1, orb
+    assert orb['receipt_files_deleted'] == [keep_rid] and orb['health']['problems'] == [], orb
+    ordb = sqlite3.connect(orph_tgt / 'state.db')
+    assert ordb.execute('SELECT COUNT(*) FROM receipts').fetchone()[0] == 0
+    ordb.close()
+    assert hrun(orenc, 'verify-chain')['ok'] is True
+
     # Migration rollback: stage three of the installer/migrator. A sealed
     # apply writes a rollback journal (exact rows + insert-time hashes,
     # merged audit event ids, restored receipt files); migrate-rollback

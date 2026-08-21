@@ -65,6 +65,20 @@ This report separates **fixed issues**, **accepted risks**, and **merge blockers
     tampered to strict byte comparison. Both sealing (`migrate_inventory`) and
     verification (`_load_inventory`) now exclude `created_at` from the digest;
     all content fields remain covered and the tamper-refusal test still passes.
+13. **A single orphan receipt aborted every migration import** — sources carry
+    receipt rows whose `task_id` matches no task (disposable verification
+    receipts routinely outlive their tasks), and the receipts foreign key
+    refused the whole import. Quarantine, not attachment: the orphan is
+    withheld from the import (no FK violation, no invented task, no re-pointed
+    evidence), reported by identity/kind/`file_hash`/row-sha256 in the plan,
+    the sealed result doc, and a digest-only audited
+    `migration_orphan_receipt_quarantined` event (values never enter the
+    ledger through the quarantine path), its bytes stay behind in the
+    immutable source home, the coverage health check excludes it from the
+    receipts expectation so no phantom shortfall fails the migration, the
+    rollback journal covers only what really landed, and re-runs stay
+    idempotent. A receipt whose task exists locally still imports attached to
+    that task by id.
 
 ## Accepted risks (documented, not fixed)
 
@@ -144,6 +158,13 @@ checkpoint divergence, tampered manifests/result docs, redaction bypass attempts
   `--since` plan filtering; byte-level proof that sources are never mutated.
 - Inventory seal fix: determinism assertion (identical trees → identical
   manifest modulo created_at) now passes; tampered manifests still refused.
+- Orphan-receipt quarantine: dry-run classification with row digest, apply
+  succeeds where the FK previously refused, quarantined row provably absent
+  from the target with a clean `foreign_key_check`, digest-only audit event
+  (values never enter the ledger), normal receipt imports and restores
+  byte-exactly, source tree byte-immutable across the import, journal/rollback
+  accounting excludes the quarantine (dry-run plan + full rollback to zero),
+  idempotent re-run, and `verify-chain` green throughout.
 - Session retention: mandatory-bound refusal, invalid-duration failure,
   filtered and absolute-ISO plans, dry-run touches nothing (rows and ledger),
   exact-count audited apply, FTS stays synced post-delete (search + doctor
