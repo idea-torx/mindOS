@@ -599,7 +599,13 @@ def export_task(args=None):
     leaves the database unredacted.
     """
     tid = args.id
-    with db() as c:
+    # One connection for the whole command, explicitly closed: export_task used
+    # to open a second `db()` for the audit write while the read connection was
+    # still alive, and on slow CI disks that second writer could hit
+    # "database is locked" against the process's own lingering first
+    # connection. A single connection removes the self-contention entirely.
+    c = db()
+    try:
         task = c.execute('SELECT * FROM tasks WHERE id=?', (tid,)).fetchone()
         if not task:
             raise SystemExit('task not found: ' + tid)
@@ -614,26 +620,28 @@ def export_task(args=None):
             'handoffs': fetch('SELECT * FROM handoffs WHERE task_id=? ORDER BY created_at, rowid'),
             'facts': fetch('SELECT * FROM facts WHERE task_id=? ORDER BY created_at, rowid'),
         }
-    receipt_files = {}
-    for r in tables['receipts']:
-        p = autopilot.RECEIPTS / (r['id'] + '.json')
-        receipt_files[r['id']] = p.read_text() if p.exists() else None
-    body = {'format': WORKORDER_FORMAT, 'version': 1, 'exported_at': utc(),
-            'task_id': tid, 'task': dict(task), 'tables': tables,
-            'receipt_files': receipt_files}
-    kinds, tables = _apply_workorder_secret_policy(
-        tables, getattr(args, 'redact', False), getattr(args, 'allow_secret', False),
-        tid, 'export')
-    if kinds:
-        body['tables'] = tables
-        body['secret_kinds'] = kinds
-    digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
-    doc = {**body, 'sha256': digest}
-    counts = {t: len(tables[t]) for t in WORKORDER_TABLES}
-    with db() as c:
+        receipt_files = {}
+        for r in tables['receipts']:
+            p = autopilot.RECEIPTS / (r['id'] + '.json')
+            receipt_files[r['id']] = p.read_text() if p.exists() else None
+        body = {'format': WORKORDER_FORMAT, 'version': 1, 'exported_at': utc(),
+                'task_id': tid, 'task': dict(task), 'tables': tables,
+                'receipt_files': receipt_files}
+        kinds, tables = _apply_workorder_secret_policy(
+            tables, getattr(args, 'redact', False), getattr(args, 'allow_secret', False),
+            tid, 'export')
+        if kinds:
+            body['tables'] = tables
+            body['secret_kinds'] = kinds
+        digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+        doc = {**body, 'sha256': digest}
+        counts = {t: len(tables[t]) for t in WORKORDER_TABLES}
         autopilot.audit(c, 'task', tid, 'workorder_exported',
                         {'sha256': digest, 'counts': counts,
                          **({'secret_kinds': kinds} if kinds else {})})
+        c.commit()
+    finally:
+        c.close()
     if getattr(args, 'out', None):
         out_path = Path(args.out); out_path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix='.workorder.', dir=str(out_path.parent))
