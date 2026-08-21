@@ -421,6 +421,72 @@ def _jaccard(a: set, b: set) -> float:
         return 0.0
     return len(a & b) / len(a | b)
 
+_SECRET_PATTERNS = (
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("github_token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b")),
+    ("openai_style_key", re.compile(r"\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}\b")),
+    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
+    ("private_key_block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("bearer_header", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{16,}")),
+    ("credential_assignment", re.compile(
+        r"(?i)\b(api[_-]?key|secret|password|passwd|access[_-]?token|auth[_-]?token|credential)[a-z0-9_-]*"
+        r"\s*[:=]\s*['\"]?([^\s'\"]{8,})")),
+)
+
+def _secret_findings(text: str) -> list:
+    """Credential-shaped spans in `text`, reported by kind only (never the value).
+
+    The generic assignment pattern additionally requires a digit in the value
+    so prose like 'token: superseded_by chain' does not false-positive while
+    real secrets (which almost always mix digits in) still trip it.
+    """
+    findings = []
+    for kind, pat in _SECRET_PATTERNS:
+        for m in pat.finditer(text):
+            if kind == "credential_assignment":
+                value = m.group(2)
+                if not any(c.isdigit() for c in value):
+                    continue
+                if value[0] in "$<{" or value.lower() in ("redacted", "placeholder", "none", "null"):
+                    continue
+            findings.append({"kind": kind})
+            break
+    return findings
+
+def _redact_secrets(text: str) -> str:
+    """Replace every credential-shaped span with a tagged placeholder."""
+    out = text
+    for kind, pat in _SECRET_PATTERNS:
+        out = pat.sub(f"[REDACTED:{kind}]", out)
+    return out
+
+def _secret_guard(texts: dict, redact: bool, allow: bool, entity_id: str = ""):
+    """Privacy boundary for shared-memory writes.
+
+    Scans each field; on findings either blocks (audited `secret_blocked`),
+    returns redacted copies (audited `secret_redacted`), or lets the caller
+    proceed verbatim under an explicit `--allow-secret` override that is
+    itself audited (`secret_allowed`) so fleet sweeps can still find it.
+    Returns (findings, texts_after). Raises SystemExit on the block path.
+    """
+    findings = {field: _secret_findings(text) for field, text in texts.items()}
+    findings = {f: ks for f, ks in findings.items() if ks}
+    if not findings:
+        return [], texts
+    kinds = sorted({k["kind"] for ks in findings.values() for k in ks})
+    with conn() as db:
+        if allow:
+            audit(db, "task", entity_id, "secret_allowed", {"fields": sorted(findings), "kinds": kinds})
+            return kinds, texts
+        if redact:
+            audit(db, "task", entity_id, "secret_redacted", {"fields": sorted(findings), "kinds": kinds})
+            return kinds, {f: (t if f not in findings else _redact_secrets(t)) for f, t in texts.items()}
+        audit(db, "task", entity_id, "secret_blocked", {"fields": sorted(findings), "kinds": kinds})
+    raise SystemExit(
+        f"refusing to store credential-shaped content ({', '.join(kinds)}); "
+        "re-run with --redact to store a redacted copy or --allow-secret to override")
+
 def _near_duplicates(db, task_id: str, content: str) -> list:
     """Live notes on this task whose token overlap with `content` is high.
 
@@ -486,6 +552,10 @@ def add_note(args):
     content = args.content.strip()
     if not content:
         raise SystemExit("note content must not be empty")
+    redact = getattr(args, "redact", False)
+    allow = getattr(args, "allow_secret", False)
+    secret_kinds, guarded = _secret_guard({"content": content}, redact, allow, args.task_id)
+    content = guarded["content"]
     nid = uuid.uuid4().hex
     t = now()
     pinned = 1 if getattr(args, "pinned", False) else 0
@@ -523,11 +593,15 @@ def add_note(args):
                    (nid, args.task_id, args.kind, content, args.source, h, t, pinned, expires_at))
         payload = {"note_id": nid, "kind": args.kind, "source": args.source, "pinned": bool(pinned),
                    "similar_notes": [s["note_id"] for s in similar]}
+        if secret_kinds:
+            payload["secret_kinds"] = secret_kinds
         if expires_at:
             payload["expires_at"] = expires_at
         audit(db, "task", args.task_id, "note_added", payload)
     out = {"ok": True, "id": nid, "task_id": args.task_id, "deduplicated": False,
            "similar_to": similar, "created_at": t}
+    if secret_kinds:
+        out["secret_kinds"] = secret_kinds
     if expires_at:
         out["expires_at"] = expires_at
     json_out(out)
@@ -558,6 +632,10 @@ def supersede_note(args):
     new_content = args.content.strip()
     if not new_content:
         raise SystemExit("superseding content must not be empty")
+    secret_kinds, guarded = _secret_guard(
+        {"content": new_content}, getattr(args, "redact", False),
+        getattr(args, "allow_secret", False), args.note_id)
+    new_content = guarded["content"]
     old_id = args.note_id
     new_id = uuid.uuid4().hex
     t = now()
@@ -585,8 +663,11 @@ def supersede_note(args):
                    (new_id, old["task_id"], kind, new_content, source, h, t, old["pinned"], new_expires))
         audit(db, "task", old["task_id"], "note_superseded",
               {"old_note_id": old_id, "new_note_id": new_id, "kind": kind,
+               **({"secret_kinds": secret_kinds} if secret_kinds else {}),
                **({"expires_at": new_expires} if new_expires else {})})
     out = {"ok": True, "old_note_id": old_id, "new_note_id": new_id, "task_id": old["task_id"]}
+    if secret_kinds:
+        out["secret_kinds"] = secret_kinds
     if new_expires:
         out["expires_at"] = new_expires
     json_out(out)
@@ -710,6 +791,16 @@ def add_handoff(args):
     can detect when the handoff predates newer context.
     """
     payload = _handoff_payload(args)
+    texts = {"objective": payload["objective"]}
+    for f in HANDOFF_LIST_FIELDS:
+        for i, item in enumerate(payload[f]):
+            texts[f"{f}[{i}]"] = item
+    secret_kinds, guarded = _secret_guard(
+        texts, getattr(args, "redact", False), getattr(args, "allow_secret", False), args.task_id)
+    if secret_kinds:
+        payload["objective"] = guarded["objective"]
+        for f in HANDOFF_LIST_FIELDS:
+            payload[f] = [guarded.get(f"{f}[{i}]", item) for i, item in enumerate(payload[f])]
     hid = uuid.uuid4().hex
     t = now()
     with conn() as db:
@@ -738,9 +829,13 @@ def add_handoff(args):
         audit(db, "task", args.task_id, "handoff_recorded",
               {"handoff_id": hid, "from_agent": payload["from_agent"],
                "to_agent": payload["to_agent"], "superseded": prev["id"] if prev and cur.rowcount else None,
-               "recall_digest": payload["recall_digest"] or None})
-    json_out({"ok": True, "id": hid, "task_id": args.task_id, "deduplicated": False,
-              "superseded": prev["id"] if prev and cur.rowcount else None, "created_at": t})
+               "recall_digest": payload["recall_digest"] or None,
+               **({"secret_kinds": secret_kinds} if secret_kinds else {})})
+    out = {"ok": True, "id": hid, "task_id": args.task_id, "deduplicated": False,
+           "superseded": prev["id"] if prev and cur.rowcount else None, "created_at": t}
+    if secret_kinds:
+        out["secret_kinds"] = secret_kinds
+    json_out(out)
 
 def list_handoffs(args):
     with conn() as db:
@@ -2202,6 +2297,9 @@ def metrics(args):
                               "SUM(CASE WHEN acked_by!='' THEN 1 ELSE 0 END) acked FROM handoffs").fetchone()
         consolidated = db.execute(
             "SELECT COUNT(*) n FROM audit_events WHERE action='note_consolidated'").fetchone()["n"]
+        secrets = {a: db.execute(
+            "SELECT COUNT(*) n FROM audit_events WHERE action=?", (a,)).fetchone()["n"]
+            for a in ("secret_blocked", "secret_redacted", "secret_allowed")}
     json_out({
         "generated_at": t,
         "tasks_total": sum(by_status.values()),
@@ -2223,6 +2321,9 @@ def metrics(args):
         "notes_pinned_live": notes["pinned"] or 0,
         "notes_expired_live": notes["expired"] or 0,
         "notes_consolidated_total": consolidated,
+        "secrets_blocked_total": secrets["secret_blocked"],
+        "secrets_redacted_total": secrets["secret_redacted"],
+        "secrets_allowed_total": secrets["secret_allowed"],
         "handoffs_total": handoffs["total"] or 0,
         "handoffs_superseded": handoffs["superseded"] or 0,
         "handoffs_with_recall_proof": handoffs["proven"] or 0,
@@ -2377,6 +2478,13 @@ def dashboard(args):
                 extra = (extra + " " if extra else "") + f"[OVERDUE due {r['due_at']}]"
             print(f"- [{r['priority']}] {r['project']} · {r['title']}" + (f" — {extra}" if extra else ""))
 
+def _add_secret_flags(p) -> None:
+    """Attach the shared-memory privacy-boundary flags to write commands."""
+    p.add_argument("--redact", action="store_true",
+                   help="replace credential-shaped spans with [REDACTED:<kind>] before storing")
+    p.add_argument("--allow-secret", dest="allow_secret", action="store_true",
+                   help="store verbatim despite credential-shaped content (audited as secret_allowed)")
+
 def _add_rerank_flags(p) -> None:
     """Attach the temporal-hybrid rerank flags shared by retrieval commands.
 
@@ -2417,9 +2525,9 @@ def main():
     p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
     p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_tasks)
-    p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); p.set_defaults(fn=add_note)
+    p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
-    p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); p.set_defaults(fn=supersede_note)
+    p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=supersede_note)
     p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
     p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
     p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
@@ -2428,7 +2536,7 @@ def main():
     p=sub.add_parser("search-handoffs"); p.add_argument("query"); p.add_argument("--task",default=""); p.add_argument("--from-agent",dest="from_agent",default=""); p.add_argument("--to-agent",dest="to_agent",default=""); p.add_argument("--project",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=search_handoffs)
     p=sub.add_parser("note-history"); p.add_argument("note_id"); p.set_defaults(fn=note_history)
     p=sub.add_parser("handoff-history"); p.add_argument("handoff_id"); p.set_defaults(fn=handoff_history)
-    p=sub.add_parser("handoff"); p.add_argument("task_id"); p.add_argument("--from-agent",required=True); p.add_argument("--to-agent",default=""); p.add_argument("--status",default=""); p.add_argument("--objective",default=""); p.add_argument("--evidence",action="append",default=[]); p.add_argument("--constraint",dest="constraints",action="append",default=[]); p.add_argument("--decision",dest="decisions",action="append",default=[]); p.add_argument("--file",dest="files",action="append",default=[]); p.add_argument("--commit",dest="commit_ref",default=""); p.add_argument("--next-action",dest="next_actions",action="append",default=[]); p.add_argument("--risk",dest="risks",action="append",default=[]); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.set_defaults(fn=add_handoff)
+    p=sub.add_parser("handoff"); p.add_argument("task_id"); p.add_argument("--from-agent",required=True); p.add_argument("--to-agent",default=""); p.add_argument("--status",default=""); p.add_argument("--objective",default=""); p.add_argument("--evidence",action="append",default=[]); p.add_argument("--constraint",dest="constraints",action="append",default=[]); p.add_argument("--decision",dest="decisions",action="append",default=[]); p.add_argument("--file",dest="files",action="append",default=[]); p.add_argument("--commit",dest="commit_ref",default=""); p.add_argument("--next-action",dest="next_actions",action="append",default=[]); p.add_argument("--risk",dest="risks",action="append",default=[]); p.add_argument("--recall-digest",dest="recall_digest",default=""); _add_secret_flags(p); p.set_defaults(fn=add_handoff)
     p=sub.add_parser("handoffs"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_handoffs)
     p=sub.add_parser("handoff-current"); p.add_argument("task_id"); p.set_defaults(fn=current_handoff)
     p=sub.add_parser("handoff-inbox"); p.add_argument("--agent",required=True); p.add_argument("--project"); p.add_argument("--limit",type=int,default=50); p.add_argument("--unacked-only",dest="unacked_only",action="store_true"); p.set_defaults(fn=handoff_inbox)

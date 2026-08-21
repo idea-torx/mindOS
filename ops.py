@@ -758,6 +758,64 @@ def notes_expired(args=None):
                       'pinned_expired': sum(1 for i in items if i['pinned']),
                       'items': items}, sort_keys=True))
 
+def secret_scan(args=None):
+    """Fleet sweep for credential-shaped content already stored in shared memory.
+
+    The write path (`note`, `supersede-note`, `handoff`) blocks credential-shaped
+    content unless explicitly redacted or overridden — but rows written before
+    that guard existed (or via --allow-secret) can still sit in shared memory,
+    packing into every context bundle. This sweep scans live notes and live
+    handoffs (objective + list fields) with the same detector the write path
+    uses and reports *where* and *what kind* — never the value itself.
+
+    Read-only: remediation is a history-preserving supersede (--redact), so
+    operators keep the audit trail while the secret leaves rotation.
+    `--all` includes superseded rows, tagged `live: false`.
+    """
+    t = utc()
+    include_all = bool(getattr(args, 'all', False))
+    items = []
+    with db() as c:
+        nq = ("SELECT n.id,n.task_id,t.project,n.kind,n.content,n.created_at,n.superseded_by "
+              "FROM notes n JOIN tasks t ON t.id=n.task_id")
+        if not include_all:
+            nq += " WHERE n.superseded_by=''"
+        for r in c.execute(nq + " ORDER BY n.rowid"):
+            kinds = sorted({f['kind'] for f in autopilot._secret_findings(r['content'])})
+            if kinds:
+                items.append({'type': 'note', 'id': r['id'], 'task_id': r['task_id'],
+                              'project': r['project'], 'fields': ['content'], 'kinds': kinds,
+                              'live': r['superseded_by'] == '',
+                              'action': 'supersede-note %s --content <redacted> --redact' % r['id']})
+        hq = "SELECT id,task_id,objective,evidence,constraints,decisions,next_actions,risks,superseded_by FROM handoffs"
+        if not include_all:
+            hq += " WHERE superseded_by=''"
+        for r in c.execute(hq + " ORDER BY rowid"):
+            fields = {}
+            def _scan(field, text):
+                if text:
+                    kinds = sorted({f['kind'] for f in autopilot._secret_findings(text)})
+                    if kinds:
+                        fields[field] = kinds
+            _scan('objective', r['objective'])
+            for col in ('evidence', 'constraints', 'decisions', 'next_actions', 'risks'):
+                try:
+                    entries = json.loads(r[col])
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                for i, entry in enumerate(entries if isinstance(entries, list) else []):
+                    _scan('%s[%d]' % (col, i), entry)
+            if fields:
+                items.append({'type': 'handoff', 'id': r['id'], 'task_id': r['task_id'],
+                              'fields': sorted(fields),
+                              'kinds': sorted({k for ks in fields.values() for k in ks}),
+                              'live': r['superseded_by'] == '',
+                              'action': 'record a redacted replacement handoff'})
+    print(json.dumps({'ok': True, 'generated_at': t, 'count': len(items),
+                      'notes_flagged': sum(1 for i in items if i['type'] == 'note'),
+                      'handoffs_flagged': sum(1 for i in items if i['type'] == 'handoff'),
+                      'items': items}, sort_keys=True))
+
 def _cluster_live_notes(rows, threshold):
     """Greedy near-duplicate clustering over one task's live notes.
 
@@ -884,6 +942,7 @@ for name,fn in [('processes',processes),('github',github),('sentry',sentry),('mo
 x=s.add_parser('handoff-check'); x.add_argument('--task',default=''); x.add_argument('--ack-sla-hours',dest='ack_sla_hours',type=float,default=24); x.set_defaults(fn=handoff_check)
 x=s.add_parser('recall-stale'); x.set_defaults(fn=recall_stale)
 x=s.add_parser('notes-expired'); x.set_defaults(fn=notes_expired)
+x=s.add_parser('secret-scan'); x.add_argument('--all',action='store_true'); x.set_defaults(fn=secret_scan)
 x=s.add_parser('consolidate'); x.add_argument('--task',default=''); x.add_argument('--threshold',type=float,default=None); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=consolidate)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--backoff-base',type=int,default=60); x.add_argument('--backoff-cap',type=int,default=3600); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('escalate'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=escalate)

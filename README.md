@@ -236,6 +236,39 @@ Design properties:
 - **Retired notes excluded**: expired unpinned notes are already invisible to
   packs and retrieval, so consolidation never resurrects them.
 
+## Secret guard (privacy boundary for shared memory)
+
+The contract is explicit: credentials, private tokens, and raw personal data
+never enter shared memory. The write path now enforces it instead of trusting
+agent discipline. `note`, `supersede-note`, and `handoff` scan their content
+(objective + list fields for handoffs) with shape detectors — AWS access keys,
+GitHub / OpenAI-style / Slack / Google tokens, private-key blocks, bearer
+headers, and generic `password:`/`api_key=` assignments — and refuse to store
+credential-shaped content:
+
+```bash
+python3 autopilot.py note t1 --content 'key is AKIA...'            # blocked (audited secret_blocked)
+python3 autopilot.py note t1 --content 'key is AKIA...' --redact   # stored as [REDACTED:aws_access_key]
+python3 autopilot.py handoff t1 ... --allow-secret                 # verbatim override, audited
+```
+
+Design properties:
+
+- **Kind-only reporting**: findings are named by pattern kind, never by value —
+  errors, output, and audit payloads never echo the secret itself.
+- **Low false positives**: the generic assignment pattern requires a digit in
+  the value, so prose like `fencing token: lease_epoch chain` passes while real
+  secrets (which almost always mix digits in) still trip it.
+- **Three audited outcomes**: `secret_blocked` (default), `secret_redacted`
+  (`--redact` stores a `[REDACTED:<kind>]` copy), `secret_allowed`
+  (`--allow-secret` override) — every escape hatch leaves a trail.
+- **Fleet sweep**: `ops.py secret-scan` finds credential-shaped content already
+  sitting in live notes/handoffs (legacy rows or overrides) with the same
+  detector; read-only, remediation is a history-preserving supersede. `--all`
+  includes superseded rows.
+- **Observable**: `metrics` reports `secrets_blocked_total`,
+  `secrets_redacted_total`, and `secrets_allowed_total`.
+
 ## Agent handoff protocol (provider-neutral)
 
 Any agent — Hermes, Claude Code, Codex, OpenCode — can publish a durable,

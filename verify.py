@@ -1367,6 +1367,48 @@ with tempfile.TemporaryDirectory() as td:
     assert rd['state'] == 'stale' and 'handoff' in rd['sections_changed'], rd
     doc = ops('doctor'); assert doc['ok'] is True and doc['problems'] == [], doc
     assert run('verify-chain')['ok'] is True
+    # Secret guard: credential-shaped content never enters shared memory silently.
+    run('create','--project','Verify','--title','secret guard','--id','sec-1')
+    fake_aws = 'AKIAIOSFODNN7EXAMPLE'
+    err = run_fail('note','sec-1','--content','key is ' + fake_aws)
+    assert 'credential-shaped' in err and 'aws_access_key' in err, err
+    assert all(fake_aws not in n['content'] for n in run('notes','sec-1'))
+    # Prose that merely mentions tokens must not false-positive (no digit in value).
+    run('note','sec-1','--content','fencing token: lease_epoch chain')
+    red = run('note','sec-1','--content','key is ' + fake_aws,'--redact')
+    assert red['secret_kinds'] == ['aws_access_key'], red
+    stored = next(n for n in run('notes','sec-1') if n['id'] == red['id'])
+    assert fake_aws not in stored['content'] and '[REDACTED:aws_access_key]' in stored['content'], stored
+    ovr = run('note','sec-1','--content','password: hunter2hunter2','--allow-secret')
+    assert ovr['secret_kinds'] == ['credential_assignment'], ovr
+    # Handoffs: objective and list fields are guarded too.
+    err = run_fail('handoff','sec-1','--from-agent','agent-a',
+                   '--objective','call the api with sk-proj-abcdefghijklmnopqrstuvwx')
+    assert 'openai_style_key' in err, err
+    hr = run('handoff','sec-1','--from-agent','agent-a','--to-agent','agent-b',
+             '--objective','rotate credentials','--evidence','token ghp_' + 'a1B2c3D4'*4,'--redact')
+    assert hr['secret_kinds'] == ['github_token'], hr
+    hrow = next(h for h in run('handoffs','sec-1') if h['id'] == hr['id'])
+    assert all('ghp_' not in e for e in hrow['evidence']) and \
+        any('[REDACTED:github_token]' in e for e in hrow['evidence']), hrow
+    ho = run('handoff','sec-1','--from-agent','agent-a','--to-agent','agent-b',
+             '--objective','bearer Zx9Kp2Qw8Er5Ty7U','--allow-secret')
+    assert ho['secret_kinds'] == ['bearer_header'], ho
+    # Fleet sweep finds secrets already sitting in shared memory (seeded raw,
+    # bypassing the write path, as legacy rows would be).
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at,pinned,expires_at)"
+                   " VALUES('leak-1','sec-1','fact','slack xoxb-123456789012abcdefgh','','legacy','2026-01-01T00:00:00+00:00',0,'')")
+    scan = ops('secret-scan')
+    leak = next(i for i in scan['items'] if i['id'] == 'leak-1')
+    assert leak['type'] == 'note' and leak['kinds'] == ['slack_token'] and leak['live'] is True, leak
+    assert any(i['type'] == 'handoff' and 'bearer_header' in i['kinds'] for i in scan['items']), scan
+    assert scan['notes_flagged'] >= 1 and scan['handoffs_flagged'] >= 1, scan
+    m = run('metrics')
+    assert m['secrets_blocked_total'] >= 2 and m['secrets_redacted_total'] >= 2 \
+        and m['secrets_allowed_total'] >= 2, (m['secrets_blocked_total'], m['secrets_redacted_total'], m['secrets_allowed_total'])
+    doc = ops('doctor'); assert doc['ok'] is True and doc['problems'] == [], doc
+    assert run('verify-chain')['ok'] is True
     # Audit chain checkpoints: pin the head so tail truncation becomes detectable.
     cp = ops('checkpoint')
     assert cp['ok'] is True and cp['last_event_id'] > 0 and len(cp['sha256']) == 64, cp
