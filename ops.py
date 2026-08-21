@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Autopilot v1.1 safe operations: recovery, approvals, reconciliation, reports."""
 from __future__ import annotations
-import json, os, re, sqlite3, subprocess, sys, urllib.request
+import json, os, re, sqlite3, subprocess, sys, tempfile, urllib.request, hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -108,6 +108,57 @@ def morning(args=None):
     autopilot.dashboard(argparse.Namespace())
     print('\nSAFE AUTOMATION: read-only reconciliation, no deploy/merge/external submission.')
 
+SNAPSHOT_TABLES = ('tasks', 'heartbeats', 'receipts', 'notes', 'task_deps', 'audit_events')
+
+def _snapshot_doc():
+    data = {}
+    with db() as c:
+        for table in SNAPSHOT_TABLES:
+            data[table] = [dict(r) for r in c.execute(f'SELECT * FROM {table}')]
+    body = {'format': 'autopilot-snapshot-v1', 'created_at': utc(), 'tables': data}
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    return {'snapshot': body, 'sha256': digest}
+
+def snapshot(args=None):
+    """Consistent point-in-time JSON export of every table, integrity-sealed."""
+    if args is not None and getattr(args, 'out', None):
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_path = autopilot.ROOT / 'backups'
+        out_path.mkdir(parents=True, exist_ok=True)
+        out_path = out_path / f"snapshot-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    doc = _snapshot_doc()
+    fd, tmp = tempfile.mkstemp(prefix='.snapshot.', dir=str(out_path.parent))
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(json.dumps(doc, sort_keys=True)); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, str(out_path))
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+    counts = {t: len(doc['snapshot']['tables'][t]) for t in SNAPSHOT_TABLES}
+    print(json.dumps({'ok': True, 'path': str(out_path), 'sha256': doc['sha256'], 'counts': counts}))
+
+def snapshot_check(args):
+    """Verify a snapshot file's self-hash without touching any database."""
+    path = Path(args.path)
+    if not path.exists(): raise SystemExit(f'snapshot not found: {path}')
+    try:
+        doc = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f'snapshot is not valid JSON: {e}')
+    body = doc.get('snapshot')
+    if not body or body.get('format') != 'autopilot-snapshot-v1':
+        raise SystemExit('unrecognized snapshot format')
+    recomputed = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    ok = recomputed == doc.get('sha256')
+    counts = {t: len(body.get('tables', {}).get(t, [])) for t in SNAPSHOT_TABLES}
+    print(json.dumps({'ok': ok, 'path': str(path),
+                      'expected_sha256': doc.get('sha256'), 'actual_sha256': recomputed,
+                      'created_at': body.get('created_at'), 'counts': counts}))
+    if not ok: sys.exit(1)
+
 def doctor(args=None):
     """Read-only consistency sweep: orphan deps, receipt index/files, audit chain, stale leases."""
     problems = []
@@ -159,6 +210,8 @@ p=argparse.ArgumentParser(); s=p.add_subparsers(dest='cmd',required=True)
 for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning),('doctor',doctor)]:
  x=s.add_parser(name); x.set_defaults(fn=fn)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
+x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)
+x=s.add_parser('snapshot-check'); x.add_argument('path'); x.set_defaults(fn=snapshot_check)
 x=s.add_parser('approval'); x.add_argument('action',choices=['approve','reject','block']); x.add_argument('id'); x.add_argument('--by',default='leo'); x.add_argument('--reason',default=''); x.add_argument('--next-action',default=''); x.set_defaults(fn=approval)
 x=s.add_parser('policy'); x.add_argument('project'); x.add_argument('action'); x.set_defaults(fn=policy)
 args=p.parse_args(); args.fn(args)

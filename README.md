@@ -27,6 +27,25 @@ python3 "$A" verify-chain            # recompute the audit hash chain; report ta
 python3 "$A" dashboard
 ```
 
+## Lease fencing epochs
+
+Every lease acquisition bumps a monotonic `lease_epoch` on the task and
+surfaces it in the `claim` / `next --claim` output. A holder can pass its epoch
+back on mutations so a stale process is rejected even when the owner name still
+matches (e.g. its lease expired, was recovered, and reacquired by the same
+owner):
+
+```bash
+python3 "$A" claim <task-id> --owner hermes --minutes 30          # → lease_epoch: 1
+python3 "$A" heartbeat <task-id> --owner hermes --epoch 1         # ok while epoch matches
+python3 "$A" complete <task-id> --owner hermes --epoch 1          # fenced completion
+python3 "$A" release <task-id> --owner hermes --epoch 1           # fenced release
+```
+
+A mismatch fails with `lease superseded (held epoch N, current M); reclaim …`.
+Passing no `--epoch` preserves the previous behavior, so existing callers keep
+working; new agents should always fence with the epoch they were issued.
+
 ## Voluntary lease release
 
 A lease holder can hand a task back to the queue without consuming retry
@@ -128,7 +147,15 @@ python3 "$O" approval approve <task-id> --by leo
 python3 "$O" policy <project> <action> # check user-approval policy for an action
 python3 "$O" processes                 # list active agent processes (read-only)
 python3 "$O" morning                   # morning brief
+python3 "$O" snapshot                  # consistent JSON export of all tables, sealed with a SHA-256
+python3 "$O" snapshot-check <file>     # verify a snapshot's integrity hash (exit 1 on tampering)
 ```
+
+`snapshot` writes an atomic, `autopilot-snapshot-v1` JSON document (default
+under `~/.hermes/autopilot/backups/`) containing every table plus a self-hash,
+giving a point-in-time backup for disaster recovery without touching the live
+database. `snapshot-check` recomputes the hash and exits non-zero if the file
+was modified.
 
 `recover` consumes one unit of each task's retry budget per pass. Tasks whose
 retry budget is exhausted (`retry_count > max-retries`, default 3) transition to

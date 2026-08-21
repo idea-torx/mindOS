@@ -36,9 +36,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   worktree TEXT NOT NULL DEFAULT '',
   branch TEXT NOT NULL DEFAULT '',
   pr_url TEXT NOT NULL DEFAULT '',
-  lease_owner TEXT NOT NULL DEFAULT '',
-  lease_expires_at TEXT NOT NULL DEFAULT '',
-  retry_count INTEGER NOT NULL DEFAULT 0,
+   lease_owner TEXT NOT NULL DEFAULT '',
+   lease_expires_at TEXT NOT NULL DEFAULT '',
+   lease_epoch INTEGER NOT NULL DEFAULT 0,
+   retry_count INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_receipt TEXT NOT NULL DEFAULT ''
@@ -116,6 +117,9 @@ def _migrate(db) -> None:
     note_cols = {r[1] for r in db.execute("PRAGMA table_info(notes)")}
     if "pinned" not in note_cols:
         db.execute("ALTER TABLE notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+    task_cols = {r[1] for r in db.execute("PRAGMA table_info(tasks)")}
+    if "lease_epoch" not in task_cols:
+        db.execute("ALTER TABLE tasks ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0")
     prev = ""
     for row in db.execute("SELECT id,prev_hash,hash FROM audit_events ORDER BY id").fetchall():
         if row[2]:
@@ -355,27 +359,38 @@ def release(args):
         if row["status"] in {"completed", "cancelled"}:
             raise SystemExit(f"cannot release terminal task: {row['status']}")
         _require_live_lease(row, args.owner, "releasing")
+        _require_epoch(row, getattr(args, "epoch", None), "releasing")
         t = now()
         db.execute("UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',updated_at=? WHERE id=?", (t, args.id))
         audit(db, "task", args.id, "lease_released", {"owner": args.owner})
         json_out(dict(task_row(db, args.id)))
 
 def _acquire(db, task_id: str, owner: str, minutes: int, max_active: int = 0):
-    """Atomically acquire/renew a lease; returns (acquired, expires_at).
+    """Atomically acquire/renew a lease; returns (acquired, expires_at, epoch).
 
     The WHERE guard makes the check-and-set a single statement so concurrent
     claimers cannot both win. When max_active > 0 the same statement also
     enforces a per-owner cap on live leases, so one agent cannot hog dispatch.
+    Each acquisition bumps lease_epoch — a monotonic fencing token so a stale
+    holder whose lease expired and was reacquired cannot silently mutate state.
     """
     exp = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + minutes * 60, timezone.utc).replace(microsecond=0).isoformat()
     t = now()
     cur = db.execute(
-        "UPDATE tasks SET status='claimed', lease_owner=?, lease_expires_at=?, updated_at=? "
+        "UPDATE tasks SET status='claimed', lease_owner=?, lease_expires_at=?, lease_epoch=lease_epoch+1, updated_at=? "
         "WHERE id=? AND (lease_owner=? OR lease_owner='' OR lease_expires_at='' OR lease_expires_at<=?) "
         "AND (?<=0 OR (SELECT COUNT(*) FROM tasks o WHERE o.lease_owner=? AND o.id!=tasks.id "
         "AND o.lease_expires_at!='' AND o.lease_expires_at>?)<?)",
         (owner, exp, t, task_id, owner, t, max_active, owner, t, max_active))
-    return cur.rowcount == 1, exp
+    if cur.rowcount != 1:
+        return False, "", -1
+    epoch = db.execute("SELECT lease_epoch FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+    return True, exp, epoch
+
+def _require_epoch(row, epoch, verb: str) -> None:
+    """Fencing guard: reject mutations from holders of a superseded lease."""
+    if epoch is not None and epoch != row["lease_epoch"]:
+        raise SystemExit(f"lease superseded (held epoch {epoch}, current {row['lease_epoch']}); reclaim before {verb}")
 
 def _explain_acquire_failure(db, task_id: str, owner: str, max_active: int) -> str:
     """Human-readable reason for a failed _acquire, for operator ergonomics."""
@@ -443,6 +458,7 @@ def complete(args):
         if row["status"] in {"completed", "cancelled"}:
             raise SystemExit(f"cannot complete terminal task: {row['status']}")
         _require_live_lease(row, args.owner, "completing")
+        _require_epoch(row, getattr(args, "epoch", None), "completing")
         t = now()
         db.execute("UPDATE tasks SET status='completed',lease_owner='',lease_expires_at='',blocked_reason='',updated_at=? WHERE id=?", (t, args.id))
         audit(db, "task", args.id, "completed", {"owner": args.owner, "note": args.note})
@@ -475,12 +491,13 @@ def claim(args):
             raise SystemExit("unsatisfied dependencies: " + ", ".join(f"{d['id']}({d['status']})" for d in pending))
         # Atomic acquire: the WHERE guard makes the lease check-and-set a single
         # statement so concurrent claimers cannot both win the same lease.
-        acquired, exp = _acquire(db, args.id, args.owner, args.minutes, resolve_max_active(args))
+        acquired, exp, epoch = _acquire(db, args.id, args.owner, args.minutes, resolve_max_active(args))
         if not acquired:
             raise SystemExit(_explain_acquire_failure(db, args.id, args.owner, resolve_max_active(args)))
         db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"claimed",now(),"lease claimed"))
-        audit(db, "task", args.id, "claimed", {"owner": args.owner, "lease_expires_at": exp})
-        json_out(dict(task_row(db, args.id)))
+        audit(db, "task", args.id, "claimed", {"owner": args.owner, "lease_expires_at": exp, "lease_epoch": epoch})
+        out = dict(task_row(db, args.id))
+        json_out(out)
 
 def add_dep(args):
     with conn() as db:
@@ -506,18 +523,20 @@ def next_task(args):
             return
         if args.claim:
             cap = resolve_max_active(args)
-            acquired, exp = _acquire(db, picked["id"], args.owner, args.minutes, cap)
+            acquired, exp, epoch = _acquire(db, picked["id"], args.owner, args.minutes, cap)
             if not acquired:
                 raise SystemExit(_explain_acquire_failure(db, picked["id"], args.owner, cap))
             db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (picked["id"],args.owner,"claimed",now(),"claimed via next"))
-            audit(db, "task", picked["id"], "claimed", {"owner": args.owner, "lease_expires_at": exp, "via": "next"})
+            audit(db, "task", picked["id"], "claimed", {"owner": args.owner, "lease_expires_at": exp, "lease_epoch": epoch, "via": "next"})
             out["claimed"] = True
             out["lease_expires_at"] = exp
+            out["lease_epoch"] = epoch
         json_out(out)
 
 def heartbeat(args):
     with conn() as db:
         row = task_row(db, args.id)
+        _require_epoch(row, getattr(args, "epoch", None), "heartbeat")
         t = now()
         exp = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + 15 * 60, timezone.utc).replace(microsecond=0).isoformat()
         # Atomic renewal: only the current lease holder with a live lease can renew.
@@ -531,7 +550,8 @@ def heartbeat(args):
             raise SystemExit("lease expired; reclaim before heartbeat")
         db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"alive",now(),args.note))
         audit(db, "task", args.id, "heartbeat", {"owner": args.owner, "lease_expires_at": exp})
-        json_out({"ok": True, "task_id": args.id, "status": "running", "lease_expires_at": exp, "heartbeat_at": now()})
+        json_out({"ok": True, "task_id": args.id, "status": "running", "lease_expires_at": exp,
+                  "lease_epoch": row["lease_epoch"], "heartbeat_at": now()})
 
 def receipt(args):
     payload = json.loads(args.payload) if args.payload else {}
@@ -667,11 +687,11 @@ def main():
     p=sub.add_parser("init"); p.set_defaults(fn=lambda a: (ensure(), json_out({"ok":True,"db":str(DB)})))
     p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.set_defaults(fn=create)
     p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.set_defaults(fn=update)
-    p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.set_defaults(fn=complete)
+    p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=complete)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
     p=sub.add_parser("verify-chain"); p.set_defaults(fn=verify_chain)
     p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=claim)
-    p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.set_defaults(fn=heartbeat)
+    p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=heartbeat)
     p=sub.add_parser("receipt"); p.add_argument("task_id"); p.add_argument("--kind",required=True); p.add_argument("--payload",default="{}"); p.set_defaults(fn=receipt)
     p=sub.add_parser("list"); p.add_argument("--status"); p.add_argument("--project"); p.set_defaults(fn=list_tasks)
     p=sub.add_parser("show"); p.add_argument("id"); p.add_argument("--limit",type=int,default=20); p.set_defaults(fn=show)
@@ -685,7 +705,7 @@ def main():
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.set_defaults(fn=supersede_note)
     p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.set_defaults(fn=task_context)
     p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.set_defaults(fn=search_notes)
-    p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.set_defaults(fn=release)
+    p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)
     args=ap.parse_args(); args.fn(args)
 
 if __name__ == "__main__": main()

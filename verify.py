@@ -251,6 +251,47 @@ with tempfile.TemporaryDirectory() as td:
     assert 'invalid note kind' in err
     m = run('metrics')
     assert m['notes_pinned_live'] == 1, m
+    # Lease fencing epochs: each acquisition bumps a monotonic token surfaced to holders.
+    run('create','--project','Verify','--title','fence me','--id','fence-1')
+    c1 = run('claim','fence-1','--owner','tester','--minutes','5')
+    assert c1['lease_epoch'] == 1, c1
+    err = run_fail('heartbeat','fence-1','--owner','tester','--epoch','99')
+    assert 'lease superseded' in err
+    beat = run('heartbeat','fence-1','--owner','tester','--epoch','1')
+    assert beat['ok'] is True and beat['lease_epoch'] == 1
+    err = run_fail('release','fence-1','--owner','tester','--epoch','7')
+    assert 'lease superseded' in err
+    # Same-owner ABA: expired lease requeued and reclaimed by the same owner;
+    # the stale holder's old epoch must be rejected even though owner matches.
+    run('claim','fence-1','--owner','tester','--minutes','0')
+    out = ops('recover','--max-retries','3')
+    assert out['recovered'] == ['fence-1']
+    c2 = run('claim','fence-1','--owner','tester','--minutes','5')
+    assert c2['lease_epoch'] == 3, c2  # expired claim + reclaim each bumped the epoch
+    err = run_fail('complete','fence-1','--owner','tester','--note','stale','--epoch','1')
+    assert 'lease superseded' in err and '(held epoch 1, current 3)' in err
+    done = run('complete','fence-1','--owner','tester','--note','fresh','--epoch','3')
+    assert done['status'] == 'completed'
+    # next --claim also surfaces the fencing epoch.
+    run('create','--project','Verify','--title','fence next','--id','fence-2','--priority','P0')
+    got = run('next','--claim','--owner','tester','--minutes','5')
+    assert got['task']['id'] == 'fence-2' and got['lease_epoch'] >= 1
+    # Snapshot export: consistent JSON dump sealed with a self-hash.
+    snap = ops('snapshot')
+    assert snap['ok'] is True and len(snap['sha256']) == 64
+    assert Path(snap['path']).exists(), snap
+    assert snap['counts']['tasks'] >= 1 and snap['counts']['audit_events'] >= 1
+    chk = ops('snapshot-check', snap['path'])
+    assert chk['ok'] is True and chk['actual_sha256'] == snap['sha256']
+    def ops_fail(*a):
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=env, text=True, capture_output=True)
+        assert p.returncode != 0, ('expected failure', a, p.stdout, p.stderr)
+        return p.stdout + p.stderr
+    tampered = json.loads(Path(snap['path']).read_text())
+    tampered['snapshot']['tables']['tasks'][0]['title'] = 'tampered'
+    Path(snap['path']).write_text(json.dumps(tampered, sort_keys=True))
+    err = ops_fail('snapshot-check', snap['path'])
+    assert '"ok": false' in err
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
