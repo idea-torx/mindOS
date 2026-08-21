@@ -46,11 +46,12 @@ retrieval substrate agents share across Hindsight/SQLite boundaries:
 
 ```bash
 python3 "$A" note <task-id> --kind fact --content "API rate limit is 60/min" --source hermes
+python3 "$A" note <task-id> --kind constraint --content "MUST NOT deploy on Friday" --pinned
 python3 "$A" notes <task-id>              # live notes, oldest first
 python3 "$A" notes <task-id> --all        # include superseded history
 python3 "$A" supersede-note <note-id> --content "rate limit raised to 120/min"
 python3 "$A" context <task-id> --budget 4000   # prompt-ready pack within a char budget
-python3 "$A" search-notes "rate limit" --project Trove
+python3 "$A" search-notes "rate limit" --project Trove --kind fact
 ```
 
 Design properties:
@@ -58,18 +59,23 @@ Design properties:
 - **Kinds**: `fact`, `decision`, `observation`, `evidence`, `constraint`.
 - **Provenance**: every note records its `source` (agent/operator) and timestamp.
 - **Deduplication**: exact duplicate content on the same task returns the
-  existing note (`deduplicated: true`) instead of growing the store.
+  existing note (`deduplicated: true`) instead of growing the store; a
+  duplicate add of pinned content promotes the existing note to pinned.
+- **Pinning**: `--pinned` marks a note as critical. Pinned notes pack first in
+  `context` (and survive tight budgets that drop unpinned notes), and the pin
+  survives supersession so temporal fact chains stay protected.
 - **Temporal facts**: `supersede-note` atomically retires an old note and links
   it to its replacement (`superseded_by`); superseded notes are hidden from
   default views but retained for audit.
-- **Context budgets**: `context` packs live notes oldest→newest within a
-  character budget and reports `used_chars`, `truncated`, and pack counts so
-  callers can assemble prompts deterministically.
+- **Context budgets**: `context` packs a task summary header, unsatisfied
+  dependencies, then live notes pinned-first (oldest→newest within each group)
+  within a character budget. It reports `used_chars`, `truncated`, pack counts,
+  and `notes_pinned_packed` so callers can assemble prompts deterministically.
 - **Retrieval**: `search-notes` does keyword search over live note content with
-  task-level `--project` / `--status` filters via a join.
+  `--kind` plus task-level `--project` / `--status` filters via a join.
 
-`metrics` reports `notes_total` and `notes_superseded`; `ops.py doctor`
-checks for orphaned notes and dangling supersession links.
+`metrics` reports `notes_total`, `notes_superseded`, and `notes_pinned_live`;
+`ops.py doctor` checks for orphaned notes and dangling supersession links.
 
 ## Dispatch fairness (per-owner lease caps)
 

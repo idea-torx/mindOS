@@ -84,8 +84,9 @@ CREATE TABLE IF NOT EXISTS notes (
   content TEXT NOT NULL,
   source TEXT NOT NULL DEFAULT '',
   content_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  superseded_by TEXT NOT NULL DEFAULT ''
+   created_at TEXT NOT NULL,
+   superseded_by TEXT NOT NULL DEFAULT '',
+   pinned INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_notes_task ON notes(task_id);
 CREATE INDEX IF NOT EXISTS idx_notes_hash ON notes(task_id, content_hash);
@@ -112,6 +113,9 @@ def _migrate(db) -> None:
         db.execute("ALTER TABLE audit_events ADD COLUMN prev_hash TEXT NOT NULL DEFAULT ''")
     if "hash" not in cols:
         db.execute("ALTER TABLE audit_events ADD COLUMN hash TEXT NOT NULL DEFAULT ''")
+    note_cols = {r[1] for r in db.execute("PRAGMA table_info(notes)")}
+    if "pinned" not in note_cols:
+        db.execute("ALTER TABLE notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
     prev = ""
     for row in db.execute("SELECT id,prev_hash,hash FROM audit_events ORDER BY id").fetchall():
         if row[2]:
@@ -225,24 +229,29 @@ def add_note(args):
         raise SystemExit("note content must not be empty")
     nid = uuid.uuid4().hex
     t = now()
+    pinned = 1 if getattr(args, "pinned", False) else 0
     with conn() as db:
         task_row(db, args.task_id)
         h = _note_hash(args.task_id, content)
         existing = live_note(db, args.task_id, h)
         if existing:
+            if pinned and not existing["pinned"]:
+                # A duplicate add can promote an existing note to pinned.
+                db.execute("UPDATE notes SET pinned=1 WHERE id=?", (existing["id"],))
+                audit(db, "task", args.task_id, "note_pinned", {"note_id": existing["id"]})
             audit(db, "task", args.task_id, "note_deduplicated", {"note_id": existing["id"], "kind": args.kind})
             json_out({"ok": True, "id": existing["id"], "task_id": args.task_id,
                       "deduplicated": True, "created_at": existing["created_at"]})
             return
-        db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at) VALUES(?,?,?,?,?,?,?)",
-                   (nid, args.task_id, args.kind, content, args.source, h, t))
-        audit(db, "task", args.task_id, "note_added", {"note_id": nid, "kind": args.kind, "source": args.source})
+        db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at,pinned) VALUES(?,?,?,?,?,?,?,?)",
+                   (nid, args.task_id, args.kind, content, args.source, h, t, pinned))
+        audit(db, "task", args.task_id, "note_added", {"note_id": nid, "kind": args.kind, "source": args.source, "pinned": bool(pinned)})
     json_out({"ok": True, "id": nid, "task_id": args.task_id, "deduplicated": False, "created_at": t})
 
 def list_notes(args):
     with conn() as db:
         task_row(db, args.task_id)
-        q = ("SELECT n.id,n.kind,n.content,n.source,n.created_at,n.superseded_by FROM notes n "
+        q = ("SELECT n.id,n.kind,n.content,n.source,n.created_at,n.superseded_by,n.pinned FROM notes n "
              "WHERE n.task_id=?")
         if not getattr(args, "all", False):
             q += " AND n.superseded_by=''"
@@ -277,38 +286,58 @@ def supersede_note(args):
         cur = db.execute("UPDATE notes SET superseded_by=? WHERE id=? AND superseded_by=''", (new_id, old_id))
         if cur.rowcount != 1:
             raise SystemExit("note was concurrently superseded; retry")
-        db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at,superseded_by) VALUES(?,?,?,?,?,?,?,'')",
-                   (new_id, old["task_id"], kind, new_content, source, h, t))
+        db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at,superseded_by,pinned) VALUES(?,?,?,?,?,?,?,'',?)",
+                   (new_id, old["task_id"], kind, new_content, source, h, t, old["pinned"]))
         audit(db, "task", old["task_id"], "note_superseded",
               {"old_note_id": old_id, "new_note_id": new_id, "kind": kind})
     json_out({"ok": True, "old_note_id": old_id, "new_note_id": new_id, "task_id": old["task_id"]})
 
 def task_context(args):
-    """Pack a task's live notes oldest→newest within a character budget for prompt assembly."""
+    """Pack a prompt-ready context bundle within a character budget.
+
+    Includes a task summary header and unsatisfied dependencies, then live
+    notes packed pinned-first (oldest→newest within each group) so critical
+    facts survive tight budgets.
+    """
     budget = max(0, args.budget)
     with conn() as db:
-        task_row(db, args.task_id)
+        row = task_row(db, args.task_id)
+        summary = {k: row[k] for k in ("id", "project", "title", "status", "priority", "next_action", "blocked_reason")}
+        pending = unsatisfied_deps(db, args.task_id)
         rows = [dict(r) for r in db.execute(
-            "SELECT id,kind,content,source,created_at FROM notes "
+            "SELECT id,kind,content,source,created_at,pinned FROM notes "
             "WHERE task_id=? AND superseded_by='' ORDER BY rowid ASC",
             (args.task_id,)).fetchall()]
-    packed, used, truncated = [], 0, False
-    for r in rows:
+    # Stable sort: pinned notes first, original (oldest→newest) order within groups.
+    ordered = sorted(rows, key=lambda r: not r["pinned"])
+    header_cost = 64 + len(summary["title"]) + len(summary["next_action"]) + len(summary["blocked_reason"])
+    used, truncated = min(header_cost, budget), False
+    packed, pinned_packed = [], 0
+    for r in ordered:
         cost = len(r["content"]) + len(r["kind"]) + len(r["source"]) + len(r["created_at"]) + 8
         if used + cost > budget:
             truncated = True
             continue
         packed.append(r); used += cost
+        if r["pinned"]:
+            pinned_packed += 1
     json_out({"task_id": args.task_id, "budget": budget, "used_chars": used,
-              "truncated": truncated, "notes_total": len(rows), "notes_packed": len(packed),
+              "truncated": truncated, "task": summary,
+              "unsatisfied_dependencies": pending,
+              "notes_total": len(rows), "notes_packed": len(packed),
+              "notes_pinned_packed": pinned_packed,
               "notes": packed})
 
 def search_notes(args):
-    """Keyword retrieval over note content with project/status filters via the task join."""
+    """Keyword retrieval over note content with kind/project/status filters via the task join."""
     with conn() as db:
         pat = "%" + args.query + "%"
         clauses = ["n.content LIKE ?"]
         vals = [pat]
+        if args.kind:
+            if args.kind not in NOTE_KINDS:
+                raise SystemExit(f"invalid note kind: {args.kind} (choose from {sorted(NOTE_KINDS)})")
+            clauses.append("n.kind=?"); vals.append(args.kind)
         if args.project:
             clauses.append("t.project=?"); vals.append(args.project)
         if args.status:
@@ -562,7 +591,8 @@ def metrics(args):
             (t,))}
         receipts = db.execute("SELECT COUNT(*) n FROM receipts").fetchone()["n"]
         events = db.execute("SELECT COUNT(*) n FROM audit_events").fetchone()["n"]
-        notes = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded FROM notes").fetchone()
+        notes = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded, "
+                           "SUM(CASE WHEN pinned!=0 AND superseded_by='' THEN 1 ELSE 0 END) pinned FROM notes").fetchone()
     json_out({
         "generated_at": t,
         "tasks_total": sum(by_status.values()),
@@ -577,6 +607,7 @@ def metrics(args):
         "audit_events": events,
         "notes_total": notes["total"] or 0,
         "notes_superseded": notes["superseded"] or 0,
+        "notes_pinned_live": notes["pinned"] or 0,
     })
 
 def list_tasks(args):
@@ -649,11 +680,11 @@ def main():
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
     p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.set_defaults(fn=search_tasks)
-    p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.set_defaults(fn=add_note)
+    p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.set_defaults(fn=supersede_note)
     p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.set_defaults(fn=task_context)
-    p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.set_defaults(fn=search_notes)
+    p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.set_defaults(fn=search_notes)
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.set_defaults(fn=release)
     args=ap.parse_args(); args.fn(args)
 

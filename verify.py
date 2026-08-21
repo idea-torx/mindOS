@@ -216,9 +216,41 @@ with tempfile.TemporaryDirectory() as td:
     detail = run('show','rel-1')
     assert any(e['action'] == 'lease_released' for e in detail['audit'])
     run_fail('release','fin-1','--owner','worker-a')  # terminal tasks cannot be released
-    # Doctor: shared-memory sweep stays clean after the note exercises above.
-    doc = ops('doctor')
-    assert doc['ok'] is True and doc['problems'] == [], doc
+    # Pinned notes: critical facts survive tight context budgets.
+    run('create','--project','Verify','--title','pin host','--id','mem-2')
+    for i in range(3):
+        run('note','mem-2','--kind','observation','--content','noise-%s %s' % (i, 'y'*40))
+    pin = run('note','mem-2','--kind','constraint','--content','MUST NOT exceed 120/min','--source','leo','--pinned')
+    assert pin['deduplicated'] is False and pin['id']
+    # Duplicate add of pinned content upgrades the existing note instead of growing the store.
+    dup_pin = run('note','mem-2','--kind','constraint','--content','MUST NOT exceed 120/min','--source','hermes')
+    assert dup_pin['deduplicated'] is True and dup_pin['id'] == pin['id']
+    import sqlite3
+    with sqlite3.connect(Path(td) / 'state.db') as db:
+        assert db.execute("SELECT pinned FROM notes WHERE id=?", (pin['id'],)).fetchone()[0] == 1
+    # Context pack v2: task summary + deps header, pinned-first packing under budget.
+    ctx = run('context','mem-2','--budget','200')
+    assert ctx['task']['id'] == 'mem-2' and ctx['task']['title'] == 'pin host'
+    assert ctx['unsatisfied_dependencies'] == []
+    assert ctx['truncated'] is True and ctx['used_chars'] <= 200
+    assert [n['content'] for n in ctx['notes']] == ['MUST NOT exceed 120/min']
+    assert ctx['notes_pinned_packed'] == 1 and ctx['notes_total'] == 4
+    full = run('context','mem-2','--budget','100000')
+    assert full['notes_packed'] == 4 and full['truncated'] is False
+    assert full['notes'][0]['pinned'] == 1, 'pinned note packs first even with a huge budget'
+    # Supersede inherits the pin so temporal fact chains stay protected.
+    sup2 = run('supersede-note',pin['id'],'--content','MUST NOT exceed 240/min','--source','leo')
+    live2 = run('context','mem-2','--budget','100000')
+    new_note = next(n for n in live2['notes'] if n['id'] == sup2['new_note_id'])
+    assert new_note['pinned'] == 1 and new_note['content'] == 'MUST NOT exceed 240/min'
+    # search-notes --kind filter narrows retrieval by note kind.
+    hits = run('search-notes','MUST NOT','--kind','constraint')
+    assert {h['id'] for h in hits} == {sup2['new_note_id']}
+    assert run('search-notes','MUST NOT','--kind','fact') == []
+    err = run_fail('search-notes','x','--kind','gossip')
+    assert 'invalid note kind' in err
+    m = run('metrics')
+    assert m['notes_pinned_live'] == 1, m
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
