@@ -12,6 +12,25 @@ MindOS brings together:
 
 The repository is currently **source-available under FSL-1.1-MIT**. It becomes MIT-licensed after the applicable two-year change date; it is not OSI open source during the FSL restriction period.
 
+## Architecture in one screen
+
+MindOS is a combinatorial system: eight orthogonal durable dimensions
+(execution truth × semantic memory × temporal facts × session/context ×
+agents/handoffs × evidence/receipts × recovery/rollback × policy/provenance)
+whose combinations produce capabilities — safe ownership, evidence-backed
+completion, current-vs-historical truth, resumable multi-agent work, portable
+brain with reversion, enforceable definition of done. Git + Markdown can store
+the data; MindOS makes concurrency, atomic transitions, retrieval, policy
+gates, receipts, temporal state, and recovery operational and queryable.
+
+Visual explanations (all render on GitHub):
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — system layers & data flow, task/lease/receipt lifecycle, memory/context retrieval path, migration & rollback path, capability matrix, plus a [fact table](ARCHITECTURE.md#fact-table) mapping every claim to source + test.
+- [docs/COMBINATORIAL-ARCHITECTURE.md](docs/COMBINATORIAL-ARCHITECTURE.md) — the dimension → combination → capability derivation and why "just use Git" misses the point.
+
+Core invariants: single SQLite authority (Hindsight bound, never copied), fail
+closed, evidence over claims, dry-run first, source immutability.
+
 ## Project identity
 
 ```text
@@ -1861,7 +1880,8 @@ source during the restricted period.
 ## Repository guide
 
 - [README.md](README.md) — what MindOS is, command surface, design rules (this document)
-- [ARCHITECTURE.md](ARCHITECTURE.md) — layers, invariants, module map
+- [ARCHITECTURE.md](ARCHITECTURE.md) — layers, invariants, diagrams, fact table
+- [docs/COMBINATORIAL-ARCHITECTURE.md](docs/COMBINATORIAL-ARCHITECTURE.md) — the combinatorial capability model
 - [INSTALL.md](INSTALL.md) — install + migration from an existing home
 - [CONTRIBUTING.md](CONTRIBUTING.md) — workflow, gates, commit style
 - [SECURITY.md](SECURITY.md) — safety boundary, data boundary, secret guard
