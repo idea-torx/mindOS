@@ -99,6 +99,36 @@ Design properties:
 `metrics` reports `notes_total`, `notes_superseded`, and `notes_pinned_live`;
 `ops.py doctor` checks for orphaned notes and dangling supersession links.
 
+## Retrieval-augmented context packs
+
+`context --related N` turns the pack into cross-task RAG: up to N live notes
+from *other* tasks whose content matches this task's title/description/
+next_action are appended after the task's own notes, within the same character
+budget. Each related note carries its source task (`task_id`,
+`via_task_title`) and an FTS relevance `score`, so agents see prior knowledge
+from sibling work without manual searching:
+
+```bash
+python3 "$A" context <task-id> --budget 4000 --related 5
+python3 "$A" context <task-id> --budget 4000 --related 5 --related-scope global
+```
+
+Design properties:
+
+- **Recall-oriented ranking**: candidate tokens are OR-combined through the
+  FTS5 index and ordered by BM25, so the strongest matches pack first even
+  when only one token overlaps.
+- **Provenance**: every related note is tagged with the task it came from;
+  the task's own notes are never duplicated into the related section.
+- **Budget-honest**: related notes consume the same budget as own notes and
+  report `related_requested` / `related_matched` / `related_packed`;
+  `truncated` flips when anything was dropped.
+- **Scope**: default `--related-scope project` restricts candidates to the
+  task's project; `global` searches all projects.
+- **Graceful fallback**: on non-FTS builds it degrades to any-token substring
+  matching (same shape, minus `score`); tokenless task text yields zero
+  related matches instead of an error.
+
 ## Ranked retrieval (FTS5)
 
 Search can run through SQLite FTS5 (stdlib — no external dependency) instead of

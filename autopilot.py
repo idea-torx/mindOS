@@ -396,14 +396,57 @@ def note_history(args):
             chain.insert(0, dict(prv)); seen.add(prv["id"]); node = prv
     json_out(chain)
 
+def _related_note_candidates(db, task_id: str, text: str, limit: int, scope: str) -> list:
+    """Cross-task retrieval: live notes on *other* tasks matching this task's text.
+
+    FTS5 path OR-combines the tokens (recall-oriented) and ranks by BM25 so the
+    best matches pack first; on non-FTS builds it degrades to any-token LIKE
+    matching with identical output shape minus `score`. Scope 'project'
+    restricts candidates to the task's own project; 'global' searches all.
+    """
+    if limit <= 0 or not text.strip():
+        return []
+    toks = []
+    for raw in text.split():
+        tok = raw.replace('"', "")
+        if tok and any(c.isalnum() for c in tok):
+            toks.append(tok)
+    if not toks:
+        return []
+    scope_sql, scope_vals = "", []
+    if scope != "global":
+        scope_sql = " AND t.project=(SELECT project FROM tasks WHERE id=?)"
+        scope_vals = [task_id]
+    cols = ("SELECT n.id,n.kind,n.content,n.source,n.created_at,n.pinned,n.task_id,"
+            "t.title AS via_task_title")
+    if _fts_ready(db):
+        match = " OR ".join('"%s"' % t for t in toks)
+        sql = (cols + ",bm25(notes_fts) AS score "
+               "FROM notes_fts f JOIN notes n ON n.rowid=f.rowid JOIN tasks t ON t.id=n.task_id "
+               "WHERE notes_fts MATCH ? AND n.superseded_by='' AND n.task_id!=?" + scope_sql +
+               " ORDER BY score LIMIT ?")
+        vals = [match, task_id, *scope_vals, limit]
+    else:
+        likes = " OR ".join("n.content LIKE ?" for _ in toks)
+        sql = (cols + " FROM notes n JOIN tasks t ON t.id=n.task_id "
+               "WHERE (" + likes + ") AND n.superseded_by='' AND n.task_id!=?" + scope_sql +
+               " ORDER BY n.created_at DESC LIMIT ?")
+        vals = [*( "%" + t + "%" for t in toks), task_id, *scope_vals, limit]
+    return [dict(r) for r in db.execute(sql, vals).fetchall()]
+
 def task_context(args):
     """Pack a prompt-ready context bundle within a character budget.
 
     Includes a task summary header and unsatisfied dependencies, then live
     notes packed pinned-first (oldest→newest within each group) so critical
-    facts survive tight budgets.
+    facts survive tight budgets. With --related N, up to N BM25-ranked live
+    notes from other tasks (matching this task's title/description/next_action
+    text) are appended afterwards within the same budget, each tagged with its
+    source task for provenance.
     """
     budget = max(0, args.budget)
+    rel_limit = max(0, getattr(args, "related", 0))
+    rel_scope = getattr(args, "related_scope", "project") or "project"
     with conn() as db:
         row = task_row(db, args.task_id)
         summary = {k: row[k] for k in ("id", "project", "title", "status", "priority", "next_action", "blocked_reason", "due_at")}
@@ -412,6 +455,10 @@ def task_context(args):
             "SELECT id,kind,content,source,created_at,pinned FROM notes "
             "WHERE task_id=? AND superseded_by='' ORDER BY rowid ASC",
             (args.task_id,)).fetchall()]
+        related = _related_note_candidates(
+            db, args.task_id,
+            " ".join(filter(None, (row["title"], row["description"], row["next_action"]))),
+            rel_limit, rel_scope)
     # Stable sort: pinned notes first, original (oldest→newest) order within groups.
     ordered = sorted(rows, key=lambda r: not r["pinned"])
     header_cost = 64 + len(summary["title"]) + len(summary["next_action"]) + len(summary["blocked_reason"])
@@ -425,11 +472,22 @@ def task_context(args):
         packed.append(r); used += cost
         if r["pinned"]:
             pinned_packed += 1
+    related_packed = 0
+    for r in related:
+        r["related"] = True
+        cost = (len(r["content"]) + len(r["kind"]) + len(r["source"]) + len(r["created_at"])
+                + len(r["task_id"]) + len(r["via_task_title"]) + 16)
+        if used + cost > budget:
+            truncated = True
+            continue
+        packed.append(r); used += cost; related_packed += 1
     json_out({"task_id": args.task_id, "budget": budget, "used_chars": used,
               "truncated": truncated, "task": summary,
               "unsatisfied_dependencies": pending,
-              "notes_total": len(rows), "notes_packed": len(packed),
+              "notes_total": len(rows), "notes_packed": len(packed) - related_packed,
               "notes_pinned_packed": pinned_packed,
+              "related_requested": rel_limit, "related_matched": len(related),
+              "related_packed": related_packed,
               "notes": packed})
 
 def search_notes(args):
@@ -879,7 +937,7 @@ def main():
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.set_defaults(fn=supersede_note)
-    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.set_defaults(fn=task_context)
+    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.set_defaults(fn=task_context)
     p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_notes)
     p=sub.add_parser("note-history"); p.add_argument("note_id"); p.set_defaults(fn=note_history)
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)

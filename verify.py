@@ -372,6 +372,38 @@ with tempfile.TemporaryDirectory() as td:
     bad.write_text(json.dumps(evil, sort_keys=True))
     err = ops_fail('snapshot-restore', str(bad), '--force')
     assert 'integrity check failed' in err
+    # Cross-task retrieval: context --related pulls ranked notes from sibling tasks.
+    run('create','--project','Verify','--title','postgres pool incident followups','--id','rag-src')
+    run('note','rag-src','--kind','fact','--content','postgres connection pool exhausted under load','--source','hermes')
+    run('note','rag-src','--kind','observation','--content','gardening tip about tomatoes entirely unrelated','--source','hermes')
+    ctx = run('context','fts-1','--budget','100000','--related','3')
+    assert ctx['related_requested'] == 3 and ctx['related_matched'] >= 1 and ctx['related_packed'] >= 1, ctx
+    rel = [n for n in ctx['notes'] if n.get('related')]
+    assert {n['task_id'] for n in rel} == {'rag-src'}, 'self-task notes must never appear as related'
+    assert all(n['via_task_title'] == 'postgres pool incident followups' for n in rel)
+    assert any('postgres' in n['content'] for n in rel), 'best match must be retrieved'
+    own = [n for n in ctx['notes'] if not n.get('related')]
+    assert ctx['notes'][:len(own)] == own, 'own notes pack before related notes'
+    assert 'score' in rel[0], 'FTS path carries a relevance score'
+    # Budget: related notes respect the same character budget and report truncation.
+    tight = run('context','fts-1','--budget','150','--related','3')
+    assert tight['used_chars'] <= 150 and tight['truncated'] is True
+    assert tight['related_packed'] < tight['related_matched'], tight
+    # Scope: default project scope excludes other projects; global includes them.
+    run('create','--project','OtherProj','--title','postgres pool incident followups','--id','rag-x')
+    run('note','rag-x','--kind','fact','--content','postgres pool sized wrong in staging','--source','hermes')
+    scoped = run('context','fts-1','--budget','100000','--related','5')
+    assert {n['task_id'] for n in scoped['notes'] if n.get('related')} == {'rag-src'}
+    glob = run('context','fts-1','--budget','100000','--related','5','--related-scope','global')
+    assert {n['task_id'] for n in glob['notes'] if n.get('related')} == {'rag-src','rag-x'}
+    # Tokenless task text degrades gracefully to zero related matches.
+    run('create','--project','Verify','--title','','--id','rag-empty')
+    empty = run('context','rag-empty','--budget','4000','--related','5')
+    assert empty['related_matched'] == 0 and empty['related_packed'] == 0
+    # Default context output shape is unchanged when --related is absent.
+    plain = run('context','mem-2','--budget','100000')
+    assert plain['related_requested'] == 0 and plain['related_packed'] == 0
+    assert all(not n.get('related') for n in plain['notes'])
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
