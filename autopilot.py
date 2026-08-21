@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import uuid
@@ -108,6 +109,7 @@ CREATE TABLE IF NOT EXISTS handoffs (
   next_actions TEXT NOT NULL DEFAULT '[]',
   risks TEXT NOT NULL DEFAULT '[]',
   content_hash TEXT NOT NULL,
+  recall_digest TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   superseded_by TEXT NOT NULL DEFAULT ''
 );
@@ -223,6 +225,9 @@ def _migrate(db) -> None:
         db.execute("ALTER TABLE tasks ADD COLUMN due_at TEXT NOT NULL DEFAULT ''")
     if "recover_after" not in task_cols:
         db.execute("ALTER TABLE tasks ADD COLUMN recover_after TEXT NOT NULL DEFAULT ''")
+    handoff_cols = {r[1] for r in db.execute("PRAGMA table_info(handoffs)")}
+    if "recall_digest" not in handoff_cols:
+        db.execute("ALTER TABLE handoffs ADD COLUMN recall_digest TEXT NOT NULL DEFAULT ''")
     prev = ""
     for row in db.execute("SELECT id,prev_hash,hash FROM audit_events ORDER BY id").fetchall():
         if row[2]:
@@ -423,6 +428,14 @@ def note_history(args):
     json_out(chain)
 
 HANDOFF_LIST_FIELDS = ("evidence", "constraints", "decisions", "files", "next_actions", "risks")
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+def _require_digest(value: str, flag: str) -> str:
+    """Validate an optional recall digest (64-char lowercase hex sha256)."""
+    v = (value or "").strip().lower()
+    if v and not _DIGEST_RE.fullmatch(v):
+        raise SystemExit(f"invalid {flag}: expected a 64-character hex sha256 digest")
+    return v
 
 def _handoff_payload(args) -> dict:
     """Canonical provider-neutral handoff fields from CLI args."""
@@ -433,6 +446,7 @@ def _handoff_payload(args) -> dict:
         "objective": (getattr(args, "objective", "") or "").strip(),
         **{f: list(getattr(args, f, []) or []) for f in HANDOFF_LIST_FIELDS},
         "commit_ref": (getattr(args, "commit_ref", "") or "").strip(),
+        "recall_digest": _require_digest(getattr(args, "recall_digest", "") or "", "--recall-digest"),
     }
 
 def _handoff_hash(task_id: str, payload: dict) -> str:
@@ -449,7 +463,8 @@ def _handoff_parsed(row, include_meta: bool = False):
         "id": row["id"], "task_id": row["task_id"],
         "from_agent": row["from_agent"], "to_agent": row["to_agent"],
         "status": row["status"], "objective": row["objective"],
-        "commit_ref": row["commit_ref"], "created_at": row["created_at"],
+        "commit_ref": row["commit_ref"], "recall_digest": row["recall_digest"],
+        "created_at": row["created_at"],
     }
     for f in HANDOFF_LIST_FIELDS:
         try:
@@ -463,7 +478,7 @@ def _handoff_parsed(row, include_meta: bool = False):
 
 def _handoff_cost(h: dict) -> int:
     return sum(len(h.get(f, "")) for f in ("id", "from_agent", "to_agent", "status",
-               "objective", "commit_ref", "created_at")) \
+               "objective", "commit_ref", "created_at", "recall_digest")) \
         + sum(len(" ".join(h.get(f, []))) for f in HANDOFF_LIST_FIELDS) + 32
 
 def add_handoff(args):
@@ -473,6 +488,9 @@ def add_handoff(args):
     handoff atomically supersedes the previous one (temporal chain, queryable
     via `handoffs --all`). An identical live handoff is deduplicated instead of
     growing the store. Payloads must never carry credentials or private tokens.
+    `--recall-digest` attaches proof of the context pack the handoff was
+    written against (the digest from a prior `recall`), so downstream agents
+    can detect when the handoff predates newer context.
     """
     payload = _handoff_payload(args)
     hid = uuid.uuid4().hex
@@ -493,15 +511,17 @@ def add_handoff(args):
                          (hid, args.task_id))
         db.execute(
             "INSERT INTO handoffs(id,task_id,from_agent,to_agent,status,objective,evidence,"
-            "constraints,decisions,files,commit_ref,next_actions,risks,content_hash,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "constraints,decisions,files,commit_ref,next_actions,risks,content_hash,recall_digest,created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (hid, args.task_id, payload["from_agent"], payload["to_agent"], payload["status"],
              payload["objective"], json.dumps(payload["evidence"]), json.dumps(payload["constraints"]),
              json.dumps(payload["decisions"]), json.dumps(payload["files"]), payload["commit_ref"],
-             json.dumps(payload["next_actions"]), json.dumps(payload["risks"]), h, t))
+             json.dumps(payload["next_actions"]), json.dumps(payload["risks"]), h,
+             payload["recall_digest"], t))
         audit(db, "task", args.task_id, "handoff_recorded",
               {"handoff_id": hid, "from_agent": payload["from_agent"],
-               "to_agent": payload["to_agent"], "superseded": prev["id"] if prev and cur.rowcount else None})
+               "to_agent": payload["to_agent"], "superseded": prev["id"] if prev and cur.rowcount else None,
+               "recall_digest": payload["recall_digest"] or None})
     json_out({"ok": True, "id": hid, "task_id": args.task_id, "deduplicated": False,
               "superseded": prev["id"] if prev and cur.rowcount else None, "created_at": t})
 
@@ -640,6 +660,44 @@ def task_context(args):
                              getattr(args, "related", 0),
                              getattr(args, "related_scope", "project")))
 
+def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: int, rel_scope: str) -> dict:
+    """Assemble the recall bundle and its deterministic digest (no audit write).
+
+    Shared by `recall` (which audits the digest) and `recall-verify` (which
+    recomputes it to test whether a previously recalled context is still fresh).
+    """
+    agent = (agent or "").strip()
+    t = now()
+    row = task_row(db, task_id)
+    pack = _build_pack(db, task_id, budget, rel_limit, rel_scope or "project")
+    lease_live = bool(row["lease_owner"]) and row["lease_expires_at"] > t
+    bundle = {
+        **pack,
+        "agent": agent or None,
+        "recalled_at": t,
+        "lease": {
+            "owner": row["lease_owner"],
+            "expires_at": row["lease_expires_at"],
+            "epoch": row["lease_epoch"],
+            "live": lease_live,
+            "held_by_caller": bool(agent) and lease_live and row["lease_owner"] == agent,
+        },
+        "latest_receipts": [
+            {**{k: r[k] for k in ("id", "kind", "created_at")},
+             "payload": json.loads(r["payload_json"])}
+            for r in db.execute(
+                "SELECT id,kind,payload_json,created_at FROM receipts "
+                "WHERE task_id=? ORDER BY created_at DESC, id DESC LIMIT 3",
+                (task_id,)).fetchall()],
+    }
+    # Digest covers durable context only — not the recall timestamp — so
+    # identical state yields an identical, referenceable digest.
+    digest = hashlib.sha256(json.dumps(
+        {k: v for k, v in bundle.items() if k != "recalled_at"},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    bundle["digest"] = digest
+    return bundle
+
 def recall(args):
     """Session bootstrap: everything an agent needs before acting on a task.
 
@@ -647,45 +705,41 @@ def recall(args):
     lease state — including whether the calling agent holds it — and the latest
     receipts, then seals the bundle with a deterministic `digest`. The digest is
     audited (`context_recalled`) so an agent can prove exactly which context it
-    recalled before acting; handoffs and receipts can reference it downstream.
+    recalled before acting; handoffs and completions can cite it downstream via
+    `--recall-digest`, and `recall-verify` re-checks its freshness.
     Identical state yields an identical digest (stable across repeated calls).
     """
-    agent = (getattr(args, "agent", "") or "").strip()
-    t = now()
     with conn() as db:
-        row = task_row(db, args.task_id)
-        pack = _build_pack(db, args.task_id, args.budget,
-                           getattr(args, "related", 0),
-                           getattr(args, "related_scope", "project"))
-        lease_live = bool(row["lease_owner"]) and row["lease_expires_at"] > t
-        bundle = {
-            **pack,
-            "agent": agent or None,
-            "recalled_at": t,
-            "lease": {
-                "owner": row["lease_owner"],
-                "expires_at": row["lease_expires_at"],
-                "epoch": row["lease_epoch"],
-                "live": lease_live,
-                "held_by_caller": bool(agent) and lease_live and row["lease_owner"] == agent,
-            },
-            "latest_receipts": [
-                {**{k: r[k] for k in ("id", "kind", "created_at")},
-                 "payload": json.loads(r["payload_json"])}
-                for r in db.execute(
-                    "SELECT id,kind,payload_json,created_at FROM receipts "
-                    "WHERE task_id=? ORDER BY created_at DESC, id DESC LIMIT 3",
-                    (args.task_id,)).fetchall()],
-        }
-        # Digest covers durable context only — not the recall timestamp — so
-        # identical state yields an identical, referenceable digest.
-        digest = hashlib.sha256(json.dumps(
-            {k: v for k, v in bundle.items() if k != "recalled_at"},
-            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        bundle["digest"] = digest
+        bundle = _build_recall_bundle(db, args.task_id,
+                                      getattr(args, "agent", "") or "",
+                                      args.budget, getattr(args, "related", 0),
+                                      getattr(args, "related_scope", "project"))
         audit(db, "task", args.task_id, "context_recalled",
-              {"agent": agent or None, "digest": digest})
+              {"agent": bundle["agent"], "digest": bundle["digest"]})
     json_out(bundle)
+
+def recall_verify(args):
+    """Freshness check for a previously recalled context digest.
+
+    Recomputes the current recall bundle for the task (same algorithm as
+    `recall`, without auditing) and compares it to the caller's digest:
+    `fresh` means nothing durable has changed since that recall — notes,
+    handoffs, lease state, receipts, deps all match. A stale result carries
+    the new `current_digest` so the agent can re-`recall` before acting.
+    Exit code stays 0 either way; callers branch on the JSON.
+    """
+    digest = _require_digest(args.digest, "--digest")
+    if not digest:
+        raise SystemExit("--digest is required")
+    with conn() as db:
+        task_row(db, args.task_id)
+        bundle = _build_recall_bundle(db, args.task_id,
+                                      getattr(args, "agent", "") or "",
+                                      args.budget, getattr(args, "related", 0),
+                                      getattr(args, "related_scope", "project"))
+    json_out({"ok": True, "task_id": args.task_id,
+              "fresh": bundle["digest"] == digest,
+              "recalled_digest": digest, "current_digest": bundle["digest"]})
 
 def search_notes(args):
     """Keyword retrieval over note content with kind/project/status filters via the task join.
@@ -905,6 +959,7 @@ def _require_not_foreign_lease(row, owner: str, verb: str) -> None:
         raise SystemExit("lease expired; reclaim before " + verb)
 
 def complete(args):
+    recall_digest = _require_digest(getattr(args, "recall_digest", "") or "", "--recall-digest")
     with conn() as db:
         row = task_row(db, args.id)
         if row["status"] in {"completed", "cancelled"}:
@@ -913,7 +968,8 @@ def complete(args):
         _require_epoch(row, getattr(args, "epoch", None), "completing")
         t = now()
         db.execute("UPDATE tasks SET status='completed',lease_owner='',lease_expires_at='',blocked_reason='',updated_at=? WHERE id=?", (t, args.id))
-        audit(db, "task", args.id, "completed", {"owner": args.owner, "note": args.note})
+        audit(db, "task", args.id, "completed", {"owner": args.owner, "note": args.note,
+                                                 "recall_digest": recall_digest or None})
         json_out(dict(task_row(db, args.id)))
 
 def cancel(args):
@@ -1215,7 +1271,8 @@ def metrics(args):
             (t, horizon)).fetchone()["n"]
         notes = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded, "
                            "SUM(CASE WHEN pinned!=0 AND superseded_by='' THEN 1 ELSE 0 END) pinned FROM notes").fetchone()
-        handoffs = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded FROM handoffs").fetchone()
+        handoffs = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded, "
+                              "SUM(CASE WHEN recall_digest!='' THEN 1 ELSE 0 END) proven FROM handoffs").fetchone()
     json_out({
         "generated_at": t,
         "tasks_total": sum(by_status.values()),
@@ -1236,6 +1293,7 @@ def metrics(args):
         "notes_pinned_live": notes["pinned"] or 0,
         "handoffs_total": handoffs["total"] or 0,
         "handoffs_superseded": handoffs["superseded"] or 0,
+        "handoffs_with_recall_proof": handoffs["proven"] or 0,
     })
 
 def list_tasks(args):
@@ -1330,7 +1388,7 @@ def main():
     p=sub.add_parser("init"); p.set_defaults(fn=lambda a: (ensure(), json_out({"ok":True,"db":str(DB)})))
     p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--due-at",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.set_defaults(fn=create)
     p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.add_argument("--title"); p.add_argument("--description"); p.add_argument("--priority",choices=sorted(PRIORITIES)); p.add_argument("--project"); p.set_defaults(fn=update)
-    p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=complete)
+    p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.set_defaults(fn=complete)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
     p=sub.add_parser("block"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=block)
     p=sub.add_parser("unblock"); p.add_argument("id"); p.add_argument("--owner",required=True); p.set_defaults(fn=unblock)
@@ -1353,9 +1411,10 @@ def main():
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.set_defaults(fn=supersede_note)
     p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.set_defaults(fn=task_context)
     p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.set_defaults(fn=recall)
+    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.set_defaults(fn=recall_verify)
     p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_notes)
     p=sub.add_parser("note-history"); p.add_argument("note_id"); p.set_defaults(fn=note_history)
-    p=sub.add_parser("handoff"); p.add_argument("task_id"); p.add_argument("--from-agent",required=True); p.add_argument("--to-agent",default=""); p.add_argument("--status",default=""); p.add_argument("--objective",default=""); p.add_argument("--evidence",action="append",default=[]); p.add_argument("--constraint",dest="constraints",action="append",default=[]); p.add_argument("--decision",dest="decisions",action="append",default=[]); p.add_argument("--file",dest="files",action="append",default=[]); p.add_argument("--commit",dest="commit_ref",default=""); p.add_argument("--next-action",dest="next_actions",action="append",default=[]); p.add_argument("--risk",dest="risks",action="append",default=[]); p.set_defaults(fn=add_handoff)
+    p=sub.add_parser("handoff"); p.add_argument("task_id"); p.add_argument("--from-agent",required=True); p.add_argument("--to-agent",default=""); p.add_argument("--status",default=""); p.add_argument("--objective",default=""); p.add_argument("--evidence",action="append",default=[]); p.add_argument("--constraint",dest="constraints",action="append",default=[]); p.add_argument("--decision",dest="decisions",action="append",default=[]); p.add_argument("--file",dest="files",action="append",default=[]); p.add_argument("--commit",dest="commit_ref",default=""); p.add_argument("--next-action",dest="next_actions",action="append",default=[]); p.add_argument("--risk",dest="risks",action="append",default=[]); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.set_defaults(fn=add_handoff)
     p=sub.add_parser("handoffs"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_handoffs)
     p=sub.add_parser("handoff-current"); p.add_argument("task_id"); p.set_defaults(fn=current_handoff)
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)

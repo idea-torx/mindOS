@@ -163,6 +163,11 @@ Design properties:
   live one (`superseded_by` link); superseded handoffs stay queryable via
   `--all`, so context evolution is auditable. A self-report is still not
   execution truth — pair handoffs with receipts for verified evidence.
+- **Recall provenance**: pass `--recall-digest <sha256>` (the digest from a
+  prior `recall`) to attach proof of the exact context the handoff was written
+  against; `complete --recall-digest` does the same for completions. The
+  digest is stored on the record and in its audit event, and `metrics`
+  reports `handoffs_with_recall_proof`. Digests are validated as 64-char hex.
 - **Deduplicated**: an identical live payload returns the existing handoff
   (`deduplicated: true`) instead of growing the store; every write is
   provenance-tagged in the hash-chained audit ledger (`handoff_recorded`,
@@ -228,8 +233,17 @@ digest, so a receipt can later prove exactly which context was recalled before
 acting. A self-report is never execution truth without a receipt; a digest ties
 the two together.
 
+`recall-verify` closes the loop: pass a previously recalled digest and it
+recomputes the current bundle (same algorithm, no audit write) and reports
+`fresh: true` when nothing durable has changed since that recall — notes,
+handoffs, lease state, receipts, deps all match. A stale result carries the
+new `current_digest` so the agent can re-`recall` before acting. Handoffs and
+completions cite the digest they acted on via `--recall-digest`, making stale
+context detectable after the fact.
+
 ```bash
 python3 "$A" recall <task-id> --agent codex --budget 6000 --related 5
+python3 "$A" recall-verify <task-id> --digest <sha256> --agent codex --budget 6000 --related 5
 python3 "$A" events --action context_recalled --entity-id <task-id>
 ```
 

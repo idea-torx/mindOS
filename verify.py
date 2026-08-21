@@ -690,6 +690,29 @@ with tempfile.TemporaryDirectory() as td:
     assert r3['digest'] != r1['digest'], 'digest must track context state'
     evs = run('events','--entity-id','ho-1','--action','context_recalled','--limit','10')
     assert evs['count'] >= 3, evs
+    # recall-verify: freshness check of a previously recalled digest.
+    rv = run('recall-verify','ho-1','--digest',r3['digest'],'--agent','opencode','--budget','100000')
+    assert rv['ok'] is True and rv['fresh'] is True and rv['current_digest'] == r3['digest'], rv
+    run('note','ho-1','--kind','fact','--content','post-recall drift marker','--source','verify')
+    rv2 = run('recall-verify','ho-1','--digest',r3['digest'],'--agent','opencode','--budget','100000')
+    assert rv2['fresh'] is False and rv2['current_digest'] != r3['digest'], rv2
+    assert run_fail('recall-verify','ho-1','--digest','not-a-digest'), 'malformed digest must be rejected'
+    # Recall provenance: handoffs and completions cite the digest they acted on.
+    h3 = run('handoff','ho-1','--from-agent','opencode','--to-agent','claude-code',
+             '--objective','finish retry path','--recall-digest',r3['digest'])
+    assert h3['id'] != h2['id'], 'new objective supersedes the live handoff'
+    cur3 = run('handoff-current','ho-1')
+    assert cur3['recall_digest'] == r3['digest'], cur3
+    assert run_fail('handoff','ho-1','--from-agent','opencode','--recall-digest','zzz'), 'bad digest rejected'
+    m2 = run('metrics')
+    assert m2['handoffs_with_recall_proof'] >= 1, m2
+    run('release','ho-1','--owner','codex')
+    run('claim','ho-1','--owner','claude-code','--minutes','30')
+    comp = run('complete','ho-1','--owner','claude-code','--note','done','--recall-digest',rv2['current_digest'])
+    assert comp['status'] == 'completed', comp
+    cev = [e for e in run('events','--entity-id','ho-1','--action','completed')['events']
+           if e['payload'].get('recall_digest') == rv2['current_digest']]
+    assert cev, 'completed event must carry the cited recall digest'
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
