@@ -101,6 +101,49 @@ Design properties:
 `metrics` reports `notes_total`, `notes_superseded`, and `notes_pinned_live`;
 `ops.py doctor` checks for orphaned notes and dangling supersession links.
 
+## Agent handoff protocol (provider-neutral)
+
+Any agent — Hermes, Claude Code, Codex, OpenCode — can publish a durable,
+structured handoff on a task. The latest live handoff is the authoritative
+resume point: a killed or fresh session reconstructs its working context from
+`handoff-current` (or the `context` pack) in moments, with no vendor-specific
+format:
+
+```bash
+python3 "$A" handoff <task-id> --from-agent codex --to-agent claude-code \
+  --status running --objective "implement retry path" \
+  --evidence "tests pass locally" --constraint "no new dependencies" \
+  --decision "use exponential backoff" --file src/retry.py \
+  --commit abc1234 --next-action "open PR" --risk "flaky integration test"
+python3 "$A" handoff-current <task-id>   # recovery point for a new session
+python3 "$A" handoffs <task-id>          # live handoff
+python3 "$A" handoffs <task-id> --all    # full temporal chain
+```
+
+Design properties:
+
+- **Complete carrier**: every handoff records source agent, target agent, work
+  status, objective, verified evidence, constraints, decisions, files/commit,
+  next actions, risks, and a timestamp — the fields an incoming agent needs
+  before acting.
+- **Temporal**: recording a new handoff atomically supersedes the previous
+  live one (`superseded_by` link); superseded handoffs stay queryable via
+  `--all`, so context evolution is auditable. A self-report is still not
+  execution truth — pair handoffs with receipts for verified evidence.
+- **Deduplicated**: an identical live payload returns the existing handoff
+  (`deduplicated: true`) instead of growing the store; every write is
+  provenance-tagged in the hash-chained audit ledger (`handoff_recorded`,
+  `handoff_deduplicated`).
+- **Context-budget aware**: `context` packs the live handoff immediately after
+  the task header (before notes), so the resume point survives tight budgets;
+  output reports `handoff` / `handoff_packed`. `show` surfaces it too.
+- **Privacy boundary**: handoff payloads are plain operator/agent text — never
+  copy credentials, tokens, raw personal data, or unrelated client context
+  into them.
+- **Consistency-checked**: `ops.py doctor` detects orphaned handoffs, dangling
+  supersession links, and invariant violations (more than one live handoff per
+  task); snapshots and archives carry the `handoffs` table.
+
 ## Retrieval-augmented context packs
 
 `context --related N` turns the pack into cross-task RAG: up to N live notes

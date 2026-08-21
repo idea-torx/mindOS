@@ -93,6 +93,25 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 CREATE INDEX IF NOT EXISTS idx_notes_task ON notes(task_id);
 CREATE INDEX IF NOT EXISTS idx_notes_hash ON notes(task_id, content_hash);
+CREATE TABLE IF NOT EXISTS handoffs (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  from_agent TEXT NOT NULL DEFAULT '',
+  to_agent TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT '',
+  objective TEXT NOT NULL DEFAULT '',
+  evidence TEXT NOT NULL DEFAULT '[]',
+  constraints TEXT NOT NULL DEFAULT '[]',
+  decisions TEXT NOT NULL DEFAULT '[]',
+  files TEXT NOT NULL DEFAULT '[]',
+  commit_ref TEXT NOT NULL DEFAULT '',
+  next_actions TEXT NOT NULL DEFAULT '[]',
+  risks TEXT NOT NULL DEFAULT '[]',
+  content_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  superseded_by TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_handoffs_task ON handoffs(task_id);
 """
 # Full-text retrieval (FTS5, stdlib sqlite3): external-content indexes over
 # notes/tasks kept in sync by triggers. Applied only when the SQLite build
@@ -403,6 +422,106 @@ def note_history(args):
             chain.insert(0, dict(prv)); seen.add(prv["id"]); node = prv
     json_out(chain)
 
+HANDOFF_LIST_FIELDS = ("evidence", "constraints", "decisions", "files", "next_actions", "risks")
+
+def _handoff_payload(args) -> dict:
+    """Canonical provider-neutral handoff fields from CLI args."""
+    return {
+        "from_agent": (args.from_agent or "").strip(),
+        "to_agent": (getattr(args, "to_agent", "") or "").strip(),
+        "status": (getattr(args, "status", "") or "").strip(),
+        "objective": (getattr(args, "objective", "") or "").strip(),
+        **{f: list(getattr(args, f, []) or []) for f in HANDOFF_LIST_FIELDS},
+        "commit_ref": (getattr(args, "commit_ref", "") or "").strip(),
+    }
+
+def _handoff_hash(task_id: str, payload: dict) -> str:
+    material = json.dumps({"task_id": task_id, **payload}, sort_keys=True)
+    return hashlib.sha256(material.encode()).hexdigest()
+
+def _live_handoff(db, task_id: str):
+    return db.execute(
+        "SELECT * FROM handoffs WHERE task_id=? AND superseded_by='' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (task_id,)).fetchone()
+
+def _handoff_parsed(row, include_meta: bool = False):
+    out = {
+        "id": row["id"], "task_id": row["task_id"],
+        "from_agent": row["from_agent"], "to_agent": row["to_agent"],
+        "status": row["status"], "objective": row["objective"],
+        "commit_ref": row["commit_ref"], "created_at": row["created_at"],
+    }
+    for f in HANDOFF_LIST_FIELDS:
+        try:
+            out[f] = json.loads(row[f])
+        except (json.JSONDecodeError, TypeError):
+            out[f] = []
+    if include_meta:
+        out["superseded_by"] = row["superseded_by"]
+        out["content_hash"] = row["content_hash"]
+    return out
+
+def _handoff_cost(h: dict) -> int:
+    return sum(len(h.get(f, "")) for f in ("id", "from_agent", "to_agent", "status",
+               "objective", "commit_ref", "created_at")) \
+        + sum(len(" ".join(h.get(f, []))) for f in HANDOFF_LIST_FIELDS) + 32
+
+def add_handoff(args):
+    """Record a durable agent-to-agent handoff for a task.
+
+    The latest live handoff is the authoritative resume point: recording a new
+    handoff atomically supersedes the previous one (temporal chain, queryable
+    via `handoffs --all`). An identical live handoff is deduplicated instead of
+    growing the store. Payloads must never carry credentials or private tokens.
+    """
+    payload = _handoff_payload(args)
+    hid = uuid.uuid4().hex
+    t = now()
+    with conn() as db:
+        task_row(db, args.task_id)
+        h = _handoff_hash(args.task_id, payload)
+        existing = db.execute(
+            "SELECT * FROM handoffs WHERE task_id=? AND content_hash=? AND superseded_by='' "
+            "ORDER BY created_at DESC LIMIT 1", (args.task_id, h)).fetchone()
+        if existing:
+            audit(db, "task", args.task_id, "handoff_deduplicated", {"handoff_id": existing["id"]})
+            json_out({"ok": True, "id": existing["id"], "task_id": args.task_id,
+                      "deduplicated": True, "created_at": existing["created_at"]})
+            return
+        prev = _live_handoff(db, args.task_id)
+        cur = db.execute("UPDATE handoffs SET superseded_by=? WHERE task_id=? AND superseded_by=''",
+                         (hid, args.task_id))
+        db.execute(
+            "INSERT INTO handoffs(id,task_id,from_agent,to_agent,status,objective,evidence,"
+            "constraints,decisions,files,commit_ref,next_actions,risks,content_hash,created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (hid, args.task_id, payload["from_agent"], payload["to_agent"], payload["status"],
+             payload["objective"], json.dumps(payload["evidence"]), json.dumps(payload["constraints"]),
+             json.dumps(payload["decisions"]), json.dumps(payload["files"]), payload["commit_ref"],
+             json.dumps(payload["next_actions"]), json.dumps(payload["risks"]), h, t))
+        audit(db, "task", args.task_id, "handoff_recorded",
+              {"handoff_id": hid, "from_agent": payload["from_agent"],
+               "to_agent": payload["to_agent"], "superseded": prev["id"] if prev and cur.rowcount else None})
+    json_out({"ok": True, "id": hid, "task_id": args.task_id, "deduplicated": False,
+              "superseded": prev["id"] if prev and cur.rowcount else None, "created_at": t})
+
+def list_handoffs(args):
+    with conn() as db:
+        task_row(db, args.task_id)
+        q = "SELECT * FROM handoffs WHERE task_id=?"
+        if not getattr(args, "all", False):
+            q += " AND superseded_by=''"
+        q += " ORDER BY created_at DESC, rowid DESC"
+        rows = [_handoff_parsed(r, include_meta=True) for r in db.execute(q, (args.task_id,)).fetchall()]
+    json_out(rows)
+
+def current_handoff(args):
+    """Latest durable handoff — the recovery point for a killed session."""
+    with conn() as db:
+        task_row(db, args.task_id)
+        row = _live_handoff(db, args.task_id)
+    json_out(_handoff_parsed(row, include_meta=True) if row else None)
+
 def _related_note_candidates(db, task_id: str, text: str, limit: int, scope: str) -> list:
     """Cross-task retrieval: live notes on *other* tasks matching this task's text.
 
@@ -444,8 +563,8 @@ def _related_note_candidates(db, task_id: str, text: str, limit: int, scope: str
 def task_context(args):
     """Pack a prompt-ready context bundle within a character budget.
 
-    Includes a task summary header and unsatisfied dependencies, then live
-    notes packed pinned-first (oldest→newest within each group) so critical
+    Includes a task summary header and unsatisfied dependencies, then the live
+    agent handoff (if any), then live notes packed pinned-first (oldest→newest within each group) so critical
     facts survive tight budgets. With --related N, up to N BM25-ranked live
     notes from other tasks (matching this task's title/description/next_action
     text) are appended afterwards within the same budget, each tagged with its
@@ -466,10 +585,21 @@ def task_context(args):
             db, args.task_id,
             " ".join(filter(None, (row["title"], row["description"], row["next_action"]))),
             rel_limit, rel_scope)
+        hrow = _live_handoff(db, args.task_id)
     # Stable sort: pinned notes first, original (oldest→newest) order within groups.
     ordered = sorted(rows, key=lambda r: not r["pinned"])
     header_cost = 64 + len(summary["title"]) + len(summary["next_action"]) + len(summary["blocked_reason"])
     used, truncated = min(header_cost, budget), False
+    # The live handoff is the authoritative resume point: it packs right after
+    # the task header, before notes, so recovery context survives tight budgets.
+    handoff = _handoff_parsed(hrow) if hrow else None
+    handoff_packed = False
+    if handoff is not None:
+        cost = _handoff_cost(handoff)
+        if used + cost <= budget:
+            used += cost; handoff_packed = True
+        else:
+            truncated = True
     packed, pinned_packed = [], 0
     for r in ordered:
         cost = len(r["content"]) + len(r["kind"]) + len(r["source"]) + len(r["created_at"]) + 8
@@ -491,6 +621,8 @@ def task_context(args):
     json_out({"task_id": args.task_id, "budget": budget, "used_chars": used,
               "truncated": truncated, "task": summary,
               "unsatisfied_dependencies": pending,
+              "handoff": handoff if handoff_packed else None,
+              "handoff_packed": handoff_packed,
               "notes_total": len(rows), "notes_packed": len(packed) - related_packed,
               "notes_pinned_packed": pinned_packed,
               "related_requested": rel_limit, "related_matched": len(related),
@@ -920,6 +1052,7 @@ def show(args):
             "SELECT d.task_id AS id, COALESCE(t.status,'missing') AS status FROM task_deps d "
             "LEFT JOIN tasks t ON t.id=d.task_id WHERE d.depends_on=? ORDER BY d.created_at",
             (args.id,)).fetchall()]
+        hrow = _live_handoff(db, args.id)
     for r in receipts:
         r["payload"] = json.loads(r.pop("payload_json"))
     for e in events:
@@ -928,6 +1061,7 @@ def show(args):
     out["audit"] = events
     out["dependencies"] = deps
     out["dependents"] = dependents
+    out["handoff"] = _handoff_parsed(hrow, include_meta=True) if hrow else None
     json_out(out)
 
 def metrics(args):
@@ -959,6 +1093,7 @@ def metrics(args):
             (t, horizon)).fetchone()["n"]
         notes = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded, "
                            "SUM(CASE WHEN pinned!=0 AND superseded_by='' THEN 1 ELSE 0 END) pinned FROM notes").fetchone()
+        handoffs = db.execute("SELECT COUNT(*) total, SUM(superseded_by!='') superseded FROM handoffs").fetchone()
     json_out({
         "generated_at": t,
         "tasks_total": sum(by_status.values()),
@@ -977,6 +1112,8 @@ def metrics(args):
         "notes_total": notes["total"] or 0,
         "notes_superseded": notes["superseded"] or 0,
         "notes_pinned_live": notes["pinned"] or 0,
+        "handoffs_total": handoffs["total"] or 0,
+        "handoffs_superseded": handoffs["superseded"] or 0,
     })
 
 def list_tasks(args):
@@ -1095,6 +1232,9 @@ def main():
     p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.set_defaults(fn=task_context)
     p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_notes)
     p=sub.add_parser("note-history"); p.add_argument("note_id"); p.set_defaults(fn=note_history)
+    p=sub.add_parser("handoff"); p.add_argument("task_id"); p.add_argument("--from-agent",required=True); p.add_argument("--to-agent",default=""); p.add_argument("--status",default=""); p.add_argument("--objective",default=""); p.add_argument("--evidence",action="append",default=[]); p.add_argument("--constraint",dest="constraints",action="append",default=[]); p.add_argument("--decision",dest="decisions",action="append",default=[]); p.add_argument("--file",dest="files",action="append",default=[]); p.add_argument("--commit",dest="commit_ref",default=""); p.add_argument("--next-action",dest="next_actions",action="append",default=[]); p.add_argument("--risk",dest="risks",action="append",default=[]); p.set_defaults(fn=add_handoff)
+    p=sub.add_parser("handoffs"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_handoffs)
+    p=sub.add_parser("handoff-current"); p.add_argument("task_id"); p.set_defaults(fn=current_handoff)
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)
     args=ap.parse_args(); args.fn(args)
 

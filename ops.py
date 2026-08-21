@@ -124,8 +124,8 @@ def morning(args=None):
     autopilot.dashboard(argparse.Namespace())
     print('\nSAFE AUTOMATION: read-only reconciliation, no deploy/merge/external submission.')
 
-SNAPSHOT_TABLES = ('tasks', 'heartbeats', 'receipts', 'notes', 'task_deps', 'audit_events')
-RESTORE_ORDER = ('tasks', 'task_deps', 'heartbeats', 'receipts', 'notes', 'audit_events')
+SNAPSHOT_TABLES = ('tasks', 'heartbeats', 'receipts', 'notes', 'handoffs', 'task_deps', 'audit_events')
+RESTORE_ORDER = ('tasks', 'task_deps', 'heartbeats', 'receipts', 'notes', 'handoffs', 'audit_events')
 
 def _snapshot_doc():
     data = {}
@@ -221,7 +221,7 @@ def snapshot_check(args):
                       'created_at': body.get('created_at'), 'counts': counts}))
     if not ok: sys.exit(1)
 
-ARCHIVE_TABLES = ('tasks', 'task_deps', 'heartbeats', 'receipts', 'notes')
+ARCHIVE_TABLES = ('tasks', 'task_deps', 'heartbeats', 'receipts', 'notes', 'handoffs')
 ARCHIVE_FORMAT = 'autopilot-archive-v1'
 
 def archive(args=None):
@@ -261,6 +261,7 @@ def archive(args=None):
             'heartbeats': fetch(f'SELECT * FROM heartbeats WHERE task_id IN ({ph})'),
             'receipts': fetch(f'SELECT * FROM receipts WHERE task_id IN ({ph})'),
             'notes': fetch(f'SELECT * FROM notes WHERE task_id IN ({ph})'),
+            'handoffs': fetch(f'SELECT * FROM handoffs WHERE task_id IN ({ph})'),
         }
         audit_retained = c.execute(
             f"SELECT COUNT(*) n FROM audit_events WHERE entity_type='task' AND entity_id IN ({ph})",
@@ -296,7 +297,7 @@ def archive(args=None):
     # Seal-then-destroy: the verified archive exists on disk before any deletion.
     with db() as c:
         c.execute(f'DELETE FROM task_deps WHERE task_id IN ({ph}) OR depends_on IN ({ph})', (*ids, *ids))
-        for t in ('heartbeats', 'receipts', 'notes'):
+        for t in ('heartbeats', 'receipts', 'notes', 'handoffs'):
             c.execute(f'DELETE FROM {t} WHERE task_id IN ({ph})', ids)
         c.execute(f'DELETE FROM tasks WHERE id IN ({ph})', ids)
     removed = 0
@@ -424,6 +425,17 @@ def doctor(args=None):
             "LEFT JOIN notes s ON s.id=n.superseded_by "
             "WHERE n.superseded_by!='' AND s.id IS NULL"):
             problems.append({'kind': 'supersede_target_missing', 'note_id': r['id'], 'superseded_by': r['superseded_by']})
+        for r in c.execute(
+            "SELECT h.id FROM handoffs h LEFT JOIN tasks t ON t.id=h.task_id WHERE t.id IS NULL"):
+            problems.append({'kind': 'orphan_handoff', 'handoff_id': r['id']})
+        for r in c.execute(
+            "SELECT h.id,h.superseded_by FROM handoffs h "
+            "LEFT JOIN handoffs s ON s.id=h.superseded_by "
+            "WHERE h.superseded_by!='' AND s.id IS NULL"):
+            problems.append({'kind': 'handoff_supersede_target_missing', 'handoff_id': r['id'], 'superseded_by': r['superseded_by']})
+        for r in c.execute(
+            "SELECT task_id,COUNT(*) n FROM handoffs WHERE superseded_by='' GROUP BY task_id HAVING n>1"):
+            problems.append({'kind': 'multiple_live_handoffs', 'task_id': r['task_id'], 'count': r['n']})
         if autopilot._fts_ready(c):
             for table, fts in (('notes', 'notes_fts'), ('tasks', 'tasks_fts')):
                 src = c.execute(f'SELECT COUNT(*) n FROM {table}').fetchone()['n']

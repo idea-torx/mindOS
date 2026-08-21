@@ -599,6 +599,50 @@ with tempfile.TemporaryDirectory() as td:
     detail = run('show','rm-b')
     assert detail['dependencies'] == []
     assert any(e['action'] == 'dependency_removed' for e in detail['audit'])
+    # Agent handoff protocol: durable, deduplicated, temporally superseded handoffs.
+    run('create','--project','Verify','--title','handoff host','--id','ho-1')
+    err = run_fail('handoff','no-such-task','--from-agent','hermes')
+    assert 'task not found' in err
+    h1 = run('handoff','ho-1','--from-agent','codex','--to-agent','claude-code',
+             '--status','running','--objective','implement retry path',
+             '--evidence','tests pass locally','--constraint','no new dependencies',
+             '--decision','use exponential backoff','--file','src/retry.py',
+             '--commit','abc1234','--next-action','open PR','--risk','flaky integration test')
+    assert h1['ok'] is True and h1['deduplicated'] is False and h1['superseded'] is None, h1
+    # Exact duplicate payload deduplicates onto the live handoff.
+    dup = run('handoff','ho-1','--from-agent','codex','--to-agent','claude-code',
+              '--status','running','--objective','implement retry path',
+              '--evidence','tests pass locally','--constraint','no new dependencies',
+              '--decision','use exponential backoff','--file','src/retry.py',
+              '--commit','abc1234','--next-action','open PR','--risk','flaky integration test')
+    assert dup['deduplicated'] is True and dup['id'] == h1['id'], dup
+    # A new handoff supersedes the previous one atomically; history stays queryable.
+    h2 = run('handoff','ho-1','--from-agent','claude-code','--to-agent','opencode',
+             '--status','waiting_for_review','--objective','review retry path',
+             '--next-action','merge after review')
+    assert h2['deduplicated'] is False and h2['superseded'] == h1['id'], h2
+    cur = run('handoff-current','ho-1')
+    assert cur['id'] == h2['id'] and cur['from_agent'] == 'claude-code', cur
+    assert cur['next_actions'] == ['merge after review'] and cur['superseded_by'] == ''
+    hist = run('handoffs','ho-1','--all')
+    assert [h['id'] for h in hist] == [h2['id'], h1['id']], hist
+    assert hist[1]['superseded_by'] == h2['id'], 'old handoff must link to its successor'
+    live = run('handoffs','ho-1')
+    assert [h['id'] for h in live] == [h2['id']]
+    assert run('handoff-current','ho-1')['id'] == h2['id']
+    # Context pack: the live handoff packs after the header and within the budget.
+    ctx = run('context','ho-1','--budget','100000')
+    assert ctx['handoff_packed'] is True and ctx['handoff']['id'] == h2['id'], ctx
+    assert ctx['handoff']['objective'] == 'review retry path'
+    tight = run('context','ho-1','--budget','60')
+    assert tight['handoff_packed'] is False and tight['handoff'] is None and tight['truncated'] is True, tight
+    # show surfaces the live handoff alongside receipts/audit/deps.
+    detail = run('show','ho-1')
+    assert detail['handoff']['id'] == h2['id']
+    m = run('metrics')
+    assert m['handoffs_total'] == 2 and m['handoffs_superseded'] == 1, m
+    doc = ops('doctor')
+    assert doc['ok'] is True and doc['problems'] == [], doc
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
