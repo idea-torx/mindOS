@@ -1623,6 +1623,46 @@ with tempfile.TemporaryDirectory() as td:
     assert 'secret_kinds' not in imr, 'an already-redacted file must pass the guard cleanly'
     stored = next(n for n in run2('notes','wo-1') if 'AKIA' in n['content'] or 'REDACTED' in n['content'])
     assert '[REDACTED:aws_access_key]' in stored['content'] and 'AKIAIOSFODNN7EXAMPLE' not in stored['content'], stored
+    # Seam conflicts: a task whose worktree (or branch+project) is held by
+    # another live lease cannot be claimed — audited refusal, no lease left
+    # behind; dispatch skips conflicted candidates; --force overrides;
+    # releasing the holder frees the seam.
+    run('create','--project','Seam','--title','seam a','--id','seam-a')
+    run('create','--project','Seam','--title','seam b','--id','seam-b')
+    run('create','--project','Seam','--title','seam c','--id','seam-c')
+    run('create','--project','Other','--title','seam d','--id','seam-d')
+    run('update','seam-a','--worktree','/tmp/seam-wt','--branch','feature/seam')
+    run('update','seam-b','--worktree','/tmp/seam-wt')
+    run('update','seam-c','--branch','feature/seam')
+    run('update','seam-d','--branch','feature/seam')
+    run('claim','seam-a','--owner','holder','--minutes','30')
+    err = run_fail('claim','seam-b','--owner','other')
+    assert 'seam conflict' in err and 'worktree' in err and '--force' in err, err
+    row = next(r for r in run('list') if r['id'] == 'seam-b')
+    assert row['status'] == 'queued' and row['lease_owner'] == '', 'refusal must not leave a lease'
+    err = run_fail('claim','seam-c','--owner','other')
+    assert 'seam conflict' in err and 'branch' in err, err
+    run('claim','seam-d','--owner','other','--minutes','5')   # same branch, different project: not a seam
+    detail = run('show','seam-b')
+    refs = [e for e in detail['audit'] if e['action'] == 'claim_refused_seam']
+    assert refs and refs[-1]['payload']['conflicts'][0]['task_id'] == 'seam-a', detail
+    forced = run('claim','seam-b','--owner','other','--force','--minutes','5')
+    assert forced['lease_owner'] == 'other', forced
+    # Dispatch skips seam-conflicted candidates instead of failing after picking.
+    run('create','--project','Seam','--title','seam e','--id','seam-e','--priority','P0')
+    run('create','--project','Seam','--title','plain pick','--id','plain-1','--priority','P3')
+    run('update','seam-e','--worktree','/tmp/seam-wt')        # seam held by seam-a and seam-b
+    nx = run('next','--project','Seam','--claim','--owner','dispatcher','--explain')
+    assert nx['claimed'] is True and nx['task']['id'] == 'plain-1', nx
+    assert any(s['task_id'] == 'seam-e' and s['reason'] == 'seam_conflict'
+               and any(c['task_id'] == 'seam-a' for c in s['conflicts']) for s in nx['skipped']), nx
+    run('release','plain-1','--owner','dispatcher')
+    # Releasing every holder frees the seam for the next dispatcher.
+    run('release','seam-a','--owner','holder')
+    run('release','seam-b','--owner','other')
+    nx2 = run('next','--project','Seam','--claim','--owner','dispatcher2','--explain')
+    assert nx2['claimed'] is True and nx2['task']['id'] == 'seam-e', nx2
+    run('release','seam-e','--owner','dispatcher2')
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:

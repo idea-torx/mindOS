@@ -1912,6 +1912,52 @@ def _explain_acquire_failure(db, task_id: str, owner: str, max_active: int) -> s
             return f"owner '{owner}' at lease capacity ({active}/{max_active}); complete or release a lease first"
     return f"could not acquire lease for {task_id}"
 
+def _seam_conflicts(db, task_id: str, worktree: str, branch: str, project: str) -> list:
+    """Live leases held by OTHER tasks on the same seam as the given task.
+
+    A seam is the shared filesystem/VCS resource two concurrent agents would
+    physically collide on: an identical non-empty worktree path, or the same
+    branch name within the same project (same branch across projects is a
+    different repository checkout, so it is not a conflict). Empty values are
+    never seams. Lease liveness uses the same rule as `leases`: expires_at in
+    the future.
+    """
+    t = now()
+    found = {}
+    if worktree:
+        for r in db.execute(
+                "SELECT id,lease_owner,lease_expires_at,lease_epoch FROM tasks "
+                "WHERE id!=? AND worktree=? AND lease_owner!='' AND lease_expires_at!='' AND lease_expires_at>?",
+                (task_id, worktree, t)):
+            found[r["id"]] = {"task_id": r["id"], "seam": "worktree", "value": worktree,
+                              "owner": r["lease_owner"], "lease_epoch": r["lease_epoch"],
+                              "lease_expires_at": r["lease_expires_at"]}
+    if branch:
+        for r in db.execute(
+                "SELECT id,lease_owner,lease_expires_at,lease_epoch FROM tasks "
+                "WHERE id!=? AND branch=? AND project=? AND lease_owner!='' AND lease_expires_at!='' AND lease_expires_at>?",
+                (task_id, branch, project, t)):
+            found.setdefault(r["id"], {"task_id": r["id"], "seam": "branch", "value": branch,
+                                       "project": project, "owner": r["lease_owner"],
+                                       "lease_epoch": r["lease_epoch"],
+                                       "lease_expires_at": r["lease_expires_at"]})
+    return sorted(found.values(), key=lambda c: c["task_id"])
+
+def _seam_message(conflicts: list) -> str:
+    detail = "; ".join(f"{c['task_id']} holds {c['seam']} {c['value']!r} (owner {c['owner']})"
+                       for c in conflicts)
+    return f"seam conflict: {detail}; complete/release the holder first or pass --force"
+
+def _audit_seam_refusal(task_id: str, owner: str, conflicts: list) -> None:
+    """Record a seam refusal in the audit chain on its own connection.
+
+    The caller's transaction is rolled back (the just-acquired lease must not
+    survive), so the refusal is committed separately to keep the audit trail
+    complete without resurrecting the lease.
+    """
+    with conn() as db:
+        audit(db, "task", task_id, "claim_refused_seam", {"owner": owner, "conflicts": conflicts})
+
 def create(args):
     task_id = args.id or f"{args.project.lower().replace(' ', '-')}-{uuid.uuid4().hex[:8]}"
     t = now()
@@ -2171,6 +2217,14 @@ def claim(args):
         pending = unsatisfied_deps(db, args.id)
         if pending:
             raise SystemExit("unsatisfied dependencies: " + ", ".join(f"{d['id']}({d['status']})" for d in pending))
+        # Seam guard: refuse to claim a task whose worktree/branch is held by
+        # another live lease — two agents on the same checkout collide no
+        # matter what the task graph says. --force is a deliberate override.
+        if not getattr(args, "force", False):
+            conflicts = _seam_conflicts(db, args.id, row["worktree"], row["branch"], row["project"])
+            if conflicts:
+                _audit_seam_refusal(args.id, args.owner, conflicts)
+                raise SystemExit(_seam_message(conflicts))
         # Atomic acquire: the WHERE guard makes the lease check-and-set a single
         # statement so concurrent claimers cannot both win the same lease.
         acquired, exp, epoch = _acquire(db, args.id, args.owner, args.minutes, resolve_max_active(args))
@@ -2217,7 +2271,8 @@ def next_task(args):
     With --explain, the result also reports how many queued candidates were
     considered and why each skipped candidate was not picked
     (unsatisfied_dependencies with the blocking ids, recovery_backoff with its
-    cooldown deadline, or deferred_until with its not_before), plus the
+    cooldown deadline, deferred_until with its not_before, or seam_conflict
+    when another live lease holds the candidate's worktree/branch), plus the
     effective priority of the pick when aging boosted it.
 
     --tag scopes dispatch to tasks carrying that capability/scope tag
@@ -2272,6 +2327,16 @@ def next_task(args):
                     skipped.append({"task_id": r["id"], "reason": "recovery_backoff",
                                     "recover_after": r["recover_after"]})
                 continue
+            if args.claim:
+                # Dispatch must not hand out work whose seam (worktree/branch)
+                # is already held by another live lease — the claim would
+                # collide physically. Skip rather than fail after picking.
+                conflicts = _seam_conflicts(db, r["id"], r["worktree"], r["branch"], r["project"])
+                if conflicts:
+                    if explain:
+                        skipped.append({"task_id": r["id"], "reason": "seam_conflict",
+                                        "conflicts": conflicts})
+                    continue
             eff, boost = _effective_priority(r, t_dt, aging_minutes, aging_boost)
             inh = inherited.get(r["id"])
             via = None
@@ -2674,7 +2739,7 @@ def main():
     p=sub.add_parser("blocked-by"); p.add_argument("id"); p.set_defaults(fn=blocked_by)
     p=sub.add_parser("verify-chain"); p.add_argument("--checkpoint",default=""); p.set_defaults(fn=verify_chain)
     p=sub.add_parser("events"); p.add_argument("--entity-type"); p.add_argument("--entity-id"); p.add_argument("--action"); p.add_argument("--since",default=""); p.add_argument("--until",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--verify",action="store_true"); p.set_defaults(fn=events)
-    p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=claim)
+    p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--force",action="store_true",help="claim even if another live lease holds the same worktree/branch seam"); p.set_defaults(fn=claim)
     p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=heartbeat)
     p=sub.add_parser("receipt"); p.add_argument("task_id"); p.add_argument("--kind",required=True); p.add_argument("--payload",default="{}"); p.set_defaults(fn=receipt)
     p=sub.add_parser("list"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--overdue",action="store_true"); p.add_argument("--tag",default=""); p.set_defaults(fn=list_tasks)

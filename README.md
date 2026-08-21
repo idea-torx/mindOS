@@ -99,6 +99,29 @@ Each entry carries `task_id`, `project`, `title`, `status`, `priority`,
 `seconds_remaining`. Default output hides expired-held leases so it answers
 "what is active right now"; `--all` answers "what will `recover` sweep".
 
+## Seam conflicts (worktree/branch exclusivity)
+
+Leases prevent two agents from taking the same *task*, but not two agents
+editing the same *checkout*. A seam is the shared filesystem/VCS resource where
+concurrent agents physically collide: an identical non-empty `worktree` path,
+or the same `branch` name within the same `project` (the same branch across
+different projects is a different repository, so it is not a conflict).
+
+`claim` refuses a task whose seam is held by another live lease:
+
+```bash
+python3 "$A" claim wt-2 --owner codex
+# seam conflict: wt-1 holds worktree '/srv/wt' (owner hermes); complete/release the holder first or pass --force
+python3 "$A" claim wt-2 --owner codex --force   # deliberate override (e.g. holder is you, read-only pass)
+```
+
+The refusal is audited as `claim_refused_seam` (kind-level conflict list, no
+lease left behind), and dispatch participates too: `next --claim` skips
+seam-conflicted candidates and picks the best unconflicted task instead of
+failing after picking — `--explain` reports them as `seam_conflict` skips with
+the holding tasks. Set `worktree`/`branch` via `update`; empty values are
+never seams.
+
 ## Lease transfer (cross-agent ownership)
 
 When work moves from one agent to another, ownership moves with it. `transfer`
