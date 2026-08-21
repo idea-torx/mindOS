@@ -92,9 +92,36 @@ Design properties:
   and `notes_pinned_packed` so callers can assemble prompts deterministically.
 - **Retrieval**: `search-notes` does keyword search over live note content with
   `--kind` plus task-level `--project` / `--status` filters via a join.
+- **Lineage**: `note-history <note-id>` walks a temporal fact chain end to end
+  (oldest predecessor → newest live successor), so agents can reconstruct how
+  a fact evolved without manual `--all` archaeology.
 
 `metrics` reports `notes_total`, `notes_superseded`, and `notes_pinned_live`;
 `ops.py doctor` checks for orphaned notes and dangling supersession links.
+
+## Ranked retrieval (FTS5)
+
+Search can run through SQLite FTS5 (stdlib — no external dependency) instead of
+substring matching. Pass `--rank` to `search-notes` or `search` for BM25-ranked
+results; each hit carries a `score` (more negative = more relevant):
+
+```bash
+python3 "$A" search-notes "postgres pool" --rank --kind fact --project Trove
+python3 "$A" search "rate limit" --rank --status queued
+```
+
+Design properties:
+
+- **Always in sync**: the `notes_fts` / `tasks_fts` indexes are external-content
+  tables maintained by triggers on every insert/update/delete, including
+  snapshot restores — no separate reindex step.
+- **Graceful fallback**: on SQLite builds without FTS5 the indexes are skipped
+  entirely and `--rank` degrades silently to the substring path (same output
+  shape, minus `score`). Tokenless queries return `[]` rather than erroring.
+- **Conjunctive semantics**: multi-token queries match documents containing all
+  tokens; superseded notes are excluded from ranked note search.
+- **Drift detection**: `ops.py doctor` compares indexed vs source row counts
+  and reports `fts_index_drift` if they ever diverge.
 
 ## Dispatch fairness (per-owner lease caps)
 

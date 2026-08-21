@@ -93,6 +93,38 @@ CREATE TABLE IF NOT EXISTS notes (
 CREATE INDEX IF NOT EXISTS idx_notes_task ON notes(task_id);
 CREATE INDEX IF NOT EXISTS idx_notes_hash ON notes(task_id, content_hash);
 """
+# Full-text retrieval (FTS5, stdlib sqlite3): external-content indexes over
+# notes/tasks kept in sync by triggers. Applied only when the SQLite build
+# supports FTS5; every consumer must fall back to LIKE search otherwise.
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+  content, kind, source, content='notes', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS notes_fts_ai AFTER INSERT ON notes BEGIN
+  INSERT INTO notes_fts(rowid,content,kind,source) VALUES(new.rowid,new.content,new.kind,new.source);
+END;
+CREATE TRIGGER IF NOT EXISTS notes_fts_ad AFTER DELETE ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts,rowid,content,kind,source) VALUES('delete',old.rowid,old.content,old.kind,old.source);
+END;
+CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
+  title, description, next_action, blocked_reason, project,
+  content='tasks', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS tasks_fts_ai AFTER INSERT ON tasks BEGIN
+  INSERT INTO tasks_fts(rowid,title,description,next_action,blocked_reason,project)
+  VALUES(new.rowid,new.title,new.description,new.next_action,new.blocked_reason,new.project);
+END;
+CREATE TRIGGER IF NOT EXISTS tasks_fts_au AFTER UPDATE ON tasks BEGIN
+  INSERT INTO tasks_fts(tasks_fts,rowid,title,description,next_action,blocked_reason,project)
+  VALUES('delete',old.rowid,old.title,old.description,old.next_action,old.blocked_reason,old.project);
+  INSERT INTO tasks_fts(rowid,title,description,next_action,blocked_reason,project)
+  VALUES(new.rowid,new.title,new.description,new.next_action,new.blocked_reason,new.project);
+END;
+CREATE TRIGGER IF NOT EXISTS tasks_fts_ad AFTER DELETE ON tasks BEGIN
+  INSERT INTO tasks_fts(tasks_fts,rowid,title,description,next_action,blocked_reason,project)
+  VALUES('delete',old.rowid,old.title,old.description,old.next_action,old.blocked_reason,old.project);
+END;
+"""
 STATUSES = {"queued", "claimed", "running", "waiting_for_agent", "waiting_for_user", "waiting_for_review", "ready_to_merge", "ready_to_deploy", "blocked", "completed", "failed", "cancelled"}
 TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 PRIORITIES = {"P0", "P1", "P2", "P3"}
@@ -121,6 +153,34 @@ def ensure() -> None:
     with sqlite3.connect(DB) as db:
         db.executescript(SCHEMA)
         _migrate(db)
+        _ensure_fts(db)
+
+def _fts_ready(db) -> bool:
+    """True when both FTS5 indexes exist (graceful-unavailable path otherwise)."""
+    names = {r[0] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('notes_fts','tasks_fts')")}
+    return {"notes_fts", "tasks_fts"} <= names
+
+def _ensure_fts(db) -> None:
+    """Create FTS indexes when supported; rebuild once on first creation so
+    pre-existing rows become searchable. Silently skips on non-FTS5 builds."""
+    try:
+        existed = _fts_ready(db)
+        db.executescript(FTS_SCHEMA)
+        if not existed:
+            db.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')")
+            db.execute("INSERT INTO tasks_fts(tasks_fts) VALUES('rebuild')")
+    except sqlite3.OperationalError:
+        pass  # FTS5 unavailable: search falls back to LIKE
+
+def _fts_query(text: str) -> str:
+    """Convert free text into a safe FTS5 query of quoted tokens ('' if none)."""
+    toks = []
+    for raw in text.split():
+        tok = raw.replace('"', "")
+        if tok and any(c.isalnum() for c in tok):
+            toks.append('"%s"' % tok)
+    return " ".join(toks)
 
 def _migrate(db) -> None:
     """Add hash-chain columns to pre-existing audit_events tables and backfill."""
@@ -313,6 +373,29 @@ def supersede_note(args):
               {"old_note_id": old_id, "new_note_id": new_id, "kind": kind})
     json_out({"ok": True, "old_note_id": old_id, "new_note_id": new_id, "task_id": old["task_id"]})
 
+def note_history(args):
+    """Walk a temporal fact chain: oldest predecessor → newest live successor."""
+    with conn() as db:
+        cur = db.execute("SELECT * FROM notes WHERE id=?", (args.note_id,)).fetchone()
+        if not cur:
+            raise SystemExit(f"note not found: {args.note_id}")
+        chain = [dict(cur)]
+        seen = {cur["id"]}
+        node = cur
+        while node["superseded_by"] and node["superseded_by"] not in seen:
+            nxt = db.execute("SELECT * FROM notes WHERE id=?", (node["superseded_by"],)).fetchone()
+            if not nxt:
+                break
+            chain.append(dict(nxt)); seen.add(nxt["id"]); node = nxt
+        node = cur
+        while True:
+            prv = db.execute(
+                "SELECT * FROM notes WHERE superseded_by=? LIMIT 1", (node["id"],)).fetchone()
+            if not prv or prv["id"] in seen:
+                break
+            chain.insert(0, dict(prv)); seen.add(prv["id"]); node = prv
+    json_out(chain)
+
 def task_context(args):
     """Pack a prompt-ready context bundle within a character budget.
 
@@ -350,8 +433,37 @@ def task_context(args):
               "notes": packed})
 
 def search_notes(args):
-    """Keyword retrieval over note content with kind/project/status filters via the task join."""
+    """Keyword retrieval over note content with kind/project/status filters via the task join.
+
+    With --rank (and an FTS5-capable SQLite), results are BM25-ranked via the
+    notes_fts index and carry a `score`; otherwise it falls back to substring
+    LIKE matching with identical output shape minus the score.
+    """
+    ranked = bool(getattr(args, "rank", False))
     with conn() as db:
+        if ranked and _fts_ready(db):
+            match = _fts_query(args.query)
+            if not match:
+                json_out([])
+                return
+            clauses = ["notes_fts MATCH ?", "n.superseded_by=''"]
+            vals = [match]
+            if args.kind:
+                if args.kind not in NOTE_KINDS:
+                    raise SystemExit(f"invalid note kind: {args.kind} (choose from {sorted(NOTE_KINDS)})")
+                clauses.append("n.kind=?"); vals.append(args.kind)
+            if args.project:
+                clauses.append("t.project=?"); vals.append(args.project)
+            if args.status:
+                clauses.append("t.status=?"); vals.append(args.status)
+            rows = [dict(r) for r in db.execute(
+                "SELECT n.id,n.task_id,t.project,n.kind,n.content,n.source,n.created_at,"
+                "bm25(notes_fts) AS score FROM notes_fts f "
+                "JOIN notes n ON n.rowid=f.rowid JOIN tasks t ON t.id=n.task_id "
+                "WHERE " + " AND ".join(clauses) +
+                " ORDER BY score LIMIT ?", (*vals, args.limit)).fetchall()]
+            json_out(rows)
+            return
         pat = "%" + args.query + "%"
         clauses = ["n.content LIKE ?"]
         vals = [pat]
@@ -681,8 +793,32 @@ def _due_order(final: str = ", updated_at DESC") -> str:
             "(due_at=''), due_at" + final)
 
 def search_tasks(args):
-    """Operator search across task text fields with status/project/priority filters."""
+    """Operator search across task text fields with status/project/priority filters.
+
+    With --rank (and an FTS5-capable SQLite), results are BM25-ranked via the
+    tasks_fts index and carry a `score`; otherwise substring LIKE matching.
+    """
+    ranked = bool(getattr(args, "rank", False))
     with conn() as db:
+        if ranked and _fts_ready(db):
+            match = _fts_query(args.query)
+            if not match:
+                json_out([])
+                return
+            clauses = ["tasks_fts MATCH ?"]
+            vals = [match]
+            if args.status:
+                clauses.append("t.status=?"); vals.append(args.status)
+            if args.project:
+                clauses.append("t.project=?"); vals.append(args.project)
+            if args.priority:
+                clauses.append("t.priority=?"); vals.append(args.priority)
+            rows = [dict(r) for r in db.execute(
+                "SELECT t.*,bm25(tasks_fts) AS score FROM tasks_fts f "
+                "JOIN tasks t ON t.rowid=f.rowid WHERE " + " AND ".join(clauses) +
+                " ORDER BY score LIMIT 50", vals).fetchall()]
+            json_out(rows)
+            return
         pat = "%" + args.query + "%"
         clauses = ["(id LIKE ? OR project LIKE ? OR title LIKE ? OR description LIKE ? "
                    "OR next_action LIKE ? OR blocked_reason LIKE ?)"]
@@ -739,12 +875,13 @@ def main():
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
     p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=next_task)
-    p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.set_defaults(fn=search_tasks)
+    p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.set_defaults(fn=supersede_note)
     p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.set_defaults(fn=task_context)
-    p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.set_defaults(fn=search_notes)
+    p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_notes)
+    p=sub.add_parser("note-history"); p.add_argument("note_id"); p.set_defaults(fn=note_history)
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)
     args=ap.parse_args(); args.fn(args)
 

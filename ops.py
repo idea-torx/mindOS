@@ -242,6 +242,12 @@ def doctor(args=None):
             "LEFT JOIN notes s ON s.id=n.superseded_by "
             "WHERE n.superseded_by!='' AND s.id IS NULL"):
             problems.append({'kind': 'supersede_target_missing', 'note_id': r['id'], 'superseded_by': r['superseded_by']})
+        if autopilot._fts_ready(c):
+            for table, fts in (('notes', 'notes_fts'), ('tasks', 'tasks_fts')):
+                src = c.execute(f'SELECT COUNT(*) n FROM {table}').fetchone()['n']
+                idx = c.execute(f'SELECT COUNT(*) n FROM {fts}').fetchone()['n']
+                if src != idx:
+                    problems.append({'kind': 'fts_index_drift', 'table': table, 'rows': src, 'indexed': idx})
     print(json.dumps({'ok': not problems, 'problems': problems, 'count': len(problems)}, sort_keys=True))
 
 def policy(args):

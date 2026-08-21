@@ -276,6 +276,38 @@ with tempfile.TemporaryDirectory() as td:
     run('create','--project','Verify','--title','fence next','--id','fence-2','--priority','P0')
     got = run('next','--claim','--owner','tester','--minutes','5')
     assert got['task']['id'] == 'fence-2' and got['lease_epoch'] >= 1
+    # FTS-ranked retrieval: BM25 ordering over notes and tasks via --rank.
+    run('create','--project','Verify','--title','rank host','--id','fts-1',
+        '--description','postgres pool incident followups')
+    run('note','fts-1','--kind','fact','--content','postgres connection pool exhausted under load','--source','hermes')
+    run('note','fts-1','--kind','observation','--content','github actions deploy pipeline green','--source','hermes')
+    run('note','fts-1','--kind','fact','--content','postgres replica lag spikes during vacuum','--source','hermes')
+    hits = run('search-notes','postgres pool','--rank')
+    # Multi-token queries are conjunctive: only the note with both terms matches.
+    assert len(hits) == 1 and 'score' in hits[0], hits
+    assert hits[0]['content'] == 'postgres connection pool exhausted under load'
+    assert all(h['task_id'] == 'fts-1' for h in hits)
+    hits = run('search-notes','postgres','--rank','--kind','fact')
+    assert {h['content'] for h in hits} == {
+        'postgres connection pool exhausted under load',
+        'postgres replica lag spikes during vacuum'}, hits
+    hits = run('search','postgres','--rank')
+    assert any(h['id'] == 'fts-1' and 'score' in h for h in hits), hits
+    hits = run('search','postgres','--rank','--project','Verify')
+    assert {h['id'] for h in hits} == {'fts-1'}
+    # Tokenless queries degrade to an empty result instead of an FTS syntax error.
+    assert run('search-notes','!!! ---','--rank') == []
+    assert run('search','!!! ---','--rank') == []
+    # Default LIKE path is unchanged when --rank is absent.
+    hits = run('search-notes','rate limit')
+    assert {h['id'] for h in hits} == {sup['new_note_id']}
+    # Note lineage: history walks predecessor -> successor across supersedes.
+    hist = run('note-history',sup['new_note_id'])
+    assert [n['id'] for n in hist] == [n1['id'], sup['new_note_id']], hist
+    hist = run('note-history',n1['id'])
+    assert len(hist) == 2 and hist[-1]['id'] == sup['new_note_id'], 'backward walk finds predecessors'
+    err = run_fail('note-history','no-such-note')
+    assert 'note not found' in err
     # Snapshot export: consistent JSON dump sealed with a self-hash.
     snap = ops('snapshot')
     assert snap['ok'] is True and len(snap['sha256']) == 64
@@ -329,6 +361,11 @@ with tempfile.TemporaryDirectory() as td:
     assert any(n['content'] == 'MUST NOT exceed 240/min' for n in notes_after), 'note data restored'
     row = next(r for r in run('list') if r['id'] == 'due-1')
     assert row['status'] == 'claimed' and row['lease_owner'] == 'tester', 'lease state restored'
+    # FTS indexes stay in sync across a full delete+insert restore (triggers fire).
+    hits = run('search-notes','exceed','--rank')
+    assert any(h['id'] == sup2['new_note_id'] for h in hits), 'fts index rebuilt after restore'
+    hits = run('search','postgres','--rank')
+    assert any(h['id'] == 'fts-1' for h in hits), 'task fts index rebuilt after restore'
     bad = Path(td) / 'bad-snap.json'
     evil = json.loads(Path(snap2['path']).read_text())
     evil['snapshot']['tables']['tasks'][0]['title'] = 'evil'
