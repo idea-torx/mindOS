@@ -34,6 +34,8 @@ python3 "$A" show <task-id>          # task detail + receipts + audit trail + de
 python3 "$A" search "deploy"         # substring search over task text fields
 python3 "$A" search "audit" --status queued --project Trove --priority P1
 python3 "$A" session-scan --root ~/library-session-store            # redacted dry-run inventory
+python3 "$O" brain-inventory --out brain.json   # end-to-end redacted brain manifest (read-only)
+python3 "$O" brain-inventory-check brain.json   # verify a sealed brain manifest
 python3 "$A" fact-assert --subject service-auth --predicate uses --object postgres-14 --source codex
 python3 "$A" facts --subject service-auth          # query currently-valid triples
 python3 "$A" search-facts postgres --rank          # BM25 retrieval over the fact graph
@@ -1400,6 +1402,57 @@ carries `required_evidence_met: true`. Observability mirrors the gate:
 Tasks without requirements behave exactly as before; the legacy completion
 shape is unchanged apart from the new field when requirements exist.
 
+
+## Brain inventory (end-to-end manifest)
+
+`brain-inventory` is the end-to-end, dry-run-first counterpart to
+`migrate-inventory`: where the migration inventory discovers sources under a
+root, the brain inventory reads the *known* durable surfaces of a whole MindOS
+installation and seals one honest manifest about them. Every source carries an
+epistemic role so downstream stages can treat each kind differently instead of
+flattening the brain into one authority:
+
+| source | role | what is recorded |
+| --- | --- | --- |
+| `autopilot` (state.db + receipts) | execution truth | integrity verdict, row counts, receipt-file count |
+| `temporal` (temporal.db) | temporal facts | integrity + entity/relation/event counts; `absent` if none |
+| `hindsight` | semantic memory | provider-neutral HTTP binding probe: `/health` + shared-bank presence and count-shaped stats |
+| `claude_sync` (claude-memory-sync.json) | sync metadata | entry count, sha256 |
+| `claude_memory` (~/.claude/projects/*/memory) | human archive | per-file checksums across all projects |
+| `sessions` (raw store + control-plane cache) | session cache | file checksums plus derived row counts |
+| `profiles`, `skills`, `cron` | definitions | checksummed inventories; cron job count parsed from jobs.json |
+
+```bash
+python3 "$O" brain-inventory --out brain.json                       # defaults: live homes, live Hindsight
+python3 "$O" brain-inventory-check brain.json                      # verify the seal before trusting it
+```
+
+Design rules, enforced and tested:
+
+- **Dry-run-first / read-only by construction**: databases open with read-only
+  URIs, Hindsight is probed with GETs only (the shared bank is never written,
+  duplicated, or copied into SQLite as a second authority), and a full-fixture
+  hash comparison proves nothing scanned is ever mutated — including on
+  fail-closed runs.
+- **Redaction**: values never enter the manifest. Text files are secret-
+  scanned with findings reported **by kind only**; Hindsight stats are
+  whitelisted to stable counts.
+- **Sealed & reproducible**: versioned `mindos-brain-inventory-v1` documents,
+  sha256-sealed with `created_at` outside the digest, so unchanged sources
+  re-seal byte-identically and interrupted installs resume against the same
+  manifest; tampering any field makes `brain-inventory-check` refuse it.
+  The command's own audit events are excluded from the audited count it
+  records, so sealing never perturbs the next seal.
+- **Honest degradation**: corruption or ambiguity fails closed naming exact
+  blockers (garbage `jobs.json`, a non-SQLite `temporal.db`); an absent
+  optional sidecar and an unreachable Hindsight are recorded as `absent` /
+  `unavailable` without blocking; a healthy service missing
+  `autopilot-shared-context` is `degraded` because the binding itself is
+  broken.
+- **Bounded & atomic**: file-count caps keep giant trees from stalling the
+  sweep (overflow reported, never silent); manifests are written atomically
+  with `0600` permissions and audited digest-only as
+  `brain_inventory_sealed`.
 
 ## Migration inventory (installer stage one)
 

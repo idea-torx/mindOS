@@ -2886,6 +2886,137 @@ with tempfile.TemporaryDirectory() as td:
     assert f_a['id'] in detached and detached[f_a['id']]['task_id'] == ''
     assert any(r['subject'] == 'pgbouncer' for r in survivors), 'facts must survive archival'
 
+    # Brain inventory: dry-run-first end-to-end manifest over every durable
+    # source (Autopilot execution truth, temporal sidecar, Hindsight binding,
+    # Claude sync metadata + memory archive, session cache, profile/skill/cron
+    # definitions). Read-only by construction; redacted counts/checksums/kind-
+    # only secret findings; sealed and reproducible; fails closed on corruption
+    # while recording absence and an unreachable Hindsight honestly.
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    fx = Path(td) / 'brain-fx'
+    fhermes = fx / 'hermes'
+    for d in ('profiles/gtm-bot', 'skills/devops', 'cron', 'hindsight',
+              'sessions/raw-store', 'state'):
+        (fhermes / d).mkdir(parents=True)
+    (fhermes / 'profiles/gtm-bot/profile.yaml').write_text('profile: gtm\n')
+    (fhermes / 'skills/devops/SKILL.md').write_text('rotate key AKIAIOSFODNN7EXAMPLE weekly\n')
+    (fhermes / 'cron/jobs.json').write_text('[{"id":"ticker","schedule":"* * * * *"}]')
+    (fhermes / 'hindsight/claude-memory-sync.json').write_text(
+        json.dumps({'proj-a/memory/MEMORY.md': {'synced_at': '2026-08-01'},
+                    'proj-b/memory/MEMORY.md': {'synced_at': '2026-08-02'}}))
+    (fhermes / 'sessions/raw-store/transcript-1.jsonl').write_text('{"role":"user"}\n')
+    fclaude = fx / 'claude/projects/-fixtures-x'
+    (fclaude / 'memory').mkdir(parents=True)
+    (fclaude / 'memory/MEMORY.md').write_text('# fixture memory\n')
+    (fclaude / 'memory/deploys-break-on-fridays.md').write_text('lesson body\n')
+    def tree_digest_under(root_):
+        h = hashlib.sha256()
+        for p in sorted(root_.rglob('*')):
+            if p.is_file() and not p.is_symlink():
+                h.update(str(p.relative_to(root_)).encode()); h.update(p.read_bytes())
+        return h.hexdigest()
+    fx_before = tree_digest_under(fx)
+
+    class _DegradedBank(BaseHTTPRequestHandler):
+        """Healthy Hindsight that lacks the shared bank: binding broken."""
+        def log_message(self, *a): pass
+        def _send(self, code, body):
+            self.send_response(code); self.end_headers()
+            self.wfile.write(json.dumps(body).encode())
+        def do_GET(self):
+            if self.path == '/health':
+                self._send(200, {'status': 'healthy'})
+            elif self.path == '/v1/default/banks':
+                self._send(200, {'banks': [{'bank_id': 'someone-elses-bank'}]})
+            else:
+                self._send(404, {'detail': 'Not Found'})
+    srv = HTTPServer(('127.0.0.1', 0), _DegradedBank)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        inv_path = Path(td) / 'brain-inventory.json'
+        inv = ops('brain-inventory',
+                  '--hermes-home', str(fhermes), '--claude-home', str(fx / 'claude'),
+                  '--hindsight-url', f'http://127.0.0.1:{srv.server_port}',
+                  '--out', str(inv_path))
+        assert inv['ok'] is True and inv['fail_closed'] is False, inv   # degraded ≠ fatal
+        assert inv_path.stat().st_mode & 0o077 == 0                     # sealed manifest 0600
+        full = json.loads(inv_path.read_text())                         # sealed doc, not compact
+        bkind = {s['kind']: s for s in full['sources']}
+        assert set(bkind) == {'autopilot', 'temporal', 'hindsight', 'claude_sync',
+                              'claude_memory', 'sessions', 'profiles', 'skills',
+                              'cron'}, sorted(bkind)                    # full brain covered
+        roles = {s['kind']: s['role'] for s in inv['sources']}
+        assert roles['autopilot'] == 'execution_truth' and roles['hindsight'] == 'semantic_memory'
+        assert roles['temporal'] == 'temporal_facts' and roles['sessions'] == 'session_cache'
+        assert roles['claude_sync'] == 'sync_metadata' and roles['claude_memory'] == 'human_archive'
+        assert roles['profiles'] == 'profile_definitions' and roles['cron'] == 'cron_definitions'
+        assert bkind['autopilot']['status'] == 'ok' and bkind['autopilot']['counts']['tasks'] >= 1
+        assert bkind['temporal']['status'] == 'absent'                 # optional sidecar reported
+        assert bkind['hindsight']['status'] == 'degraded'              # service up, bank missing
+        assert any('not present' in p for p in bkind['hindsight']['problems'])
+        assert bkind['hindsight']['adapter'] == 'provider-neutral-http-v1'
+        assert bkind['claude_sync']['status'] == 'ok' and bkind['claude_sync']['counts']['entries'] == 2
+        assert bkind['claude_sync']['sha256']
+        assert bkind['claude_memory']['counts']['projects'] == 1
+        assert bkind['claude_memory']['counts']['files'] == 2          # both memory files checksummed
+        assert all(len(f['sha256']) == 64 for f in bkind['claude_memory']['files'])
+        assert bkind['sessions']['counts']['files'] == 1 and bkind['sessions']['counts']['raw_store_present'] is True
+        assert bkind['sessions']['counts'].get('cache_sessions') is not None  # control-plane cache counted
+        assert bkind['cron']['counts']['jobs'] == 1 and bkind['cron']['status'] == 'ok'
+        assert bkind['profiles']['status'] == 'ok' and bkind['skills']['counts']['files'] == 1
+        # Redaction: credential shapes surface as kinds only, values never leave.
+        assert inv['summary']['secret_kinds'] == ['aws_access_key'], inv['summary']
+        assert 'AKIAIOSFODNN7EXAMPLE' not in inv_path.read_text()
+        # Reproducibility: unchanged sources re-seal byte-identically (modulo created_at).
+        inv2_path = Path(td) / 'brain-inventory-2.json'
+        inv2 = ops('brain-inventory', '--hermes-home', str(fhermes),
+                   '--claude-home', str(fx / 'claude'),
+                   '--hindsight-url', f'http://127.0.0.1:{srv.server_port}',
+                   '--out', str(inv2_path))
+        a_, b_ = json.loads(inv_path.read_text()), json.loads(inv2_path.read_text())
+        assert a_.pop('created_at') and b_.pop('created_at')
+        assert a_ == b_, 'unchanged sources must reproduce an identical manifest'
+        chk = ops('brain-inventory-check', str(inv_path))
+        assert chk['ok'] is True and chk['summary']['sources'] == len(bkind), chk
+        tam = json.loads(inv_path.read_text()); tam['sources'][0]['status'] = 'corrupted'
+        Path(str(inv_path) + '.tampered').write_text(json.dumps(tam, sort_keys=True))
+        err = ops_fail('brain-inventory-check', str(inv_path) + '.tampered')
+        assert 'integrity check failed' in err, err                    # tamper evidence
+        ev = run('events', '--action', 'brain_inventory_sealed')
+        sealed = [e for e in ev['events'] if e['entity_id'] == 'brain-inventory']
+        assert len(sealed) >= 2 and all(
+            set(e['payload']) <= {'sha256', 'sources', 'fail_closed'} for e in sealed), \
+            'audit payload must stay digest-only'
+        assert tree_digest_under(fx) == fx_before, 'inventory must never mutate a scanned source'
+    finally:
+        srv.shutdown()
+    # Unreachable Hindsight: recorded as unavailable, everything else proceeds.
+    inv3 = ops('brain-inventory', '--hermes-home', str(fhermes),
+               '--claude-home', str(fx / 'claude'), '--hindsight-url', 'http://127.0.0.1:9')
+    h3 = next(s for s in inv3['sources'] if s['kind'] == 'hindsight')
+    assert h3['status'] == 'unavailable' and inv3['fail_closed'] is False, h3
+    assert any('health probe failed' in p for p in h3['problems']), h3
+    # Corruption elsewhere fails closed with exact blockers: a garbage cron
+    # definition and a garbage temporal sidecar each block their own run.
+    (fhermes / 'cron/jobs.json').write_text('{definitely not json')
+    err = ops_fail('brain-inventory', '--hermes-home', str(fhermes),
+                   '--claude-home', str(fx / 'claude'))
+    assert 'failed closed' in err and 'jobs.json' in err, err          # blocker named exactly
+    bhome = fx / 'broken-autopilot'; bhome.mkdir()
+    benv = os.environ.copy(); benv['HERMES_AUTOPILOT_HOME'] = str(bhome)
+    bp = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), 'init'],
+                        env=benv, text=True, capture_output=True)
+    assert bp.returncode == 0, bp.stderr
+    (bhome / 'temporal.db').write_bytes(b'temporal sidecar garbage, not sqlite')
+    fx_after_edits = tree_digest_under(fhermes) + tree_digest_under(fx / 'claude')
+    bp2 = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'brain-inventory'],
+                         env=benv, text=True, capture_output=True)
+    assert bp2.returncode != 0 and 'temporal.db' in (bp2.stdout + bp2.stderr) and \
+        'failed closed' in (bp2.stdout + bp2.stderr), bp2             # corrupt sidecar blocks
+    assert tree_digest_under(fhermes) + tree_digest_under(fx / 'claude') == fx_after_edits, \
+        'fail-closed runs still never mutate scanned sources'
+
     # Tamper evidence (last): mutating a historical audit event breaks the chain.
     import sqlite3
     with sqlite3.connect(Path(td) / 'state.db') as db:
