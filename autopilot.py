@@ -1501,8 +1501,17 @@ def next_task(args):
     (unsatisfied_dependencies with the blocking ids, recovery_backoff with its
     cooldown deadline, or deferred_until with its not_before), plus the
     effective priority of the pick when aging boosted it.
+
+    With --claim --recall, the dispatch response embeds the full sealed recall
+    bundle (digest, lease state, receipts) for the claimed task and audits it
+    as `context_recalled` — one call takes work AND proves which context it
+    was taken against, instead of a follow-up `recall` round trip. The agent
+    defaults to the claiming --owner; --budget/--related/--related-scope tune
+    the bundle exactly like `recall`.
     """
     explain = bool(getattr(args, "explain", False))
+    if getattr(args, "recall", False) and not args.claim:
+        raise SystemExit("--recall requires --claim: the bundle seals the context of the task you claimed")
     t_now = now()
     t_dt = datetime.now(timezone.utc)
     aging_minutes = getattr(args, "aging_minutes", 360)
@@ -1565,6 +1574,22 @@ def next_task(args):
             out["claimed"] = True
             out["lease_expires_at"] = exp
             out["lease_epoch"] = epoch
+            if getattr(args, "recall", False):
+                agent = (getattr(args, "agent", "") or "").strip() or args.owner
+                bundle = _build_recall_bundle(db, picked["id"], agent, args.recall_budget,
+                                              getattr(args, "related", 0),
+                                              getattr(args, "related_scope", "project"))
+                # Same provenance contract as `recall`: the digest is recorded
+                # with its bundle parameters so handoffs/completions can cite
+                # it and fleet sweeps can recompute it exactly.
+                audit(db, "task", picked["id"], "context_recalled",
+                      {"agent": bundle["agent"], "digest": bundle["digest"],
+                       "core_digest": bundle["core_digest"],
+                       "budget": args.recall_budget, "related": getattr(args, "related", 0),
+                       "related_scope": getattr(args, "related_scope", "project"),
+                       "via": "next"})
+                out["recall"] = bundle
+                out["recall_digest"] = bundle["digest"]
         json_out(out)
 
 def heartbeat(args):
@@ -1833,7 +1858,7 @@ def main():
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
     p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
-    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.set_defaults(fn=next_task)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)

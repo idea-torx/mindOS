@@ -385,6 +385,25 @@ python3 "$A" events --action context_recalled --entity-id <task-id>
 python3 ops.py recall-stale   # fleet sweep: which live handoffs cite drifted context?
 ```
 
+## Dispatch-and-recall (next --claim --recall)
+
+`recall` after `next --claim` is two round trips for what is one decision. With
+`--recall`, dispatch embeds the full sealed recall bundle in the claim response
+and audits it as `context_recalled` — one call takes work AND proves which
+context it was taken against:
+
+```bash
+python3 "$A" next --claim --owner codex --recall --budget 8000 --related 5
+```
+
+The agent defaults to the claiming `--owner`; `--budget`, `--related`, and
+`--related-scope` tune the bundle exactly like `recall`. The response carries
+`recall` (the bundle) plus `recall_digest`, which is first-class provenance:
+it passes `handoff-check`, can be cited by `handoff --recall-digest` /
+`complete --recall-digest`, and is fresh per `recall-verify`. Without
+`--recall` the output shape is unchanged; `--recall` without `--claim` is
+rejected.
+
 ## Fleet freshness sweep (recall-stale)
 
 `recall-verify` answers freshness for one task and one digest the caller

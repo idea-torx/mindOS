@@ -1043,6 +1043,41 @@ with tempfile.TemporaryDirectory() as td:
     assert row['priority'] == 'P3', 'aging must never mutate stored priority'
     static = run('next','--project','DeferTest','--aging-minutes','0')
     assert static['task']['id'] == 'def-1', '--aging-minutes 0 restores strict ordering'
+    # Dispatch-and-recall: next --claim --recall takes work AND seals its context
+    # in one call, auditing context_recalled so the dispatch→recall→act chain is contiguous.
+    run('create','--project','DispatchRecall','--title','one call work','--id','dr-1')
+    run('note','dr-1','--kind','fact','--content','dispatch recall marker','--source','verify')
+    err = run_fail('next','--project','DispatchRecall','--recall')
+    assert '--recall requires --claim' in err
+    got = run('next','--claim','--project','DispatchRecall','--owner','codex','--minutes','5',
+              '--recall','--budget','8000')
+    assert got['claimed'] is True and got['task']['id'] == 'dr-1', got
+    assert len(got['recall_digest']) == 64 and got['recall']['task']['id'] == 'dr-1', got
+    assert got['recall']['digest'] == got['recall_digest']
+    assert got['recall']['lease']['owner'] == 'codex' and got['recall']['lease']['held_by_caller'] is True, got['recall']['lease']
+    assert got['recall']['agent'] == 'codex', 'agent defaults to the claiming owner'
+    # ...is fresh per recall-verify, and was audited as context_recalled via next.
+    rv = run('recall-verify','dr-1','--digest',got['recall_digest'],'--agent','codex','--budget','8000')
+    assert rv['fresh'] is True, rv
+    evs = run('events','--entity-id','dr-1','--action','context_recalled')['events']
+    assert any(e['payload'].get('via') == 'next' and e['payload']['digest'] == got['recall_digest']
+               for e in evs), evs
+    # The cited digest is first-class provenance: a handoff citing it passes the lint.
+    dh = run('handoff','dr-1','--from-agent','codex','--to-agent','claude-code',
+             '--objective','continue dispatched work','--next-action','implement',
+             '--recall-digest',got['recall_digest'])
+    chk = ops('handoff-check','--task','dr-1')
+    assert chk['ok'] is True and chk['problems'] == [], chk
+    # A plain recall of the identical durable state yields the identical core
+    # digest (the handoff recorded above moves the full digest by design).
+    plain = run('recall','dr-1','--agent','codex','--budget','8000')
+    assert plain['core_digest'] == got['recall']['core_digest'], \
+        (plain['core_digest'], got['recall']['core_digest'])
+    # Default output shape is unchanged without --recall.
+    run('create','--project','DispatchRecall','--title','plain pick','--id','dr-2')
+    plain_next = run('next','--project','DispatchRecall')
+    assert plain_next['task']['id'] == 'dr-2' and 'recall' not in plain_next \
+        and 'recall_digest' not in plain_next, plain_next
     # Audit chain checkpoints: pin the head so tail truncation becomes detectable.
     cp = ops('checkpoint')
     assert cp['ok'] is True and cp['last_event_id'] > 0 and len(cp['sha256']) == 64, cp
