@@ -1887,6 +1887,41 @@ with tempfile.TemporaryDirectory() as td:
     miss = next(i for i in uv['items'] if i['task_id'] == 'ev-2'
                 and i['kind'] == 'evidence_receipt_missing')
     assert miss['receipt_ids'] == [rec2['receipt_id']], miss
+    # Definition of done: required receipt kinds are acceptance criteria as
+    # data — completion refuses until every required kind has evidence.
+    err = run_fail('create','--project','Plain','--title','bad kind','--id','dod-x',
+                   '--requires-receipt','Bad Kind!')
+    assert 'invalid receipt kind' in err                             # restricted stable charset
+    run('create','--project','Plain','--title','definition of done','--id','dod-1',
+        '--requires-receipt','Verification','--requires-receipt','test-report')
+    d1 = run('show','dod-1')
+    assert d1['requires_receipts'] == ['test-report','verification'], d1   # normalized + sorted
+    crev = next(e for e in run('show','dod-1')['audit'] if e['action'] == 'created')
+    assert crev['payload']['requires_receipts'] == ['test-report','verification'], crev
+    run('claim','dod-1','--owner','tester','--minutes','5')
+    err = run_fail('complete','dod-1','--owner','tester')
+    assert 'definition of done unmet' in err \
+        and 'test-report' in err and 'verification' in err           # gate names every gap
+    blk = next(e for e in run('events','--entity-type','task','--entity-id','dod-1')['events']
+               if e['action'] == 'completion_blocked_evidence')
+    assert blk['payload']['missing_receipt_kinds'] == ['test-report','verification'], blk
+    m = run('metrics')
+    assert 'dod-1' in m['tasks_missing_required_evidence'], m        # open work awaiting evidence
+    assert m['completions_blocked_by_evidence'] >= 1, m              # refusals are visible fleet-wide
+    run('receipt','dod-1','--kind','verification','--payload','{}')
+    err = run_fail('complete','dod-1','--owner','tester')
+    assert 'missing required receipt kind(s): test-report' in err    # only the remaining gap
+    run('receipt','dod-1','--kind','test-report','--payload','{}')
+    cd = run('complete','dod-1','--owner','tester')
+    assert cd['required_evidence_met'] is True and cd['status'] == 'completed', cd
+    m = run('metrics')
+    assert 'dod-1' not in m['tasks_missing_required_evidence'], m    # settled work leaves the sweep
+    # Requirements are editable lifecycle data: set later, clear deliberately.
+    run('create','--project','Plain','--title','retroactive dod','--id','dod-2')
+    up = run('update','dod-2','--requires-receipt','log')
+    assert up['requires_receipts'] == ['log'], up
+    up = run('update','dod-2','--requires-receipt','')               # empty string clears
+    assert up['requires_receipts'] == [], up
     # Policy gate: entering a gated readiness state consults policies/<project>.yaml.
     pol = Path(td) / 'policies'; pol.mkdir(exist_ok=True)
     (pol / 'gated.yaml').write_text('merge_requires_user: true\n')

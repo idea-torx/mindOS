@@ -1368,6 +1368,30 @@ gate kind are recorded in the audited `updated` event. Re-stating the current
 status is not a transition and stays ungated; projects without a policy file
 behave exactly as before.
 
+## Definition of done (required receipt kinds)
+
+Evidence citations on completion are stronger when the acceptance criteria are
+declared up front. Tasks carry an optional `requires_receipts` list — repeatable
+`--requires-receipt <kind>` at `create`, or `update --requires-receipt` to set
+or revise it later (a single empty string clears it deliberately). Kinds use
+the same restricted token charset as tags so they survive CLI flags, dispatch
+data, and sweep output across every agent adapter.
+
+`complete` then enforces the definition of done as data: until **at least one
+receipt of every required kind** exists on the task, completion refuses with
+the missing kinds named, and the refusal is audited as
+`completion_blocked_evidence` on its own connection (gate kind — never erased
+by the rolled-back transaction). Once every kind is satisfied, the completion
+carries `required_evidence_met: true`. Observability mirrors the gate:
+
+- `metrics` reports `tasks_missing_required_evidence` — open work whose
+  acceptance criteria are not yet satisfiable — and
+  `completions_blocked_by_evidence`, the fleet-wide count of gate refusals.
+
+Tasks without requirements behave exactly as before; the legacy completion
+shape is unchanged apart from the new field when requirements exist.
+
+
 ## Migration inventory (installer stage one)
 
 Bringing a new machine (or a new Autopilot home) up starts with honest

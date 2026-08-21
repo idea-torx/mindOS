@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS tasks (
    due_at TEXT NOT NULL DEFAULT '',
    not_before TEXT NOT NULL DEFAULT '',
    tags TEXT NOT NULL DEFAULT '[]',
+   requires_receipts TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_receipt TEXT NOT NULL DEFAULT ''
@@ -233,10 +234,38 @@ def _task_tags(row) -> list:
     return v if isinstance(v, list) else []
 
 def _task_view(row) -> dict:
-    """Serialize a task row for output, exposing tags as a JSON array."""
+    """Serialize a task row for output, exposing tags/receipt requirements as JSON arrays."""
     d = dict(row)
     d["tags"] = _task_tags(row)
+    d["requires_receipts"] = _task_requires(row)
     return d
+
+def _valid_receipt_kind(kind: str) -> str:
+    """Validate a required-receipt kind: the same token charset as tags.
+
+    Receipt kinds are free-form elsewhere, but a *requirement* becomes CLI
+    flags, dispatch data, and sweep output across every agent adapter, so it
+    gets the restricted stable form. Normalized to lowercase.
+    """
+    k = (kind or "").strip().lower()
+    if not TAG_RE.fullmatch(k):
+        raise SystemExit(f"invalid receipt kind: {kind!r} (lowercase [a-z0-9] then [a-z0-9:_./-], max 64 chars)")
+    return k
+
+def _task_requires(row) -> list:
+    try:
+        v = json.loads(row["requires_receipts"] or "[]")
+    except (json.JSONDecodeError, TypeError, KeyError):
+        return []
+    return v if isinstance(v, list) else []
+
+def _missing_required_evidence(db, task_id: str, required: list) -> list:
+    """Required receipt kinds with no receipt of that kind on this task yet."""
+    if not required:
+        return []
+    have = {r["kind"] for r in db.execute(
+        "SELECT DISTINCT kind FROM receipts WHERE task_id=?", (task_id,))}
+    return [k for k in required if k not in have]
 
 def now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -331,6 +360,8 @@ def _migrate(db) -> None:
         db.execute("ALTER TABLE tasks ADD COLUMN not_before TEXT NOT NULL DEFAULT ''")
     if "tags" not in task_cols:
         db.execute("ALTER TABLE tasks ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
+    if "requires_receipts" not in task_cols:
+        db.execute("ALTER TABLE tasks ADD COLUMN requires_receipts TEXT NOT NULL DEFAULT '[]'")
     handoff_cols = {r[1] for r in db.execute("PRAGMA table_info(handoffs)")}
     if "recall_digest" not in handoff_cols:
         db.execute("ALTER TABLE handoffs ADD COLUMN recall_digest TEXT NOT NULL DEFAULT ''")
@@ -2454,16 +2485,17 @@ def create(args):
     due_at = _normalize_due(getattr(args, "due_at", None) or "")
     not_before = _normalize_iso(getattr(args, "not_before", None) or "", "--not-before")
     tags = sorted({_valid_tag(x) for x in (getattr(args, "tag", None) or [])})
+    requires = sorted({_valid_receipt_kind(x) for x in (getattr(args, "requires_receipt", None) or [])})
     with conn() as db:
         try:
-            db.execute("INSERT INTO tasks(id,project,title,description,owner,status,priority,next_action,due_at,not_before,tags,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (task_id,args.project,args.title,args.description,args.owner,"queued",args.priority,args.next_action,due_at,not_before,json.dumps(tags),t,t))
+            db.execute("INSERT INTO tasks(id,project,title,description,owner,status,priority,next_action,due_at,not_before,tags,requires_receipts,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (task_id,args.project,args.title,args.description,args.owner,"queued",args.priority,args.next_action,due_at,not_before,json.dumps(tags),json.dumps(requires),t,t))
         except sqlite3.IntegrityError:
             raise SystemExit(f"task id already exists: {task_id}")
         # Task-layer deduplication: flag open tasks in the same project whose
         # text restates this one. Informational — creation is never blocked.
         similar = _similar_open_tasks(db, args.project,
                                       f"{args.title} {args.description}", task_id)
-        audit(db, "task", task_id, "created", {"project": args.project, "owner": args.owner, "priority": args.priority, "due_at": due_at, "not_before": not_before, **({"tags": tags} if tags else {}), **({"similar_open_tasks": [s["task_id"] for s in similar]} if similar else {})})
+        audit(db, "task", task_id, "created", {"project": args.project, "owner": args.owner, "priority": args.priority, "due_at": due_at, "not_before": not_before, **({"tags": tags} if tags else {}), **({"requires_receipts": requires} if requires else {}), **({"similar_open_tasks": [s["task_id"] for s in similar]} if similar else {})})
         for dep in getattr(args, "depends_on", []) or []:
             add_dependency(db, task_id, dep)
     out = {"ok": True, "id": task_id, "status": "queued"}
@@ -2567,6 +2599,13 @@ def update(args):
         fields["due_at"] = _normalize_due(fields["due_at"])
     if "not_before" in fields:
         fields["not_before"] = _normalize_iso(fields["not_before"], "--not-before")
+    if getattr(args, "requires_receipt", None) is not None:
+        raw = list(args.requires_receipt)
+        if raw == [""]:
+            fields["requires_receipts"] = "[]"   # "" clears the definition of done
+        else:
+            fields["requires_receipts"] = json.dumps(
+                sorted({_valid_receipt_kind(x) for x in raw}))
     if fields.get("status") in {"completed", "failed", "cancelled"}:
         # Terminal transitions release any held lease so the task cannot look active.
         fields["lease_owner"] = ""
@@ -2591,8 +2630,10 @@ def update(args):
                     f"entering {fields['status']}; re-run with --approved-by <name>")
             approval = {"policy_gate": gate_action, "approved_by": approver}
         db.execute(f"UPDATE tasks SET {', '.join(k+'=?' for k in fields)} WHERE id=?", (*fields.values(), args.id))
-        audit(db, "task", args.id, "updated",
-              {**{k: v for k, v in fields.items() if k != "updated_at"}, **(approval or {})})
+        audit_payload = {k: v for k, v in fields.items() if k != "updated_at"}
+        if "requires_receipts" in audit_payload:
+            audit_payload["requires_receipts"] = json.loads(audit_payload["requires_receipts"])
+        audit(db, "task", args.id, "updated", {**audit_payload, **(approval or {})})
         json_out(_task_view(task_row(db, args.id)))
 
 def _require_live_lease(row, owner: str, verb: str) -> None:
@@ -2633,6 +2674,20 @@ def complete(args):
                              (rid, args.id)).fetchone()
             if not hit:
                 raise SystemExit(f"evidence receipt not found on this task: {rid}")
+        # Definition of done: a task's required receipt kinds are acceptance
+        # criteria as data — completion refuses until at least one receipt of
+        # every required kind exists on this task. The refusal is audited on
+        # its own connection (the caller's transaction rolls back) so the gate
+        # leaves provenance without resurrecting anything.
+        required = _task_requires(row)
+        missing_evidence = _missing_required_evidence(db, args.id, required)
+        if missing_evidence:
+            _audit_claim_refusal(args.id, args.owner, "completion_blocked_evidence",
+                                 {"missing_receipt_kinds": missing_evidence,
+                                  "required_receipts": required})
+            raise SystemExit(
+                "definition of done unmet: missing required receipt kind(s): "
+                + ", ".join(missing_evidence))
         t = now()
         # Guarded mutation: the completion only lands while the lease is exactly
         # as checked above. A lease that expired and was re-acquired (or
@@ -2654,6 +2709,8 @@ def complete(args):
         out["newly_unblocked"] = newly
         if evidence:
             out["evidence_receipts"] = evidence
+        if required:
+            out["required_evidence_met"] = True
         json_out(out)
 
 def cancel(args):
@@ -3507,6 +3564,17 @@ def metrics(args):
         completed_no_receipt = db.execute(
             "SELECT COUNT(*) n FROM tasks t WHERE t.status='completed' AND NOT EXISTS("
             "SELECT 1 FROM receipts r WHERE r.task_id=t.id)").fetchone()["n"]
+        # Definition-of-done observability: open work whose acceptance criteria
+        # are not yet satisfiable, and completions the gate has refused.
+        awaiting_evidence = []
+        for r in db.execute(
+                "SELECT id,requires_receipts FROM tasks WHERE "
+                "requires_receipts!='' AND requires_receipts!='[]' AND "
+                "status NOT IN ('completed','failed','cancelled')").fetchall():
+            if _missing_required_evidence(db, r["id"], _task_requires(r)):
+                awaiting_evidence.append(r["id"])
+        completions_blocked = db.execute(
+            "SELECT COUNT(*) n FROM audit_events WHERE action='completion_blocked_evidence'").fetchone()["n"]
         sessions = db.execute(
             "SELECT COUNT(*) n, COALESCE(SUM(message_count),0) m FROM sessions").fetchone()
     json_out({
@@ -3542,6 +3610,8 @@ def metrics(args):
         "handoffs_with_recall_proof": handoffs["proven"] or 0,
         "handoffs_acked_total": handoffs["acked"] or 0,
         "completions_without_receipt": completed_no_receipt,
+        "tasks_missing_required_evidence": sorted(awaiting_evidence),
+        "completions_blocked_by_evidence": completions_blocked,
         "sessions_indexed": sessions["n"],
         "session_messages_indexed": sessions["m"],
     })
@@ -3727,8 +3797,8 @@ def main():
     ap = argparse.ArgumentParser(prog="autopilot")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p=sub.add_parser("init"); p.set_defaults(fn=lambda a: (ensure(), json_out({"ok":True,"db":str(DB)})))
-    p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--due-at",default=""); p.add_argument("--not-before",dest="not_before",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.add_argument("--tag",action="append",default=[],help="capability/scope tag (repeatable)"); p.set_defaults(fn=create)
-    p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.add_argument("--not-before",dest="not_before"); p.add_argument("--title"); p.add_argument("--description"); p.add_argument("--priority",choices=sorted(PRIORITIES)); p.add_argument("--project"); p.add_argument("--approved-by",dest="approved_by",default="",help="user approving a policy-gated readiness transition (recorded in the audit chain)"); p.set_defaults(fn=update)
+    p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--due-at",default=""); p.add_argument("--not-before",dest="not_before",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.add_argument("--tag",action="append",default=[],help="capability/scope tag (repeatable)"); p.add_argument("--requires-receipt",dest="requires_receipt",action="append",default=[],help="receipt kind required before completion — the definition of done (repeatable)"); p.set_defaults(fn=create)
+    p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.add_argument("--not-before",dest="not_before"); p.add_argument("--title"); p.add_argument("--description"); p.add_argument("--priority",choices=sorted(PRIORITIES)); p.add_argument("--project"); p.add_argument("--approved-by",dest="approved_by",default="",help="user approving a policy-gated readiness transition (recorded in the audit chain)"); p.add_argument("--requires-receipt",dest="requires_receipt",action="append",default=None,help="set required receipt kinds (repeatable); a single empty string clears them"); p.set_defaults(fn=update)
     p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.add_argument("--receipt",dest="evidence_receipts",action="append",default=[],help="evidence receipt id on this task cited by the completion (repeatable)"); p.set_defaults(fn=complete)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
     p=sub.add_parser("fail"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.add_argument("--no-retry",dest="no_retry",action="store_true",help="skip the retry budget: fail terminally on the first attempt"); p.add_argument("--max-retries",dest="max_retries",type=int,default=3); p.add_argument("--backoff-base",dest="backoff_base",type=int,default=60); p.add_argument("--backoff-cap",dest="backoff_cap",type=int,default=3600); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=fail)
