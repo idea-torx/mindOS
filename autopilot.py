@@ -130,9 +130,25 @@ def audit_chain_problems(db) -> list:
 
 def conn() -> sqlite3.Connection:
     ensure()
-    c = sqlite3.connect(DB)
+    c = sqlite3.connect(DB, timeout=10)
     c.row_factory = sqlite3.Row
+    # Concurrent dispatchers/agents hit the same database; wait on locks instead
+    # of failing with "database is locked", and actually enforce FK cascades.
+    c.execute("PRAGMA busy_timeout=10000")
+    c.execute("PRAGMA foreign_keys=ON")
     return c
+
+def default_max_active() -> int:
+    """Per-owner live-lease cap (0 = unlimited), overridable via env."""
+    try:
+        return max(0, int(os.environ.get("AUTOPILOT_MAX_ACTIVE_PER_OWNER", "0")))
+    except ValueError:
+        return 0
+
+def resolve_max_active(args) -> int:
+    """CLI --max-active wins; otherwise the env/default cap applies."""
+    value = getattr(args, "max_active", None)
+    return default_max_active() if value is None else max(0, value)
 
 def json_out(value) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
@@ -178,15 +194,35 @@ def add_dependency(db, task_id: str, depends_on: str) -> None:
                (task_id, depends_on, now()))
     audit(db, "task", task_id, "dependency_added", {"depends_on": depends_on})
 
-def _acquire(db, task_id: str, owner: str, minutes: int):
-    """Atomically acquire/renew a lease; returns (acquired, expires_at)."""
+def _acquire(db, task_id: str, owner: str, minutes: int, max_active: int = 0):
+    """Atomically acquire/renew a lease; returns (acquired, expires_at).
+
+    The WHERE guard makes the check-and-set a single statement so concurrent
+    claimers cannot both win. When max_active > 0 the same statement also
+    enforces a per-owner cap on live leases, so one agent cannot hog dispatch.
+    """
     exp = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + minutes * 60, timezone.utc).replace(microsecond=0).isoformat()
     t = now()
     cur = db.execute(
         "UPDATE tasks SET status='claimed', lease_owner=?, lease_expires_at=?, updated_at=? "
-        "WHERE id=? AND (lease_owner=? OR lease_owner='' OR lease_expires_at='' OR lease_expires_at<=?)",
-        (owner, exp, t, task_id, owner, t))
+        "WHERE id=? AND (lease_owner=? OR lease_owner='' OR lease_expires_at='' OR lease_expires_at<=?) "
+        "AND (?<=0 OR (SELECT COUNT(*) FROM tasks o WHERE o.lease_owner=? AND o.id!=tasks.id "
+        "AND o.lease_expires_at!='' AND o.lease_expires_at>?)<?)",
+        (owner, exp, t, task_id, owner, t, max_active, owner, t, max_active))
     return cur.rowcount == 1, exp
+
+def _explain_acquire_failure(db, task_id: str, owner: str, max_active: int) -> str:
+    """Human-readable reason for a failed _acquire, for operator ergonomics."""
+    row = task_row(db, task_id)
+    if row["lease_owner"] and row["lease_owner"] != owner:
+        return f"lease owned by {row['lease_owner']}"
+    if max_active > 0:
+        active = db.execute(
+            "SELECT COUNT(*) n FROM tasks WHERE lease_owner=? AND id!=? AND lease_expires_at!='' AND lease_expires_at>?",
+            (owner, task_id, now())).fetchone()["n"]
+        if active >= max_active:
+            return f"owner '{owner}' at lease capacity ({active}/{max_active}); complete or release a lease first"
+    return f"could not acquire lease for {task_id}"
 
 def create(args):
     task_id = args.id or f"{args.project.lower().replace(' ', '-')}-{uuid.uuid4().hex[:8]}"
@@ -273,9 +309,9 @@ def claim(args):
             raise SystemExit("unsatisfied dependencies: " + ", ".join(f"{d['id']}({d['status']})" for d in pending))
         # Atomic acquire: the WHERE guard makes the lease check-and-set a single
         # statement so concurrent claimers cannot both win the same lease.
-        acquired, exp = _acquire(db, args.id, args.owner, args.minutes)
+        acquired, exp = _acquire(db, args.id, args.owner, args.minutes, resolve_max_active(args))
         if not acquired:
-            raise SystemExit(f"lease owned by {row['lease_owner']}")
+            raise SystemExit(_explain_acquire_failure(db, args.id, args.owner, resolve_max_active(args)))
         db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"claimed",now(),"lease claimed"))
         audit(db, "task", args.id, "claimed", {"owner": args.owner, "lease_expires_at": exp})
         json_out(dict(task_row(db, args.id)))
@@ -303,9 +339,10 @@ def next_task(args):
             json_out(out)
             return
         if args.claim:
-            acquired, exp = _acquire(db, picked["id"], args.owner, args.minutes)
+            cap = resolve_max_active(args)
+            acquired, exp = _acquire(db, picked["id"], args.owner, args.minutes, cap)
             if not acquired:
-                raise SystemExit(f"lost race for {picked['id']}")
+                raise SystemExit(_explain_acquire_failure(db, picked["id"], args.owner, cap))
             db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (picked["id"],args.owner,"claimed",now(),"claimed via next"))
             audit(db, "task", picked["id"], "claimed", {"owner": args.owner, "lease_expires_at": exp, "via": "next"})
             out["claimed"] = True
@@ -383,6 +420,9 @@ def metrics(args):
         blocked_by_deps = db.execute(
             "SELECT COUNT(*) n FROM tasks t WHERE t.status='queued' AND EXISTS("
             "SELECT 1 FROM task_deps d JOIN tasks dt ON dt.id=d.depends_on WHERE d.task_id=t.id AND dt.status!='completed')").fetchone()["n"]
+        leases_by_owner = {r["lease_owner"]: r["n"] for r in db.execute(
+            "SELECT lease_owner,COUNT(*) n FROM tasks WHERE lease_owner!='' AND lease_expires_at!='' AND lease_expires_at>? GROUP BY lease_owner",
+            (t,))}
         receipts = db.execute("SELECT COUNT(*) n FROM receipts").fetchone()["n"]
         events = db.execute("SELECT COUNT(*) n FROM audit_events").fetchone()["n"]
     json_out({
@@ -391,6 +431,7 @@ def metrics(args):
         "tasks_by_status": by_status,
         "tasks_by_project": by_project,
         "stale_leases": stale,
+        "active_leases_by_owner": leases_by_owner,
         "queued_blocked_by_deps": blocked_by_deps,
         "total_retries": retries["s"],
         "max_retries_seen": retries["m"],
@@ -409,6 +450,23 @@ def list_tasks(args):
             clauses.append("project=?"); vals.append(args.project)
         if clauses: q += " WHERE " + " AND ".join(clauses)
         q += " ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END, updated_at DESC"
+        json_out([dict(r) for r in db.execute(q, vals).fetchall()])
+
+def search_tasks(args):
+    """Operator search across task text fields with status/project/priority filters."""
+    with conn() as db:
+        pat = "%" + args.query + "%"
+        clauses = ["(id LIKE ? OR project LIKE ? OR title LIKE ? OR description LIKE ? "
+                   "OR next_action LIKE ? OR blocked_reason LIKE ?)"]
+        vals = [pat] * 6
+        if args.status:
+            clauses.append("status=?"); vals.append(args.status)
+        if args.project:
+            clauses.append("project=?"); vals.append(args.project)
+        if args.priority:
+            clauses.append("priority=?"); vals.append(args.priority)
+        q = ("SELECT * FROM tasks WHERE " + " AND ".join(clauses) +
+             " ORDER BY CASE priority WHEN 'P0' THEN 0 WHEN 'P1' THEN 1 WHEN 'P2' THEN 2 ELSE 3 END, updated_at DESC")
         json_out([dict(r) for r in db.execute(q, vals).fetchall()])
 
 def dashboard(args):
@@ -441,7 +499,7 @@ def main():
     p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.set_defaults(fn=complete)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
     p=sub.add_parser("verify-chain"); p.set_defaults(fn=verify_chain)
-    p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.set_defaults(fn=claim)
+    p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=claim)
     p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.set_defaults(fn=heartbeat)
     p=sub.add_parser("receipt"); p.add_argument("task_id"); p.add_argument("--kind",required=True); p.add_argument("--payload",default="{}"); p.set_defaults(fn=receipt)
     p=sub.add_parser("list"); p.add_argument("--status"); p.add_argument("--project"); p.set_defaults(fn=list_tasks)
@@ -449,7 +507,8 @@ def main():
     p=sub.add_parser("metrics"); p.set_defaults(fn=metrics)
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
-    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.set_defaults(fn=next_task)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=next_task)
+    p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.set_defaults(fn=search_tasks)
     args=ap.parse_args(); args.fn(args)
 
 if __name__ == "__main__": main()

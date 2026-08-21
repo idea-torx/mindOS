@@ -123,6 +123,41 @@ with tempfile.TemporaryDirectory() as td:
     run('claim','can-2','--owner','holder','--minutes','5')
     err = run_fail('cancel','can-2','--owner','leo','--reason','x')
     assert 'lease owned by holder' in err
+    # Per-owner lease cap: an owner cannot exceed their live-lease budget.
+    run('create','--project','Verify','--title','cap one','--id','cap-1')
+    run('create','--project','Verify','--title','cap two','--id','cap-2')
+    run('claim','cap-1','--owner','capped-worker','--minutes','5','--max-active','1')
+    err = run_fail('claim','cap-2','--owner','capped-worker','--minutes','5','--max-active','1')
+    assert 'lease capacity' in err and '(1/1)' in err
+    # A different owner is unaffected by the first owner's cap.
+    run('claim','cap-2','--owner','other-worker','--minutes','5','--max-active','1')
+    # Completing a task frees capacity for the same owner.
+    run('complete','cap-1','--owner','capped-worker')
+    run('create','--project','Verify','--title','cap three','--id','cap-3')
+    run('claim','cap-3','--owner','capped-worker','--minutes','5','--max-active','1')
+    # next --claim honors the cap too: capped owner is skipped, not silently starved.
+    run('create','--project','Verify','--title','cap four','--id','cap-4')
+    err = run_fail('next','--claim','--owner','capped-worker','--minutes','5','--max-active','1')
+    assert 'lease capacity' in err
+    m = run('metrics')
+    assert m['active_leases_by_owner'].get('capped-worker') == 1
+    assert m['active_leases_by_owner'].get('other-worker') == 1
+    # Operator search: substring match across text fields with filters.
+    hits = run('search','cap two')
+    assert [h['id'] for h in hits] == ['cap-2']
+    hits = run('search','cap','--status','claimed')
+    assert {h['id'] for h in hits} == {'cap-2','cap-3'}
+    hits = run('search','smoke','--project','NoSuchProject')
+    assert hits == []
+    # Recovery dry-run: previews actions without mutating anything.
+    run('create','--project','Verify','--title','dry recover','--id','dry-1')
+    run('claim','dry-1','--owner','tester','--minutes','0')
+    out = ops('recover','--dry-run')
+    assert out['dry_run'] is True and out['would_recover'] == ['dry-1'] and out['would_fail'] == []
+    row = next(r for r in run('list') if r['id'] == 'dry-1')
+    assert row['status'] == 'claimed' and row['lease_owner'] == 'tester', 'dry-run must not mutate'
+    out = ops('recover','--max-retries','3')
+    assert out['recovered'] == ['dry-1']
     # Audit chain integrity: chain verifies on a healthy database.
     chain = run('verify-chain')
     assert chain['ok'] is True and chain['events'] >= 8 and chain['problems'] == []

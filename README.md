@@ -20,10 +20,36 @@ python3 "$A" update <task-id> --status waiting_for_user --next-action "Leo revie
 python3 "$A" complete <task-id> --owner hermes --note "tests pass"  # requires live lease
 python3 "$A" cancel <task-id> --owner leo --reason "obsolete"       # rejected on foreign leases
 python3 "$A" show <task-id>          # task detail + receipts + audit trail + dependencies
+python3 "$A" search "deploy"         # substring search over task text fields
+python3 "$A" search "audit" --status queued --project Trove --priority P1
 python3 "$A" metrics                 # JSON observability snapshot
 python3 "$A" verify-chain            # recompute the audit hash chain; report tampering
 python3 "$A" dashboard
 ```
+
+## Dispatch fairness (per-owner lease caps)
+
+By default an owner may hold unlimited live leases. Set a cap to stop one
+agent from hogging dispatch:
+
+```bash
+python3 "$A" claim <task-id> --owner hermes --minutes 30 --max-active 4
+python3 "$A" next --claim --owner hermes --max-active 4
+export AUTOPILOT_MAX_ACTIVE_PER_OWNER=4   # default for every claim/next
+```
+
+The cap is enforced atomically inside the lease acquire statement, so
+concurrent dispatchers cannot race past it. When an owner is at capacity the
+claim fails with `owner '<name>' at lease capacity (n/max)`; completing or
+releasing a lease frees capacity immediately. `metrics` reports
+`active_leases_by_owner` for observability.
+
+## Operator search
+
+`search` does a substring match across `id`, `project`, `title`,
+`description`, `next_action`, and `blocked_reason`, with optional
+`--status`, `--project`, and `--priority` filters. Results use the same
+priority-then-recency ordering as `list`.
 
 ## Dependency-aware dispatch
 
@@ -47,6 +73,7 @@ dispatchers can never double-claim. `metrics` reports
 ```bash
 O=~/.hermes/autopilot/ops.py
 python3 "$O" recover --max-retries 3   # requeue stale leases; fail tasks past retry budget
+python3 "$O" recover --dry-run         # preview what the next pass would do, mutating nothing
 python3 "$O" approval approve <task-id> --by leo
 python3 "$O" policy <project> <action> # check user-approval policy for an action
 python3 "$O" processes                 # list active agent processes (read-only)
@@ -56,6 +83,8 @@ python3 "$O" morning                   # morning brief
 `recover` consumes one unit of each task's retry budget per pass. Tasks whose
 retry budget is exhausted (`retry_count > max-retries`, default 3) transition to
 `failed` with reason `max lease retries exceeded` instead of looping forever.
+`--dry-run` reports `would_recover` / `would_fail` without touching state,
+making it safe to run from monitoring cron before committing to a real pass.
 
 ## Lifecycle guardrails
 

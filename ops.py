@@ -20,12 +20,26 @@ def run(cmd, cwd=None):
 def recover(args=None):
     now=utc(); recovered=[]; failed=[]
     max_retries = getattr(args, 'max_retries', 3) if args is not None else 3
+    dry_run = bool(getattr(args, 'dry_run', False))
+    plan = []
     with db() as c:
         rows=c.execute("SELECT id,lease_owner,lease_expires_at,status,retry_count FROM tasks WHERE lease_expires_at!='' AND lease_expires_at<=? AND status IN ('claimed','running','waiting_for_agent')",(now,)).fetchall()
         for r in rows:
             new_retry = r['retry_count'] + 1
             if new_retry > max_retries:
                 # Retry budget exhausted: fail the task instead of looping forever.
+                plan.append(('failed', r, new_retry))
+            else:
+                plan.append(('recovered', r, new_retry))
+        if dry_run:
+            # Non-destructive preview: report what the next real pass would do.
+            print(json.dumps({'ok':True,'dry_run':True,
+                'would_recover':[r['id'] for kind,r,_ in plan if kind=='recovered'],
+                'would_fail':[r['id'] for kind,r,_ in plan if kind=='failed'],
+                'count':len(plan)}))
+            return
+        for kind, r, new_retry in plan:
+            if kind == 'failed':
                 c.execute("UPDATE tasks SET status='failed',lease_owner='',lease_expires_at='',retry_count=?,blocked_reason='max lease retries exceeded',updated_at=? WHERE id=?",(new_retry,now,r['id']))
                 autopilot.audit(c, 'task', r['id'], 'lease_failed', {'previous_owner': r['lease_owner'], 'previous_status': r['status'], 'retry_count': new_retry})
                 failed.append(r['id'])
@@ -136,7 +150,7 @@ import argparse
 p=argparse.ArgumentParser(); s=p.add_subparsers(dest='cmd',required=True)
 for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning),('doctor',doctor)]:
  x=s.add_parser(name); x.set_defaults(fn=fn)
-x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.set_defaults(fn=recover)
+x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('approval'); x.add_argument('action',choices=['approve','reject','block']); x.add_argument('id'); x.add_argument('--by',default='leo'); x.add_argument('--reason',default=''); x.add_argument('--next-action',default=''); x.set_defaults(fn=approval)
 x=s.add_parser('policy'); x.add_argument('project'); x.add_argument('action'); x.set_defaults(fn=policy)
 args=p.parse_args(); args.fn(args)
