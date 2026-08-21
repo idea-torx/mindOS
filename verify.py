@@ -1366,6 +1366,58 @@ with tempfile.TemporaryDirectory() as td:
     rd = run('recall-diff','hr-q','--digest',ra['digest'])
     assert rd['state'] == 'stale' and 'handoff' in rd['sections_changed'], rd
     doc = ops('doctor'); assert doc['ok'] is True and doc['problems'] == [], doc
+    # Dependency evidence inheritance: completed prerequisites contribute their
+    # verified evidence (live handoff + latest sealed receipt) to the
+    # dependent's context pack — opt-in via --dep-context, flag-gated keys.
+    run('create','--project','DepCtx','--title','upstream build','--id','dc-a')
+    run('claim','dc-a','--owner','codex','--minutes','5')
+    dc_rec = run('receipt','dc-a','--kind','verification','--payload','{"tests":"pass"}')
+    run('handoff','dc-a','--from-agent','codex','--to-agent','hermes',
+        '--status','completed','--objective','build artifacts sealed','--commit','abc123')
+    run('complete','dc-a','--owner','codex','--note','done')
+    run('create','--project','DepCtx','--title','downstream deploy','--id','dc-b')
+    run('dep','dc-b','dc-a')
+    ctx = run('context','dc-b','--budget','100000')
+    assert 'dep_context' not in ctx and 'dep_context_packed' not in ctx, \
+        'legacy pack shape must stay without the flag'
+    ctx = run('context','dc-b','--budget','100000','--dep-context','3')
+    assert ctx['dep_context_requested'] == 3 and ctx['dep_context_matched'] == 1
+    assert ctx['dep_context_packed'] == 1, ctx
+    dce = ctx['dep_context'][0]
+    assert dce['id'] == 'dc-a' and dce['handoff']['objective'] == 'build artifacts sealed'
+    assert dce['receipt']['id'] == dc_rec['receipt_id'] and dce['receipt']['payload'] == {"tests": "pass"}
+    # Budget: prerequisite evidence respects the same character budget.
+    tight = run('context','dc-b','--budget','130','--dep-context','3')
+    assert tight['used_chars'] <= 130 and tight['truncated'] is True
+    assert tight['dep_context_packed'] < tight['dep_context_matched'], tight
+    # Recall integration: the flag moves the sealed digest, verifies only with
+    # identical params, and the recorded parameter lets fleet sweeps recompute.
+    da = run('recall','dc-b','--agent','codex','--budget','100000','--dep-context','2')
+    db_ = run('recall','dc-b','--agent','codex','--budget','100000')
+    assert da['digest'] != db_['digest'], 'the flag must move the sealed digest'
+    rv = run('recall-verify','dc-b','--digest',da['digest'],'--agent','codex',
+             '--budget','100000','--dep-context','2')
+    assert rv['fresh'] is True, rv
+    rvb = run('recall-verify','dc-b','--digest',da['digest'],'--agent','codex','--budget','100000')
+    assert rvb['fresh'] is False, 'a dep-context digest must not verify without the flag'
+    run('handoff','dc-b','--from-agent','codex','--to-agent','claude-code',
+        '--objective','plan deploy','--recall-digest',da['digest'])
+    st = ops('recall-stale')
+    item = next(i for i in st['items'] if i['recall_digest'] == da['digest'])
+    assert item['state'] == 'fresh', (item, 'core digest must survive own-handoff drift')
+    rd = run('recall-diff','dc-b','--digest',da['digest'])
+    assert rd['state'] == 'stale' and 'handoff' in rd['sections_changed'], rd
+    # resume + dispatch-and-recall pack prerequisite evidence too.
+    rz = run('resume','dc-b','--agent','opencode','--budget','100000','--dep-context','2')
+    assert rz['action'] in ('claimed','already_held') and rz['dep_context_packed'] == 1, rz
+    run('create','--project','DepCtx','--title','second downstream','--id','dc-c',
+        '--priority','P0','--due-at','2019-01-01T00:00:00Z')
+    run('dep','dc-c','dc-a')
+    nx = run('next','--claim','--owner','hermes','--recall','--budget','100000','--dep-context','2')
+    assert nx['task']['id'] == 'dc-c', nx
+    assert nx['recall']['dep_context_packed'] == 1 and nx['recall_digest'] == nx['recall']['digest'], nx
+    run('release','dc-c','--owner','hermes')
+    doc = ops('doctor'); assert doc['ok'] is True and doc['problems'] == [], doc
     assert run('verify-chain')['ok'] is True
     # Secret guard: credential-shaped content never enters shared memory silently.
     run('create','--project','Verify','--title','secret guard','--id','sec-1')

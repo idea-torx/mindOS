@@ -754,6 +754,38 @@ the urgency):
 python3 "$A" next --explain    # inherited_via shows which dependent made this urgent
 ```
 
+## Dependency evidence inheritance
+
+Priority flows upstream through the dep DAG; evidence should flow downstream.
+When a prerequisite completes, its live handoff and latest sealed receipt are
+the verified proof of what upstream produced — yet only *unsatisfied*
+dependencies surface in context packs, so an agent picking up downstream work
+starts blind to what it is building on. `--dep-context N` (on `context`,
+`recall`, `recall-verify`, `resume`, and `next --claim --recall`) packs up to N
+completed direct prerequisites into the bundle, each with its id, title, live
+handoff (the resume point) and latest receipt (sealed evidence, payload
+included), within the same character budget as everything else:
+
+```bash
+python3 "$A" recall <task-id> --agent codex --dep-context 3
+python3 "$A" next --claim --owner codex --recall --dep-context 3
+```
+
+Design properties:
+
+- **Opt-in and digest-sealed**: every output key is present only when the flag
+  is used, so packs built without it stay byte-identical (and
+  digest-compatible) to the legacy shape. Using the flag moves the sealed
+  digest; `recall-verify` is fresh only under identical parameters.
+- **Provenance-complete**: the flag value is recorded in the audited
+  `context_recalled` / `session_resumed` payload, so `ops.py recall-stale`
+  recomputes cited digests exactly and `recall-diff` reports a `dep_context`
+  section (prerequisite evidence added/removed) like any other section.
+- **Budget-honest**: each entry costs its real serialized size; under a tight
+  budget entries drop out and `truncated` flags it rather than lying.
+- **Deterministic**: prerequisites appear in dependency-edge creation order,
+  so identical state yields identical bundles.
+
 ## Blocking & unblocking
 
 Operators and agents can park work with a reason without cancelling it:

@@ -949,6 +949,9 @@ def recall_stale(args=None):
                 # --related-handoffs is optional (added after the provenance
                 # loop); absent means the original bundle was built without it.
                 rel_handoffs = payload.get('related_handoffs') or 0
+                # --dep-context is optional the same way; absent means the
+                # original bundle was built without prerequisite evidence.
+                dep_ctx_n = payload.get('dep_context') or 0
                 # Rerank parameters are optional (feature added after the
                 # provenance loop); absent keys mean the original bundle was
                 # built without rerank, which is exactly how it must be
@@ -969,7 +972,8 @@ def recall_stale(args=None):
                         rerank=rerank,
                         recency_half_life_hours=168.0 if half_life is None else half_life,
                         pinned_boost=0.5 if boost is None else boost,
-                        rel_handoffs=rel_handoffs)
+                        rel_handoffs=rel_handoffs,
+                        dep_context=dep_ctx_n)
                     item['state'] = ('fresh' if bundle['core_digest'] == payload['core_digest']
                                      else 'stale')
                     item['current_digest'] = bundle['digest']

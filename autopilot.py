@@ -1107,9 +1107,49 @@ def _related_handoff_candidates(db, task_id: str, text: str, limit: int, scope: 
         vals = [*pats, task_id, *scope_vals, limit]
     return [dict(r) for r in db.execute(sql, vals).fetchall()]
 
+def _dep_context_candidates(db, task_id: str, limit: int) -> list:
+    """Verified evidence of completed direct prerequisites.
+
+    Dependency-aware orchestration: when a prerequisite completes, its live
+    handoff and latest sealed receipt ARE the verified evidence the
+    dependent's agent must inherit — yet only *unsatisfied* dependencies
+    surface in packs today, so downstream work starts blind to what upstream
+    proved. Returns, per completed direct dependency in deterministic edge
+    order (task_deps.rowid), the dep's id/title plus its live handoff (the
+    resume point) and latest receipt (sealed evidence with payload).
+    """
+    if limit <= 0:
+        return []
+    deps = db.execute(
+        "SELECT d.depends_on AS id, t.title AS title FROM task_deps d "
+        "JOIN tasks t ON t.id=d.depends_on WHERE d.task_id=? AND t.status='completed' "
+        "ORDER BY d.rowid ASC LIMIT ?", (task_id, limit)).fetchall()
+    out = []
+    for d in deps:
+        hrow = _live_handoff(db, d["id"])
+        rrow = db.execute(
+            "SELECT id,kind,payload_json,created_at FROM receipts WHERE task_id=? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1", (d["id"],)).fetchone()
+        out.append({"id": d["id"], "title": d["title"],
+                    "handoff": _handoff_parsed(hrow) if hrow else None,
+                    "receipt": ({**{k: rrow[k] for k in ("id", "kind", "created_at")},
+                                 "payload": json.loads(rrow["payload_json"])} if rrow else None)})
+    return out
+
+def _dep_context_cost(entry: dict) -> int:
+    c = len(entry["id"]) + len(entry["title"]) + 16
+    if entry["handoff"]:
+        c += _handoff_cost(entry["handoff"])
+    if entry["receipt"]:
+        r = entry["receipt"]
+        c += len(json.dumps(r["payload"], sort_keys=True)) \
+            + len(r["id"]) + len(r["kind"]) + len(r["created_at"]) + 8
+    return c
+
 def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
                 rerank: bool = False, recency_half_life_hours: float = 168.0,
-                pinned_boost: float = 0.5, rel_handoffs: int = 0) -> dict:
+                pinned_boost: float = 0.5, rel_handoffs: int = 0,
+                dep_context: int = 0) -> dict:
     """Assemble the prompt-ready context bundle for a task within a char budget.
 
     Shared by `context` and `recall`: task summary header + unsatisfied
@@ -1122,6 +1162,10 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
     work) pack after related notes within the same budget; every related-
     handoff output key is present only when the flag is used, so packs built
     without it stay byte-identical (and digest-compatible) to the legacy shape.
+    With dep_context > 0, up to that many completed direct prerequisites
+    contribute their verified evidence (live handoff + latest sealed receipt)
+    after related handoffs within the same budget; the same flag-gated key
+    rule keeps legacy packs byte-identical.
     """
     budget = max(0, budget)
     rel_limit = max(0, rel_limit)
@@ -1148,6 +1192,7 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
     pack_text = " ".join(filter(None, (row["title"], row["description"], row["next_action"])))
     related_handoffs = _related_handoff_candidates(
         db, task_id, pack_text, max(0, rel_handoffs), rel_scope) if rel_handoffs > 0 else []
+    dep_ctx = _dep_context_candidates(db, task_id, max(0, dep_context)) if dep_context > 0 else []
     hrow = _live_handoff(db, task_id)
     # Stable sort: pinned notes first, original (oldest→newest) order within groups.
     ordered = sorted(rows, key=lambda r: not r["pinned"])
@@ -1194,6 +1239,13 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
             truncated = True
             continue
         rh_packed.append(h); used += cost
+    dc_packed = []
+    for e in dep_ctx:
+        cost = _dep_context_cost(e)
+        if used + cost > budget:
+            truncated = True
+            continue
+        dc_packed.append(e); used += cost
     out = {"task_id": task_id, "budget": budget, "used_chars": used,
             "truncated": truncated, "task": summary,
             "unsatisfied_dependencies": pending,
@@ -1211,6 +1263,11 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
         out["related_handoffs_matched"] = len(related_handoffs)
         out["related_handoffs_packed"] = len(rh_packed)
         out["related_handoffs"] = rh_packed
+    if dep_context > 0:
+        out["dep_context_requested"] = max(0, dep_context)
+        out["dep_context_matched"] = len(dep_ctx)
+        out["dep_context_packed"] = len(dc_packed)
+        out["dep_context"] = dc_packed
     if rerank:
         # Reported only when enabled so packs built without rerank stay
         # byte-identical to the legacy shape (and digest-compatible).
@@ -1226,7 +1283,9 @@ def task_context(args):
     facts survive tight budgets. With --related N, up to N BM25-ranked live
     notes from other tasks (matching this task's title/description/next_action
     text) are appended afterwards within the same budget, each tagged with its
-    source task for provenance.
+    source task for provenance. With --dep-context N, up to N completed direct
+    prerequisites contribute their verified evidence (live handoff + latest
+    sealed receipt) so downstream work inherits what upstream proved.
     """
     with conn() as db:
         json_out(_build_pack(db, args.task_id, args.budget,
@@ -1235,11 +1294,13 @@ def task_context(args):
                              rerank=bool(getattr(args, "rerank", False)),
                              recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
                              pinned_boost=getattr(args, "pinned_boost", 0.5),
-                             rel_handoffs=getattr(args, "related_handoffs", 0)))
+                             rel_handoffs=getattr(args, "related_handoffs", 0),
+                             dep_context=getattr(args, "dep_context", 0)))
 
 def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: int, rel_scope: str,
                          rerank: bool = False, recency_half_life_hours: float = 168.0,
-                         pinned_boost: float = 0.5, rel_handoffs: int = 0) -> dict:
+                         pinned_boost: float = 0.5, rel_handoffs: int = 0,
+                         dep_context: int = 0) -> dict:
     """Assemble the recall bundle and its deterministic digest (no audit write).
 
     Shared by `recall` (which audits the digest) and `recall-verify` (which
@@ -1250,7 +1311,8 @@ def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: i
     row = task_row(db, task_id)
     pack = _build_pack(db, task_id, budget, rel_limit, rel_scope or "project",
                        rerank=rerank, recency_half_life_hours=recency_half_life_hours,
-                       pinned_boost=pinned_boost, rel_handoffs=rel_handoffs)
+                       pinned_boost=pinned_boost, rel_handoffs=rel_handoffs,
+                       dep_context=dep_context)
     lease_live = bool(row["lease_owner"]) and row["lease_expires_at"] > t
     bundle = {
         **pack,
@@ -1317,6 +1379,8 @@ def _bundle_sections(bundle: dict) -> dict:
         # Flag-gated section: manifests recorded without the flag stay
         # byte-identical to their pre-feature shape.
         sections["related_handoffs"] = [x["id"] for x in bundle["related_handoffs"]]
+    if "dep_context" in bundle:
+        sections["dep_context"] = [e["id"] for e in bundle["dep_context"]]
     return sections
 
 def _diff_sections(old: dict, new: dict) -> dict:
@@ -1355,6 +1419,9 @@ def _diff_sections(old: dict, new: dict) -> dict:
     orh, nrh = set(old.get("related_handoffs") or []), set(new.get("related_handoffs") or [])
     if orh != nrh:
         changes["related_handoffs"] = {"added": sorted(nrh - orh), "removed": sorted(orh - nrh)}
+    odc, ndc = set(old.get("dep_context") or []), set(new.get("dep_context") or [])
+    if odc != ndc:
+        changes["dep_context"] = {"added": sorted(ndc - odc), "removed": sorted(odc - ndc)}
     if old["lease"] != new["lease"]:
         changes["lease"] = {"from": old["lease"], "to": new["lease"]}
     orec, nrec = set(old["receipts"]), set(new["receipts"])
@@ -1381,7 +1448,8 @@ def recall(args):
                                       rerank=bool(getattr(args, "rerank", False)),
                                       recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
                                       pinned_boost=getattr(args, "pinned_boost", 0.5),
-                                      rel_handoffs=getattr(args, "related_handoffs", 0))
+                                      rel_handoffs=getattr(args, "related_handoffs", 0),
+                                      dep_context=getattr(args, "dep_context", 0))
         # Record the bundle parameters alongside the digest so fleet sweeps
         # (ops.py recall-stale) can recompute the digest exactly as recalled.
         audit(db, "task", args.task_id, "context_recalled",
@@ -1393,6 +1461,7 @@ def recall(args):
                "recency_half_life_hours": getattr(args, "recency_half_life_hours", 168.0),
                "pinned_boost": getattr(args, "pinned_boost", 0.5),
                "related_handoffs": getattr(args, "related_handoffs", 0),
+               "dep_context": getattr(args, "dep_context", 0),
                "sections": _bundle_sections(bundle)})
     json_out(bundle)
 
@@ -1418,7 +1487,8 @@ def recall_verify(args):
                                       rerank=bool(getattr(args, "rerank", False)),
                                       recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
                                       pinned_boost=getattr(args, "pinned_boost", 0.5),
-                                      rel_handoffs=getattr(args, "related_handoffs", 0))
+                                      rel_handoffs=getattr(args, "related_handoffs", 0),
+                                      dep_context=getattr(args, "dep_context", 0))
     json_out({"ok": True, "task_id": args.task_id,
               "fresh": bundle["digest"] == digest,
               "recalled_digest": digest, "current_digest": bundle["digest"]})
@@ -1466,6 +1536,7 @@ def recall_diff(args):
         # Legacy events predate --related-handoffs; absent means the original
         # bundle was built without it, which recomputes the digest exactly.
         rel_handoffs = payload.get("related_handoffs") or 0
+        dep_ctx_n = payload.get("dep_context") or 0
         rerank = bool(payload.get("rerank"))
         half_life = payload.get("recency_half_life_hours")
         boost = payload.get("pinned_boost")
@@ -1478,7 +1549,8 @@ def recall_diff(args):
                                       rerank=rerank,
                                       recency_half_life_hours=168.0 if half_life is None else half_life,
                                       pinned_boost=0.5 if boost is None else boost,
-                                      rel_handoffs=rel_handoffs)
+                                      rel_handoffs=rel_handoffs,
+                                      dep_context=dep_ctx_n)
         fresh = bundle["digest"] == digest
         out["current_digest"] = bundle["digest"]
         out["fresh"] = fresh
@@ -1548,7 +1620,8 @@ def resume(args):
                                       rerank=bool(getattr(args, "rerank", False)),
                                       recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
                                       pinned_boost=getattr(args, "pinned_boost", 0.5),
-                                      rel_handoffs=getattr(args, "related_handoffs", 0))
+                                      rel_handoffs=getattr(args, "related_handoffs", 0),
+                                      dep_context=getattr(args, "dep_context", 0))
         # session_resumed doubles as recall provenance: the digest is recorded
         # with its bundle parameters so a handoff citing a resume digest passes
         # the handoff-check lint and fleet sweeps can recompute it exactly.
@@ -1561,6 +1634,7 @@ def resume(args):
                "recency_half_life_hours": getattr(args, "recency_half_life_hours", 168.0),
                "pinned_boost": getattr(args, "pinned_boost", 0.5),
                "related_handoffs": getattr(args, "related_handoffs", 0),
+               "dep_context": getattr(args, "dep_context", 0),
                "sections": _bundle_sections(bundle)})
     json_out({"ok": True, "task_id": args.task_id, "action": action, **bundle})
 
@@ -2245,7 +2319,8 @@ def next_task(args):
                                               rerank=bool(getattr(args, "rerank", False)),
                                               recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
                                               pinned_boost=getattr(args, "pinned_boost", 0.5),
-                                              rel_handoffs=getattr(args, "related_handoffs", 0))
+                                              rel_handoffs=getattr(args, "related_handoffs", 0),
+                                      dep_context=getattr(args, "dep_context", 0))
                 # Same provenance contract as `recall`: the digest is recorded
                 # with its bundle parameters so handoffs/completions can cite
                 # it and fleet sweeps can recompute it exactly.
@@ -2258,6 +2333,7 @@ def next_task(args):
                        "recency_half_life_hours": getattr(args, "recency_half_life_hours", 168.0),
                        "pinned_boost": getattr(args, "pinned_boost", 0.5),
                        "related_handoffs": getattr(args, "related_handoffs", 0),
+                       "dep_context": getattr(args, "dep_context", 0),
                        "sections": _bundle_sections(bundle),
                        "via": "next"})
                 out["recall"] = bundle
@@ -2609,14 +2685,14 @@ def main():
     p=sub.add_parser("tag"); p.add_argument("id"); p.add_argument("--tag",action="append",required=True,help="capability/scope tag (repeatable)"); p.set_defaults(fn=tag_task)
     p=sub.add_parser("untag"); p.add_argument("id"); p.add_argument("--tag",required=True); p.set_defaults(fn=untag_task)
     p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
-    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.add_argument("--tag",default=""); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=supersede_note)
-    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
-    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
-    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
+    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
+    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
+    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
     p=sub.add_parser("recall-diff"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.set_defaults(fn=recall_diff)
     p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--include-expired",dest="include_expired",action="store_true"); _add_rerank_flags(p); p.set_defaults(fn=search_notes)
     p=sub.add_parser("search-handoffs"); p.add_argument("query"); p.add_argument("--task",default=""); p.add_argument("--from-agent",dest="from_agent",default=""); p.add_argument("--to-agent",dest="to_agent",default=""); p.add_argument("--project",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=search_handoffs)
@@ -2630,7 +2706,7 @@ def main():
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)
     p=sub.add_parser("renew"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=renew)
     p=sub.add_parser("transfer"); p.add_argument("id"); p.add_argument("--from-owner",required=True,dest="from_owner"); p.add_argument("--to-owner",required=True,dest="to_owner"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=transfer)
-    p=sub.add_parser("resume"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=resume)
+    p=sub.add_parser("resume"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=resume)
     p=sub.add_parser("leases"); p.add_argument("--owner"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=leases)
     args=ap.parse_args(); args.fn(args)
 
