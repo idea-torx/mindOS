@@ -445,6 +445,40 @@ Design properties:
 - **Drift detection**: `ops.py doctor` compares indexed vs source row counts
   and reports `fts_index_drift` if they ever diverge.
 
+## Temporal hybrid rerank
+
+Pure BM25 is blind to time: a perfectly-matched note from months ago outranks
+a fresh one, and stale facts are exactly what agents must not pack first.
+Retrieval commands accept an opt-in hybrid re-scoring pass — lexical match ×
+recency decay + pinned bonus:
+
+```bash
+python3 "$A" search-notes "postgres pool" --rank --rerank --recency-half-life-hours 24
+python3 "$A" context <task-id> --related 5 --rerank
+python3 "$A" recall <task-id> --agent codex --related 5 --rerank --pinned-boost 0.5
+python3 "$A" next --claim --recall --owner codex --rerank
+```
+
+Design properties:
+
+- **Hybrid score**: the best BM25 match in the candidate set normalizes to
+  1.0 (LIKE-fallback rows count as 1.0 — that path is already newest-first),
+  multiplied by an exponential recency decay (`--recency-half-life-hours`,
+  default 168 = one week), plus a flat `--pinned-boost` (default 0.5) for
+  pinned notes. Each row carries its `rank_score`; results sort by it,
+  ties newest-first.
+- **Deterministic digests**: note ages are floored to whole hours before the
+  decay is applied, so a recall bundle's scores — and therefore its sealed
+  digest — are stable within the hour instead of drifting on every
+  recomputation. Identical state still yields an identical digest.
+- **Provenance-preserving**: when a recall/resume uses `--rerank`, the
+  half-life and boost are recorded in the audited `context_recalled` /
+  `session_resumed` event, so `ops.py recall-stale` recomputes cited digests
+  exactly as originally recalled; events recorded before this feature
+  recompute unchanged (rerank off).
+- **Opt-in and shape-stable**: without `--rerank`, every command's output
+  (and digest behavior) is byte-identical to the pre-rerank semantics.
+
 ## Dispatch fairness (per-owner lease caps)
 
 By default an owner may hold unlimited live leases. Set a cap to stop one

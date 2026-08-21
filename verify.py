@@ -713,6 +713,62 @@ with tempfile.TemporaryDirectory() as td:
     cev = [e for e in run('events','--entity-id','ho-1','--action','completed')['events']
            if e['payload'].get('recall_digest') == rv2['current_digest']]
     assert cev, 'completed event must carry the cited recall digest'
+    # Temporal hybrid rerank: retrieval quality under stale-vs-fresh competition.
+    run('create','--project','Verify','--title','rerank probe','--id','rr-1')
+    run('create','--project','Verify','--title','old source','--id','rr-old')
+    run('create','--project','Verify','--title','new source','--id','rr-new')
+    run('note','rr-old','--kind','fact','--content','rerank probe ancient wisdom','--source','verify')
+    run('note','rr-new','--kind','fact','--content','rerank probe fresh insight','--source','verify')
+    def sq(*stmts):
+        with sqlite3.connect(Path(td) / 'state.db') as db:
+            for s in stmts: db.execute(s)
+    sq("UPDATE notes SET created_at='2026-07-01T00:00:00+00:00' WHERE content LIKE 'rerank probe ancient%'")
+    plain = run('context','rr-1','--budget','100000','--related','5')
+    assert 'rerank' not in plain, 'packs built without --rerank must keep the legacy shape'
+    rel_plain = [n for n in plain['notes'] if n.get('related')]
+    assert {n['task_id'] for n in rel_plain} == {'rr-old','rr-new'}, rel_plain
+    ranked = run('context','rr-1','--budget','100000','--related','5',
+                 '--rerank','--recency-half-life-hours','24')
+    assert ranked['rerank'] == {'recency_half_life_hours': 24.0, 'pinned_boost': 0.5}, ranked.get('rerank')
+    rel_ranked = [n for n in ranked['notes'] if n.get('related')]
+    assert all('rank_score' in n for n in rel_ranked), rel_ranked
+    scores = [n['rank_score'] for n in rel_ranked]
+    assert scores == sorted(scores, reverse=True), 'reranked rows must sort by rank_score desc'
+    assert rel_ranked[0]['task_id'] == 'rr-new', \
+        'a fresh match must outrank a month-old one under a 24h half-life'
+    # Rerank changes the sealed bundle, and the params are recorded for exact recomputation.
+    ra = run('recall','rr-1','--agent','opencode','--budget','100000','--related','5',
+             '--rerank','--recency-half-life-hours','24')
+    rb = run('recall','rr-1','--agent','opencode','--budget','100000','--related','5')
+    assert ra['digest'] != rb['digest'], 'rerank must move the recall digest'
+    rva = run('recall-verify','rr-1','--digest',ra['digest'],'--agent','opencode',
+              '--budget','100000','--related','5','--rerank','--recency-half-life-hours','24')
+    assert rva['fresh'] is True, rva
+    rvb = run('recall-verify','rr-1','--digest',ra['digest'],'--agent','opencode',
+              '--budget','100000','--related','5')
+    assert rvb['fresh'] is False, 'a reranked digest must not verify under different params'
+    evs = run('events','--entity-id','rr-1','--action','context_recalled','--limit','3')
+    assert evs['events'][0]['payload']['rerank'] is False, evs['events'][0]
+    assert evs['events'][0]['payload']['digest'] == rb['digest']
+    # Fleet sweep recomputes a rerank bundle exactly: cite it, then expect fresh.
+    hh = run('handoff','rr-1','--from-agent','opencode','--to-agent','codex',
+             '--objective','verify rerank sweep','--next-action','compare digests',
+             '--recall-digest',ra['digest'])
+    st = ops('recall-stale')
+    item = next(i for i in st['items'] if i['recall_digest'] == ra['digest'])
+    assert item['state'] == 'fresh', item
+    # search-notes honors the same hybrid in both FTS and fallback shapes.
+    hits = run('search-notes','rerank probe','--rank','--rerank','--recency-half-life-hours','24')
+    assert hits and hits[0]['task_id'] == 'rr-new' and all('rank_score' in h for h in hits), hits
+    base = run('search-notes','rerank probe','--rank')
+    assert all('rank_score' not in h for h in base), 'baseline --rank output shape unchanged'
+    # Pinned bonus: neutralize recency, pin the old note, watch it surface.
+    sq("UPDATE notes SET pinned=1 WHERE content LIKE 'rerank probe ancient%'")
+    boosted = run('search-notes','rerank probe','--rank','--rerank','--recency-half-life-hours','1000000')
+    assert boosted[0]['content'].startswith('rerank probe ancient'), \
+        'pinned bonus must lift the old note when recency is neutralized'
+    sq("UPDATE notes SET pinned=0 WHERE content LIKE 'rerank probe ancient%'")
+
     # Cross-agent ownership transfer: atomic live-lease reassignment with fencing.
     run('create','--project','Verify','--title','pass the baton','--id','xfer-1')
     run('claim','xfer-1','--owner','agent-a','--minutes','5')

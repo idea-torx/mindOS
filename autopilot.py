@@ -753,13 +753,57 @@ def handoff_inbox(args):
     json_out({"ok": True, "agent": agent, "generated_at": t,
               "count": len(items), "items": items})
 
-def _related_note_candidates(db, task_id: str, text: str, limit: int, scope: str) -> list:
+def _rerank_notes(rows: list, recency_half_life_hours: float, pinned_boost: float) -> list:
+    """Hybrid temporal rerank over retrieved note rows (pure function).
+
+    Pure BM25 is blind to time: a perfectly-matched note from months ago
+    outranks a fresh one, and stale facts are exactly what agents must not
+    pack first. The hybrid score blends a normalized lexical match (best bm25
+    → 1.0; rows without a score — the LIKE fallback — count as 1.0 since that
+    path already returns newest-first) with an exponential recency decay
+    (half-life = recency_half_life_hours) plus a flat pinned_boost bonus.
+    Each row gains `rank_score`; output sorts by it descending, ties broken
+    newest-first. Deterministic: same inputs, same order — note ages are
+    floored to whole hours before the decay is applied, so a bundle's
+    rank_scores (and therefore its recall digest) stay stable within the
+    hour instead of drifting with every recomputation.
+    """
+    if not rows:
+        return rows
+    scored = [dict(r) for r in rows]
+    bm = [r["score"] for r in scored if r.get("score") is not None]
+    best = min(bm) if bm else None  # bm25(): lower (more negative) = better match
+    now_dt = datetime.now(timezone.utc)
+    half_life = max(float(recency_half_life_hours), 1e-9)
+    for r in scored:
+        s = r.get("score")
+        if s is None or best is None or s == 0:
+            norm = 1.0
+        else:
+            norm = max(0.0, min(1.0, best / s))
+        try:
+            age_h = max(0.0, (now_dt - datetime.fromisoformat(r["created_at"])).total_seconds() / 3600.0)
+        except ValueError:
+            age_h = 0.0
+        r["rank_score"] = round(norm * (0.5 ** (float(int(age_h)) / half_life))
+                                + (float(pinned_boost) if r.get("pinned") else 0.0), 6)
+    scored.sort(key=lambda r: r["created_at"], reverse=True)   # tie-break: newest first
+    scored.sort(key=lambda r: -r["rank_score"])                # stable: rank dominates
+    return scored
+
+def _related_note_candidates(db, task_id: str, text: str, limit: int, scope: str,
+                             rerank: bool = False,
+                             recency_half_life_hours: float = 168.0,
+                             pinned_boost: float = 0.5) -> list:
     """Cross-task retrieval: live notes on *other* tasks matching this task's text.
 
     FTS5 path OR-combines the tokens (recall-oriented) and ranks by BM25 so the
     best matches pack first; on non-FTS builds it degrades to any-token LIKE
     matching with identical output shape minus `score`. Scope 'project'
     restricts candidates to the task's own project; 'global' searches all.
+    With rerank=True, candidates are re-scored by the temporal hybrid
+    (`_rerank_notes`) so fresh and pinned matches surface before stale ones;
+    each row then also carries `rank_score`.
     """
     if limit <= 0 or not text.strip():
         return []
@@ -789,14 +833,22 @@ def _related_note_candidates(db, task_id: str, text: str, limit: int, scope: str
                "WHERE (" + likes + ") AND n.superseded_by='' AND n.task_id!=?" + scope_sql +
                " ORDER BY n.created_at DESC LIMIT ?")
         vals = [*( "%" + t + "%" for t in toks), task_id, *scope_vals, limit]
-    return [dict(r) for r in db.execute(sql, vals).fetchall()]
+    rows = [dict(r) for r in db.execute(sql, vals).fetchall()]
+    if rerank:
+        rows = _rerank_notes(rows, recency_half_life_hours, pinned_boost)
+    return rows
 
-def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str) -> dict:
+def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
+                rerank: bool = False, recency_half_life_hours: float = 168.0,
+                pinned_boost: float = 0.5) -> dict:
     """Assemble the prompt-ready context bundle for a task within a char budget.
 
     Shared by `context` and `recall`: task summary header + unsatisfied
     dependencies, then the live handoff, then live notes pinned-first
     (oldest→newest within each group), then cross-task related notes.
+    With rerank=True the related-note candidates are temporally re-scored
+    (see `_rerank_notes`) and the pack reports the rerank parameters so
+    recall digests stay exactly recomputable.
     """
     budget = max(0, budget)
     rel_limit = max(0, rel_limit)
@@ -811,7 +863,8 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str) -
     related = _related_note_candidates(
         db, task_id,
         " ".join(filter(None, (row["title"], row["description"], row["next_action"]))),
-        rel_limit, rel_scope)
+        rel_limit, rel_scope, rerank=rerank,
+        recency_half_life_hours=recency_half_life_hours, pinned_boost=pinned_boost)
     hrow = _live_handoff(db, task_id)
     # Stable sort: pinned notes first, original (oldest→newest) order within groups.
     ordered = sorted(rows, key=lambda r: not r["pinned"])
@@ -845,7 +898,7 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str) -
             truncated = True
             continue
         packed.append(r); used += cost; related_packed += 1
-    return {"task_id": task_id, "budget": budget, "used_chars": used,
+    out = {"task_id": task_id, "budget": budget, "used_chars": used,
             "truncated": truncated, "task": summary,
             "unsatisfied_dependencies": pending,
             "handoff": handoff if handoff_packed else None,
@@ -855,6 +908,12 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str) -
             "related_requested": rel_limit, "related_matched": len(related),
             "related_packed": related_packed,
             "notes": packed}
+    if rerank:
+        # Reported only when enabled so packs built without rerank stay
+        # byte-identical to the legacy shape (and digest-compatible).
+        out["rerank"] = {"recency_half_life_hours": recency_half_life_hours,
+                         "pinned_boost": pinned_boost}
+    return out
 
 def task_context(args):
     """Pack a prompt-ready context bundle within a character budget.
@@ -869,9 +928,14 @@ def task_context(args):
     with conn() as db:
         json_out(_build_pack(db, args.task_id, args.budget,
                              getattr(args, "related", 0),
-                             getattr(args, "related_scope", "project")))
+                             getattr(args, "related_scope", "project"),
+                             rerank=bool(getattr(args, "rerank", False)),
+                             recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
+                             pinned_boost=getattr(args, "pinned_boost", 0.5)))
 
-def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: int, rel_scope: str) -> dict:
+def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: int, rel_scope: str,
+                         rerank: bool = False, recency_half_life_hours: float = 168.0,
+                         pinned_boost: float = 0.5) -> dict:
     """Assemble the recall bundle and its deterministic digest (no audit write).
 
     Shared by `recall` (which audits the digest) and `recall-verify` (which
@@ -880,7 +944,9 @@ def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: i
     agent = (agent or "").strip()
     t = now()
     row = task_row(db, task_id)
-    pack = _build_pack(db, task_id, budget, rel_limit, rel_scope or "project")
+    pack = _build_pack(db, task_id, budget, rel_limit, rel_scope or "project",
+                       rerank=rerank, recency_half_life_hours=recency_half_life_hours,
+                       pinned_boost=pinned_boost)
     lease_live = bool(row["lease_owner"]) and row["lease_expires_at"] > t
     bundle = {
         **pack,
@@ -934,14 +1000,20 @@ def recall(args):
         bundle = _build_recall_bundle(db, args.task_id,
                                       getattr(args, "agent", "") or "",
                                       args.budget, getattr(args, "related", 0),
-                                      getattr(args, "related_scope", "project"))
+                                      getattr(args, "related_scope", "project"),
+                                      rerank=bool(getattr(args, "rerank", False)),
+                                      recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
+                                      pinned_boost=getattr(args, "pinned_boost", 0.5))
         # Record the bundle parameters alongside the digest so fleet sweeps
         # (ops.py recall-stale) can recompute the digest exactly as recalled.
         audit(db, "task", args.task_id, "context_recalled",
               {"agent": bundle["agent"], "digest": bundle["digest"],
                "core_digest": bundle["core_digest"],
                "budget": args.budget, "related": getattr(args, "related", 0),
-               "related_scope": getattr(args, "related_scope", "project")})
+               "related_scope": getattr(args, "related_scope", "project"),
+               "rerank": bool(getattr(args, "rerank", False)),
+               "recency_half_life_hours": getattr(args, "recency_half_life_hours", 168.0),
+               "pinned_boost": getattr(args, "pinned_boost", 0.5)})
     json_out(bundle)
 
 def recall_verify(args):
@@ -962,7 +1034,10 @@ def recall_verify(args):
         bundle = _build_recall_bundle(db, args.task_id,
                                       getattr(args, "agent", "") or "",
                                       args.budget, getattr(args, "related", 0),
-                                      getattr(args, "related_scope", "project"))
+                                      getattr(args, "related_scope", "project"),
+                                      rerank=bool(getattr(args, "rerank", False)),
+                                      recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
+                                      pinned_boost=getattr(args, "pinned_boost", 0.5))
     json_out({"ok": True, "task_id": args.task_id,
               "fresh": bundle["digest"] == digest,
               "recalled_digest": digest, "current_digest": bundle["digest"]})
@@ -1015,7 +1090,10 @@ def resume(args):
             action = "claimed"
         bundle = _build_recall_bundle(db, args.task_id, agent, args.budget,
                                       getattr(args, "related", 0),
-                                      getattr(args, "related_scope", "project"))
+                                      getattr(args, "related_scope", "project"),
+                                      rerank=bool(getattr(args, "rerank", False)),
+                                      recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
+                                      pinned_boost=getattr(args, "pinned_boost", 0.5))
         # session_resumed doubles as recall provenance: the digest is recorded
         # with its bundle parameters so a handoff citing a resume digest passes
         # the handoff-check lint and fleet sweeps can recompute it exactly.
@@ -1023,7 +1101,10 @@ def resume(args):
               {"agent": agent, "action": action, "digest": bundle["digest"],
                "core_digest": bundle["core_digest"],
                "budget": args.budget, "related": getattr(args, "related", 0),
-               "related_scope": getattr(args, "related_scope", "project")})
+               "related_scope": getattr(args, "related_scope", "project"),
+               "rerank": bool(getattr(args, "rerank", False)),
+               "recency_half_life_hours": getattr(args, "recency_half_life_hours", 168.0),
+               "pinned_boost": getattr(args, "pinned_boost", 0.5)})
     json_out({"ok": True, "task_id": args.task_id, "action": action, **bundle})
 
 def search_notes(args):
@@ -1032,8 +1113,15 @@ def search_notes(args):
     With --rank (and an FTS5-capable SQLite), results are BM25-ranked via the
     notes_fts index and carry a `score`; otherwise it falls back to substring
     LIKE matching with identical output shape minus the score.
+    With --rerank, results are re-scored by the temporal hybrid
+    (`_rerank_notes`): lexical match × recency decay + pinned bonus. Each row
+    gains `rank_score` and ordering follows it — use this when stale facts
+    outranking fresh ones would mislead the caller.
     """
     ranked = bool(getattr(args, "rank", False))
+    do_rerank = bool(getattr(args, "rerank", False))
+    half_life = getattr(args, "recency_half_life_hours", 168.0)
+    boost = getattr(args, "pinned_boost", 0.5)
     with conn() as db:
         if ranked and _fts_ready(db):
             match = _fts_query(args.query)
@@ -1052,11 +1140,11 @@ def search_notes(args):
                 clauses.append("t.status=?"); vals.append(args.status)
             rows = [dict(r) for r in db.execute(
                 "SELECT n.id,n.task_id,t.project,n.kind,n.content,n.source,n.created_at,"
-                "bm25(notes_fts) AS score FROM notes_fts f "
+                "n.pinned,bm25(notes_fts) AS score FROM notes_fts f "
                 "JOIN notes n ON n.rowid=f.rowid JOIN tasks t ON t.id=n.task_id "
                 "WHERE " + " AND ".join(clauses) +
                 " ORDER BY score LIMIT ?", (*vals, args.limit)).fetchall()]
-            json_out(rows)
+            json_out(_rerank_notes(rows, half_life, boost) if do_rerank else rows)
             return
         pat = "%" + args.query + "%"
         clauses = ["n.content LIKE ?"]
@@ -1070,10 +1158,10 @@ def search_notes(args):
         if args.status:
             clauses.append("t.status=?"); vals.append(args.status)
         rows = [dict(r) for r in db.execute(
-            "SELECT n.id,n.task_id,t.project,n.kind,n.content,n.source,n.created_at "
+            "SELECT n.id,n.task_id,t.project,n.kind,n.content,n.source,n.created_at,n.pinned "
             "FROM notes n JOIN tasks t ON t.id=n.task_id WHERE n.superseded_by='' AND " +
             " AND ".join(clauses) + " ORDER BY n.created_at DESC LIMIT ?", (*vals, args.limit)).fetchall()]
-    json_out(rows)
+    json_out(_rerank_notes(rows, half_life, boost) if do_rerank else rows)
 
 def release(args):
     """Voluntarily give up a live lease without consuming retry budget."""
@@ -1586,7 +1674,10 @@ def next_task(args):
                 agent = (getattr(args, "agent", "") or "").strip() or args.owner
                 bundle = _build_recall_bundle(db, picked["id"], agent, args.recall_budget,
                                               getattr(args, "related", 0),
-                                              getattr(args, "related_scope", "project"))
+                                              getattr(args, "related_scope", "project"),
+                                              rerank=bool(getattr(args, "rerank", False)),
+                                              recency_half_life_hours=getattr(args, "recency_half_life_hours", 168.0),
+                                              pinned_boost=getattr(args, "pinned_boost", 0.5))
                 # Same provenance contract as `recall`: the digest is recorded
                 # with its bundle parameters so handoffs/completions can cite
                 # it and fleet sweeps can recompute it exactly.
@@ -1595,6 +1686,9 @@ def next_task(args):
                        "core_digest": bundle["core_digest"],
                        "budget": args.recall_budget, "related": getattr(args, "related", 0),
                        "related_scope": getattr(args, "related_scope", "project"),
+                       "rerank": bool(getattr(args, "rerank", False)),
+                       "recency_half_life_hours": getattr(args, "recency_half_life_hours", 168.0),
+                       "pinned_boost": getattr(args, "pinned_boost", 0.5),
                        "via": "next"})
                 out["recall"] = bundle
                 out["recall_digest"] = bundle["digest"]
@@ -1879,6 +1973,21 @@ def dashboard(args):
                 extra = (extra + " " if extra else "") + f"[OVERDUE due {r['due_at']}]"
             print(f"- [{r['priority']}] {r['project']} · {r['title']}" + (f" — {extra}" if extra else ""))
 
+def _add_rerank_flags(p) -> None:
+    """Attach the temporal-hybrid rerank flags shared by retrieval commands.
+
+    Opt-in: without --rerank every command's output shape and ordering is
+    byte-identical to the pre-rerank behavior (and recall digests stay
+    comparable with ones cited before this feature existed).
+    """
+    p.add_argument("--rerank", action="store_true",
+                   help="re-score results by lexical match x recency decay + pinned bonus")
+    p.add_argument("--recency-half-life-hours", dest="recency_half_life_hours",
+                   type=float, default=168.0,
+                   help="recency decay half-life in hours for --rerank (default 168 = one week)")
+    p.add_argument("--pinned-boost", dest="pinned_boost", type=float, default=0.5,
+                   help="flat score bonus for pinned notes under --rerank (default 0.5)")
+
 def main():
     ap = argparse.ArgumentParser(prog="autopilot")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1902,15 +2011,15 @@ def main():
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
     p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
-    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.set_defaults(fn=next_task)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.set_defaults(fn=supersede_note)
-    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.set_defaults(fn=task_context)
-    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.set_defaults(fn=recall)
-    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.set_defaults(fn=recall_verify)
-    p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.set_defaults(fn=search_notes)
+    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
+    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
+    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
+    p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); _add_rerank_flags(p); p.set_defaults(fn=search_notes)
     p=sub.add_parser("note-history"); p.add_argument("note_id"); p.set_defaults(fn=note_history)
     p=sub.add_parser("handoff-history"); p.add_argument("handoff_id"); p.set_defaults(fn=handoff_history)
     p=sub.add_parser("handoff"); p.add_argument("task_id"); p.add_argument("--from-agent",required=True); p.add_argument("--to-agent",default=""); p.add_argument("--status",default=""); p.add_argument("--objective",default=""); p.add_argument("--evidence",action="append",default=[]); p.add_argument("--constraint",dest="constraints",action="append",default=[]); p.add_argument("--decision",dest="decisions",action="append",default=[]); p.add_argument("--file",dest="files",action="append",default=[]); p.add_argument("--commit",dest="commit_ref",default=""); p.add_argument("--next-action",dest="next_actions",action="append",default=[]); p.add_argument("--risk",dest="risks",action="append",default=[]); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.set_defaults(fn=add_handoff)

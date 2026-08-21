@@ -657,7 +657,7 @@ def recall_stale(args=None):
     fleet: for every *live* handoff citing a --recall-digest, recompute the
     task's current recall bundle exactly as it was originally recalled (the
     audited event stores the bundle parameters — budget, related, scope,
-    agent) and compare digests.
+    agent, and the optional temporal-rerank settings) and compare digests.
 
     Per-item states:
     - fresh: the cited recall's *core* context (everything except the handoff
@@ -693,12 +693,26 @@ def recall_stale(args=None):
             else:
                 payload = json.loads(ev['payload_json'])
                 params = {k: payload.get(k) for k in ('budget', 'related', 'related_scope')}
+                # Rerank parameters are optional (feature added after the
+                # provenance loop); absent keys mean the original bundle was
+                # built without rerank, which is exactly how it must be
+                # recomputed for the digest comparison to be meaningful.
+                rerank = bool(payload.get('rerank'))
+                half_life = payload.get('recency_half_life_hours')
+                boost = payload.get('pinned_boost')
+                if rerank and (half_life is None or boost is None):
+                    item['state'] = 'unknown_recall_params'
+                    items.append(item)
+                    continue
                 if any(v is None for v in params.values()) or not payload.get('core_digest'):
                     item['state'] = 'unknown_recall_params'
                 else:
                     bundle = autopilot._build_recall_bundle(
                         c, r['task_id'], payload.get('agent') or '',
-                        params['budget'], params['related'], params['related_scope'])
+                        params['budget'], params['related'], params['related_scope'],
+                        rerank=rerank,
+                        recency_half_life_hours=168.0 if half_life is None else half_life,
+                        pinned_boost=0.5 if boost is None else boost)
                     item['state'] = ('fresh' if bundle['core_digest'] == payload['core_digest']
                                      else 'stale')
                     item['current_digest'] = bundle['digest']
