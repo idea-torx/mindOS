@@ -1,0 +1,8 @@
+# Tier-0 FTS drift repair: rebuild the external-content FTS indexes.
+trigger: doctor_fts_index_drift
+preconditions: fts5 compile option available; indexes are derived cache only
+command: fts-rebuild
+rollback_command: fts-rebuild --dry-run
+receipt_kind: repair
+blast_radius_tier: 0
+requires_user: false
