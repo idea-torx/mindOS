@@ -74,15 +74,6 @@ def _case_core_lifecycle_and_recall():
             assert p.returncode != 0, ('expected failure', a, p.stdout, p.stderr)
             return p.stdout + p.stderr
         import sqlite3, hashlib, time
-        env = os.environ.copy(); env['HERMES_AUTOPILOT_HOME'] = td
-        def run(*args):
-            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
-            if p.returncode: raise AssertionError((args, p.stdout, p.stderr))
-            return json.loads(p.stdout)
-        def run_fail(*args):
-            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
-            assert p.returncode != 0, ('expected failure', args, p.stdout, p.stderr)
-            return p.stderr
         task = run('create','--project','Verify','--title','smoke','--id','verify-1')
         assert task['status'] == 'queued'
         run('claim','verify-1','--owner','tester','--minutes','5')
@@ -2599,102 +2590,119 @@ def _case_hardening_regression_race_guards():
         import argparse, io
         from contextlib import redirect_stdout
         race_td = tempfile.mkdtemp(prefix='ap-race-')
-        os.environ['HERMES_AUTOPILOT_HOME'] = race_td
-        sys.modules.pop('autopilot', None); sys.modules.pop('ops', None)
-        sys.path.insert(0, str(ROOT))
-        import autopilot as apmod
-        import ops as opsmod
-        apmod.ensure()
-        real_task_row, real_audit = apmod.task_row, apmod.audit
-        past, future = '2020-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00'
-        def rsql(q, params=()):
+        prior_env = os.environ.get('HERMES_AUTOPILOT_HOME')
+        prior_ap, prior_ops = sys.modules.get('autopilot'), sys.modules.get('ops')
+        prior_path = list(sys.path)
+        try:
+            os.environ['HERMES_AUTOPILOT_HOME'] = race_td
+            sys.modules.pop('autopilot', None); sys.modules.pop('ops', None)
+            sys.path.insert(0, str(ROOT))
+            import autopilot as apmod
+            import ops as opsmod
+            apmod.ensure()
+            real_task_row, real_audit = apmod.task_row, apmod.audit
+            past, future = '2020-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00'
+            def rsql(q, params=()):
+                with apmod.conn() as c:
+                    c.execute(q, params)
+            def rmk(task_id):
+                t0 = apmod.now()
+                rsql("INSERT INTO tasks(id,project,title,status,priority,created_at,updated_at) "
+                     "VALUES(?,'Race','r','queued','P2',?,?)", (task_id, t0, t0))
+            # complete/fail/release: a lease stolen after the holder's row read turns
+            # the write into a refusal — the new owner's claim is never clobbered.
+            rmk('rc-c')
+            rsql("UPDATE tasks SET status='claimed',lease_owner='holder',lease_expires_at=? WHERE id='rc-c'", (future,))
             with apmod.conn() as c:
-                c.execute(q, params)
-        def rmk(task_id):
-            t0 = apmod.now()
-            rsql("INSERT INTO tasks(id,project,title,status,priority,created_at,updated_at) "
-                 "VALUES(?,'Race','r','queued','P2',?,?)", (task_id, t0, t0))
-        # complete/fail/release: a lease stolen after the holder's row read turns
-        # the write into a refusal — the new owner's claim is never clobbered.
-        rmk('rc-c')
-        rsql("UPDATE tasks SET status='claimed',lease_owner='holder',lease_expires_at=? WHERE id='rc-c'", (future,))
-        with apmod.conn() as c:
-            stolen = c.execute("SELECT * FROM tasks WHERE id='rc-c'").fetchone()   # holder's view
-        rsql("UPDATE tasks SET lease_owner='thief',lease_expires_at=?,lease_epoch=lease_epoch+1 WHERE id='rc-c'", (future,))
-        apmod.task_row = lambda db, tid: stolen
-        try:
-            for fn, ns in (
-                (apmod.complete, argparse.Namespace(id='rc-c', owner='holder', note='',
-                                                    epoch=None, recall_digest='', evidence_receipts=[])),
-                (apmod.fail, argparse.Namespace(id='rc-c', owner='holder', reason='x', no_retry=False,
-                                                max_retries=3, backoff_base=60, backoff_cap=3600, epoch=None)),
-                (apmod.release, argparse.Namespace(id='rc-c', owner='holder', epoch=None)),
-            ):
-                try:
-                    buf = io.StringIO()
-                    with redirect_stdout(buf):
-                        fn(ns)
-                    raise AssertionError(('stale holder mutation succeeded', fn.__name__, buf.getvalue()))
-                except SystemExit as e:
-                    assert 'lease changed' in str(e), (fn.__name__, str(e))
-        finally:
-            apmod.task_row = real_task_row
-        with apmod.conn() as c:
-            assert c.execute("SELECT lease_owner FROM tasks WHERE id='rc-c'").fetchone()[0] == 'thief'
-        # recover: a fresh claim landing mid-sweep keeps its lease (reported as skipped).
-        rmk('rc-r1'); rmk('rc-r2')
-        rsql("UPDATE tasks SET status='running',lease_owner='ghost',lease_expires_at=?,retry_count=0 "
-             "WHERE id IN ('rc-r1','rc-r2')", (past,))
-        def stealing_audit(db, *a, **k):
-            # Runs inside recover's open transaction: steal rc-r2's lease on the
-            # same connection (a second writer would deadlock on the lock).
-            db.execute("UPDATE tasks SET status='claimed',lease_owner='fresh-worker',lease_expires_at=? "
-                       "WHERE id='rc-r2'", (future,))
-            return real_audit(db, *a, **k)
-        apmod.audit = stealing_audit
-        try:
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                opsmod.recover(argparse.Namespace(max_retries=3, dry_run=False,
-                                                  backoff_base=60, backoff_cap=3600))
-            out = json.loads(buf.getvalue())
-        finally:
-            apmod.audit = real_audit
-        assert out['recovered'] == ['rc-r1'] and out['skipped'] == ['rc-r2'], out
-        with apmod.conn() as c:
-            r2 = c.execute("SELECT status,lease_owner FROM tasks WHERE id='rc-r2'").fetchone()
-        assert tuple(r2) == ('claimed', 'fresh-worker'), tuple(r2)
-        # escalate: a task that settles mid-sweep is skipped, not bumped posthumously.
-        rmk('rc-e1'); rmk('rc-e2')
-        rsql("UPDATE tasks SET priority='P3',due_at=? WHERE id IN ('rc-e1','rc-e2')", (past,))
-        def completing_audit(db, *a, **k):
-            db.execute("UPDATE tasks SET status='completed' WHERE id='rc-e2'")
-            return real_audit(db, *a, **k)
-        apmod.audit = completing_audit
-        try:
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                opsmod.escalate(argparse.Namespace(dry_run=False))
-            out = json.loads(buf.getvalue())
-        finally:
-            apmod.audit = real_audit
-        assert out['skipped'] == ['rc-e2'] and [c['task_id'] for c in out['escalated']] == ['rc-e1'], out
-        # tag/untag: compare-and-swap refuses to drop a concurrent writer's tags.
-        rmk('rc-t')
-        with apmod.conn() as c:
-            stale_tags = c.execute("SELECT * FROM tasks WHERE id='rc-t'").fetchone()
-            c.execute('UPDATE tasks SET tags=\'["other"]\' WHERE id=\'rc-t\'')
-        apmod.task_row = lambda db, tid: stale_tags
-        try:
+                stolen = c.execute("SELECT * FROM tasks WHERE id='rc-c'").fetchone()   # holder's view
+            rsql("UPDATE tasks SET lease_owner='thief',lease_expires_at=?,lease_epoch=lease_epoch+1 WHERE id='rc-c'", (future,))
+            apmod.task_row = lambda db, tid: stolen
+            try:
+                for fn, ns in (
+                    (apmod.complete, argparse.Namespace(id='rc-c', owner='holder', note='',
+                                                        epoch=None, recall_digest='', evidence_receipts=[])),
+                    (apmod.fail, argparse.Namespace(id='rc-c', owner='holder', reason='x', no_retry=False,
+                                                    max_retries=3, backoff_base=60, backoff_cap=3600, epoch=None)),
+                    (apmod.release, argparse.Namespace(id='rc-c', owner='holder', epoch=None)),
+                ):
+                    try:
+                        buf = io.StringIO()
+                        with redirect_stdout(buf):
+                            fn(ns)
+                        raise AssertionError(('stale holder mutation succeeded', fn.__name__, buf.getvalue()))
+                    except SystemExit as e:
+                        assert 'lease changed' in str(e), (fn.__name__, str(e))
+            finally:
+                apmod.task_row = real_task_row
+            with apmod.conn() as c:
+                assert c.execute("SELECT lease_owner FROM tasks WHERE id='rc-c'").fetchone()[0] == 'thief'
+            # recover: a fresh claim landing mid-sweep keeps its lease (reported as skipped).
+            rmk('rc-r1'); rmk('rc-r2')
+            rsql("UPDATE tasks SET status='running',lease_owner='ghost',lease_expires_at=?,retry_count=0 "
+                 "WHERE id IN ('rc-r1','rc-r2')", (past,))
+            def stealing_audit(db, *a, **k):
+                # Runs inside recover's open transaction: steal rc-r2's lease on the
+                # same connection (a second writer would deadlock on the lock).
+                db.execute("UPDATE tasks SET status='claimed',lease_owner='fresh-worker',lease_expires_at=? "
+                           "WHERE id='rc-r2'", (future,))
+                return real_audit(db, *a, **k)
+            apmod.audit = stealing_audit
             try:
                 buf = io.StringIO()
                 with redirect_stdout(buf):
-                    apmod.tag_task(argparse.Namespace(id='rc-t', tag=['x']))
-                raise AssertionError('concurrent tag write was lost silently')
-            except SystemExit as e:
-                assert 'concurrently' in str(e), str(e)
+                    opsmod.recover(argparse.Namespace(max_retries=3, dry_run=False,
+                                                      backoff_base=60, backoff_cap=3600))
+                out = json.loads(buf.getvalue())
+            finally:
+                apmod.audit = real_audit
+            assert out['recovered'] == ['rc-r1'] and out['skipped'] == ['rc-r2'], out
+            with apmod.conn() as c:
+                r2 = c.execute("SELECT status,lease_owner FROM tasks WHERE id='rc-r2'").fetchone()
+            assert tuple(r2) == ('claimed', 'fresh-worker'), tuple(r2)
+            # escalate: a task that settles mid-sweep is skipped, not bumped posthumously.
+            rmk('rc-e1'); rmk('rc-e2')
+            rsql("UPDATE tasks SET priority='P3',due_at=? WHERE id IN ('rc-e1','rc-e2')", (past,))
+            def completing_audit(db, *a, **k):
+                db.execute("UPDATE tasks SET status='completed' WHERE id='rc-e2'")
+                return real_audit(db, *a, **k)
+            apmod.audit = completing_audit
+            try:
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    opsmod.escalate(argparse.Namespace(dry_run=False))
+                out = json.loads(buf.getvalue())
+            finally:
+                apmod.audit = real_audit
+            assert out['skipped'] == ['rc-e2'] and [c['task_id'] for c in out['escalated']] == ['rc-e1'], out
+            # tag/untag: compare-and-swap refuses to drop a concurrent writer's tags.
+            rmk('rc-t')
+            with apmod.conn() as c:
+                stale_tags = c.execute("SELECT * FROM tasks WHERE id='rc-t'").fetchone()
+                c.execute('UPDATE tasks SET tags=\'["other"]\' WHERE id=\'rc-t\'')
+            apmod.task_row = lambda db, tid: stale_tags
+            try:
+                try:
+                    buf = io.StringIO()
+                    with redirect_stdout(buf):
+                        apmod.tag_task(argparse.Namespace(id='rc-t', tag=['x']))
+                    raise AssertionError('concurrent tag write was lost silently')
+                except SystemExit as e:
+                    assert 'concurrently' in str(e), str(e)
+            finally:
+                apmod.task_row = real_task_row
         finally:
-            apmod.task_row = real_task_row
+            # Restore the exact prior interpreter state even on failure so later
+            # cases never inherit this case's home, modules, or path entries.
+            if prior_env is None:
+                os.environ.pop('HERMES_AUTOPILOT_HOME', None)
+            else:
+                os.environ['HERMES_AUTOPILOT_HOME'] = prior_env
+            sys.path[:] = prior_path
+            for name, mod in (('autopilot', prior_ap), ('ops', prior_ops)):
+                if mod is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = mod
         import shutil
         shutil.rmtree(race_td, ignore_errors=True)
 
@@ -3008,6 +3016,8 @@ def _case_fact_graph_and_archival():
             db.execute("UPDATE audit_events SET action='tampered' WHERE id=(SELECT MIN(id) FROM audit_events)")
         chain = run('verify-chain')
         assert chain['ok'] is False
+        assert any(p['kind'] == 'hash_mismatch' for p in chain['problems']), \
+            ('a mutated historical event must surface as a hash_mismatch problem', chain)
 
 
 
@@ -3040,6 +3050,15 @@ def _case_protocol_self_description():
         assert {'unaddressed', 'unproven_recall_digest'} <= \
             set(d1['refusal_vocabulary']['handoff_lint_reasons'])
         assert 'completed' in d1['status_machine']['terminal_statuses']
+        # Repeatable-field contract: every argparse append action must report
+        # repeatable=true (introspection used to miss all of them), while
+        # scalar fields stay false.
+        fields = d1['handoff_field_contract']['fields']
+        repeatable = {k for k, v in fields.items() if v['repeatable']}
+        assert {'evidence', 'constraints', 'decisions', 'files',
+                'next_actions', 'risks'} <= repeatable, \
+            ('all append handoff fields must be repeatable', sorted(repeatable))
+        assert not ({'task_id', 'from_agent', 'to_agent', 'objective', 'commit_ref'} & repeatable), repeatable
         # A tampered protocol document fails digest verification.
         tampered = json.loads(json.dumps(d1))
         tampered['status_machine']['statuses'] = ['made-up']

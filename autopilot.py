@@ -1467,11 +1467,6 @@ def _assemble_pack(db, task_id, budget, rel_limit, rel_scope, rerank=False,
             continue  # inactive section: legacy shape keeps no keys at all
         key = section.keys
         out[key] = got
-        if key == "notes":
-            # The first spec section shares the `notes` list with own notes;
-            # report its counters under the historical related_* names and
-            # fold its rows back into `out["notes"]`.
-            pass
         out[f"{section.prefix}_requested"] = limit
         out[f"{section.prefix}_matched"] = len(cand)
         out[f"{section.prefix}_packed"] = len(got)
@@ -3732,13 +3727,13 @@ def _dispatch_candidates(db, args, t_now):
 
 def _filter_candidate(db, r, args, t_now, explain, skipped, pol_cache, inherited,
                       t_dt=None):
-    t_dt = t_dt or datetime.now(timezone.utc)
     """Stage 2 — filter: one candidate's admissibility gates, in order.
 
     Returns (eligible_tuple | None). Refusals append an explain record to
     `skipped` when `explain` is set: deferred_until, unsatisfied_dependencies,
     recovery_backoff, policy_missing_tag, policy_wip_cap, seam_conflict.
     """
+    t_dt = t_dt or datetime.now(timezone.utc)
     if r["not_before"] and r["not_before"] > t_now:
         if explain:
             skipped.append({"task_id": r["id"], "reason": "deferred_until",
@@ -4006,7 +4001,7 @@ def _protocol_doc() -> dict:
         handoff_fields[a.dest] = {
             'flags': sorted(a.option_strings),
             'required': a.required,
-            'repeatable': a.nargs == 0 or 'append' in str(getattr(a, 'action', '')),
+            'repeatable': a.nargs == 0 or isinstance(a, argparse._AppendAction),
             'default': None if a.default is None else (a.default if isinstance(a.default, (str, int, float, bool, list)) else str(a.default)),
         }
     doc = {
