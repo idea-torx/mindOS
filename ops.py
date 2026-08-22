@@ -1477,7 +1477,7 @@ def _open_source_sqlite(path: Path):
 def _classify_sqlite(path: Path):
     """Open a candidate database strictly read-only and classify it.
 
-    Returns (status, problems, counts): status is 'ok' for a healthy Autopilot
+    Returns (status, problems, counts, open_mode): status is 'ok' for a healthy Autopilot
     database, 'corrupted' when SQLite cannot read it or integrity fails, and
     'ambiguous' for valid SQLite that is not an Autopilot schema — the caller
     fails closed on anything other than 'ok'.
@@ -1837,14 +1837,10 @@ def migrate_import(args=None):
     empty; merging into a live ledger breaks every link and is refused unless
     `--relink-audit` explicitly relinks the whole merged chain.
 
-    Receipt rows whose task_id is absent both from the imported tasks and
-    from this home are orphans — disposable verification receipts routinely
-    outlive their tasks — and importing them would violate foreign-key
-    integrity. They are quarantined rather than attached: never inserted,
-    never invented onto a task, never silently lost. Each one is reported
-    with its identity and content/file hashes and audited (digest-only, so
-    no secret value ever enters the ledger); the original stays untouched in
-    the immutable source home.
+    Any source-side foreign-key violation is refused before planning or
+    mutation, naming the dangling rows. Source remediation is a separate
+    approved operation; this importer never repairs, attaches, or invents
+    execution-truth rows.
 
     Dry-run is the default: nothing is written until `--apply` is passed.
     Everything lands in one transaction (rollback on any failure), receipt
@@ -1908,8 +1904,7 @@ def migrate_import(args=None):
         # receipt_file_missing forever. Inventory checksums the receipts
         # directory (above), so absence/drift is visible at stage one; here we
         # refuse to offer an import that would insert evidence without files.
-        # Rows whose task is gone entirely are NOT gated here: they follow the
-        # documented orphan-receipt quarantine accounting instead.
+        # Every receipt row is covered by the source FK gate above.
         tgt = sqlite3.connect(DB, timeout=10)
         tgt.row_factory = sqlite3.Row
         tgt.execute('PRAGMA foreign_keys=ON')
@@ -1946,8 +1941,7 @@ def migrate_import(args=None):
         # receipt_file_missing forever. Inventory checksums the receipts
         # directory (above), so absence/drift is visible at stage one; here we
         # refuse to offer an import that would insert evidence without files.
-        # Rows whose task is gone entirely are NOT gated here: they follow the
-        # documented orphan-receipt quarantine accounting instead.
+        # Receipt rows are covered by the source FK and file gates above.
         src_task_ids = {r['id'] for r in rows['tasks']}
         missing_receipt_files = sorted(
             r['id'] for r in rows['receipts']
@@ -1965,32 +1959,6 @@ def migrate_import(args=None):
             if r['status'] in WORKORDER_ACTIVE_STATUSES:
                 r.update(status='queued', lease_owner='', lease_expires_at='',
                          blocked_reason='migrated active lease sanitized')
-        # Orphan-receipt quarantine: a receipt whose task_id is neither in the
-        # imported task set nor already resident here cannot satisfy the
-        # receipts FK, and the alternatives are all forbidden — weakening the
-        # key, inventing a task, or re-pointing evidence at a guess. So the
-        # row is withheld from import entirely and accounted for by digest:
-        # identity + content hash travel into the report and audit ledger,
-        # the bytes stay put in the source home (which is never mutated).
-        known_tasks = {r['id'] for r in rows['tasks']} | \
-            {r[0] for r in tgt.execute('SELECT id FROM tasks')}
-        orphan_receipts = []
-        if 'task_id' in cols['receipts']:
-            orphans_by_id = {}
-            for r in rows['receipts']:
-                if r.get('task_id') and r['task_id'] not in known_tasks \
-                        and r['id'] not in orphans_by_id:
-                    orphans_by_id[r['id']] = {
-                        'id': r['id'], 'task_id': r['task_id'], 'kind': r.get('kind', ''),
-                        'file_hash': r.get('file_hash', ''),
-                        'row_sha256': hashlib.sha256(json.dumps(
-                            [r[c_] for c_ in cols['receipts']], sort_keys=True)
-                            .encode()).hexdigest()}
-            orphan_receipts = [orphans_by_id[k] for k in sorted(orphans_by_id)]
-            if orphan_receipts:
-                orphan_ids = {o['id'] for o in orphan_receipts}
-                rows['receipts'] = [r for r in rows['receipts']
-                                    if r['id'] not in orphan_ids]
         # The fact graph joins the secret guard even though its tokens cannot
         # be credential-shaped by construction: the free-form `source` field
         # is operator text and gets exactly the same boundary as notes.
@@ -2025,7 +1993,6 @@ def migrate_import(args=None):
                 'tables': {t: {'source_rows': len(rows[t]),
                                'already_present': present[t]} for t in _MIGRATION_TABLES},
                 'sanitized_tasks': sanitized_ids, 'secret_kinds': kinds,
-                'orphan_receipts_quarantined': orphan_receipts,
                 **({'receipt_files_withheld': withheld_receipts} if withheld_receipts else {}),
                 'heartbeats_skipped_disposable': hb_count,
                 'audit_events_source': len(src_audit),
@@ -2108,17 +2075,11 @@ def migrate_import(args=None):
                 if cur.rowcount:
                     journal_audit_ids.append(r['id'] + audit_offset)
                 audit_imported += cur.rowcount
-            if orphan_receipts:
-                autopilot.audit(tgt, 'system', sid, 'migration_orphan_receipt_quarantined',
-                                {'source_id': sid, 'source_path': str(db_path),
-                                 'receipts': orphan_receipts})
             autopilot.audit(tgt, 'system', sid, 'migration_import_applied',
                             {'inventory_sha256': inv['sha256'], 'source_id': sid,
                              'source_path': str(db_path), 'inserted': inserted,
                              'skipped_existing': skipped_existing,
                              'sanitized_tasks': sanitized_ids,
-                             **({'orphan_receipts_quarantined': orphan_receipts}
-                                if orphan_receipts else {}),
                              **({'secret_kinds': kinds} if kinds else {}),
                              **({'receipt_files_withheld': withheld_receipts}
                                 if withheld_receipts else {}),
@@ -2173,11 +2134,7 @@ def migrate_import(args=None):
                 if t in src_tables else 0
             t_count = tgt.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
             coverage[t] = {'source': s_count, 'target': t_count}
-            # Quarantined orphans are source rows that must never arrive, so
-            # they are excluded from the receipts coverage expectation rather
-            # than flagged as a shortfall.
-            expected = s_count - (len(orphan_receipts) if t == 'receipts' else 0)
-            if t_count < expected:
+            if t_count < s_count:
                 health_problems.append(f'{t}: target has {t_count} rows, source has {s_count}')
         health_problems += [f'receipt file hash mismatch: {rid}' for rid in hash_mismatches]
         deduplicated = all(v == 0 for v in inserted.values()) and audit_imported == 0
@@ -2187,7 +2144,6 @@ def migrate_import(args=None):
             'inventory_sha256': inv['sha256'],
             'inserted': inserted, 'skipped_existing': skipped_existing,
             'sanitized_tasks': sanitized_ids,
-            'orphan_receipts_quarantined': orphan_receipts,
             **({'secret_kinds': kinds} if kinds else {}),
             'audit_events_imported': audit_imported,
             'audit_relinked': bool(audit_offset and audit_imported),
@@ -2848,7 +2804,7 @@ def brain_inventory(args=None):
 
     # Execution truth: the Autopilot control plane database + receipt evidence.
     adb = autopilot.DB
-    status, problems, counts = _classify_sqlite(adb)
+    status, problems, counts, _open_mode = _classify_sqlite(adb)
     # audit_events deliberately re-counted through _brain_ro_counts so the
     # command's own seal events stay outside the sealed manifest (reproducibility).
     counts.update(_brain_ro_counts(adb, ('sessions', 'session_messages', 'facts',
