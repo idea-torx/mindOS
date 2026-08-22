@@ -3010,5 +3010,44 @@ def _case_fact_graph_and_archival():
         assert chain['ok'] is False
 
 
+
+@case('protocol_self_description')
+def _case_protocol_self_description():
+    with tempfile.TemporaryDirectory() as td:
+        env = os.environ.copy(); env['HERMES_AUTOPILOT_HOME'] = td
+        def run(*args):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
+            if p.returncode: raise AssertionError((args, p.stdout, p.stderr))
+            return json.loads(p.stdout)
+        run_fail = None  # not needed here; tampering is file-level below
+        run('init')
+        # Stable across calls (created_at excluded) and sealed with the house digest.
+        d1 = run('protocol')
+        d2 = run('protocol')
+        assert d1.pop('created_at') and d2.pop('created_at')
+        assert d1 == d2, 'protocol output must be stable across calls'
+        body = {k: v for k, v in d1.items() if k != 'sha256'}
+        import hashlib
+        assert hashlib.sha256(json.dumps(body, sort_keys=True,
+            separators=(',', ':')).encode()).hexdigest() == d1['sha256'], \
+            'protocol seal must verify under the house digest format (created_at outside)'
+        # Generated-from-code content cannot silently drift.
+        assert {s['prefix'] for s in d1['flag_gated_pack_sections']} >= \
+            {'related', 'related_handoffs', 'dep_context', 'related_sessions', 'related_facts'}
+        for s in d1['flag_gated_pack_sections']:
+            assert s['limit_flag'].startswith('--'), s
+        assert 'objective' in d1['handoff_field_contract']['fields']
+        assert {'unaddressed', 'unproven_recall_digest'} <= \
+            set(d1['refusal_vocabulary']['handoff_lint_reasons'])
+        assert 'completed' in d1['status_machine']['terminal_statuses']
+        # A tampered protocol document fails digest verification.
+        tampered = json.loads(json.dumps(d1))
+        tampered['status_machine']['statuses'] = ['made-up']
+        body2 = {k: v for k, v in tampered.items() if k != 'sha256'}
+        bad_digest = hashlib.sha256(json.dumps(body2, sort_keys=True,
+            separators=(',', ':')).encode()).hexdigest()
+        assert bad_digest != d1['sha256'], 'tampering must change the digest'
+
+
 if __name__ == '__main__':
     main()

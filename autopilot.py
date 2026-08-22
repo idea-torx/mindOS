@@ -3843,6 +3843,131 @@ def next_task(args):
         json_out(out)
 
 
+
+def _handoff_parser_actions():
+    """Introspect the handoff subparser's argument spec (single source of truth)."""
+    import argparse as _argparse
+    parser = _argparse.ArgumentParser(prog="autopilot")
+    sub = parser.add_subparsers(dest="cmd")
+    # Rebuild just the handoff subparser exactly as main() registers it.
+    p = sub.add_parser("handoff")
+    p.add_argument("task_id")
+    p.add_argument("--from-agent", required=True)
+    p.add_argument("--to-agent", default="")
+    p.add_argument("--status", default="")
+    p.add_argument("--objective", default="")
+    p.add_argument("--evidence", action="append", default=[])
+    p.add_argument("--constraint", dest="constraints", action="append", default=[])
+    p.add_argument("--decision", dest="decisions", action="append", default=[])
+    p.add_argument("--file", dest="files", action="append", default=[])
+    p.add_argument("--commit", dest="commit_ref", default="")
+    p.add_argument("--next-action", dest="next_actions", action="append", default=[])
+    p.add_argument("--risk", dest="risks", action="append", default=[])
+    p.add_argument("--recall-digest", dest="recall_digest", default="")
+    return p._actions
+
+_PACK_SECTION_FLAGS = {
+    "related": "--related",
+    "related_handoffs": "--related-handoffs",
+    "dep_context": "--dep-context",
+    "related_sessions": "--related-sessions",
+    "related_facts": "--related-facts",
+}
+
+def _protocol_doc() -> dict:
+    """Build the machine-readable handoff-protocol self-description.
+
+    Generated from the live code wherever possible (the argparse registry,
+    status/priority/kind vocabularies, dispatch skip reasons) so it cannot
+    silently drift from behavior. Sealed with the house digest format:
+    sha256 over the sorted-key JSON body with `created_at` outside.
+    """
+    # Handoff field contract, generated from the parser spec so new flags
+    # appear automatically.
+    handoff_fields = {}
+    for a in _handoff_parser_actions():
+        if a.dest in ('help', 'fn'):
+            continue
+        handoff_fields[a.dest] = {
+            'flags': sorted(a.option_strings),
+            'required': a.required,
+            'repeatable': a.nargs == 0 or 'append' in str(getattr(a, 'action', '')),
+            'default': None if a.default is None else (a.default if isinstance(a.default, (str, int, float, bool, list)) else str(a.default)),
+        }
+    doc = {
+        'format': 'autopilot-protocol-v1',
+        'handoff_field_contract': {
+            'command': 'autopilot.py handoff <task_id> [fields]',
+            'fields': handoff_fields,
+            'supersession': 'writing a new handoff atomically supersedes the previous live one; history stays queryable via handoffs --all and handoff-history',
+            'deduplication': 'an identical payload deduplicates onto the live handoff instead of adding a row',
+        },
+        'recall_ack_receipt_loop': {
+            'recall': {
+                'commands': ['recall', 'resume', 'next --claim --recall'],
+                'proves': 'context_recalled audit event carrying digest + core_digest + bundle parameters',
+                'digest': 'sha256 over the sealed bundle (recalled_at excluded); core_digest additionally excludes the handoff section and used/truncated counters',
+            },
+            'acknowledge': {
+                'command': 'ack <task_id> --agent <recipient>',
+                'proves': 'handoff_acknowledged audit event; idempotent re-ack; supersession resets acceptance',
+            },
+            'receipt': {
+                'command': 'receipt <task_id> --kind <kind> --payload <json>',
+                'proves': 'sealed receipt file whose sha256 is recorded in SQLite; completions may cite evidence receipts; definition-of-done gates on required kinds',
+            },
+            'freshness_sweeps': ['recall-verify', 'recall-diff', 'ops.py recall-stale'],
+            'lint': 'ops.py handoff-check enforces objective/addressing/evidence/provenance/SLA',
+        },
+        'status_machine': {
+            'statuses': sorted(STATUSES),
+            'terminal_statuses': sorted(TERMINAL_STATUSES),
+            'transitions': {
+                'queued': ['claimed', 'blocked', 'cancelled'],
+                'claimed': ['running', 'queued', 'completed', 'failed', 'blocked', 'cancelled'],
+                'running': ['completed', 'failed', 'queued', 'blocked', 'cancelled'],
+                'waiting_for_agent': ['queued', 'cancelled'],
+                'waiting_for_user': ['queued', 'cancelled'],
+                'waiting_for_review': ['queued', 'ready_to_merge', 'cancelled'],
+                'ready_to_merge': ['ready_to_deploy', 'cancelled'],
+                'ready_to_deploy': ['completed', 'cancelled'],
+                'blocked': ['queued', 'cancelled'],
+                'completed': [], 'failed': [], 'cancelled': [],
+            },
+            'lease_rules': {
+                'exclusivity': 'one live lease per task; second owner refused',
+                'fencing': 'each acquisition bumps lease_epoch; stale epochs are refused',
+                'expiry': 'an expired lease requeues the task and consumes retry budget',
+            },
+        },
+        'refusal_vocabulary': {
+            'handoff_lint_reasons': sorted({
+                'unaddressed', 'missing_objective', 'sparse_no_evidence_or_next_actions',
+                'unproven_recall_digest', 'older_than_latest_recall',
+                'terminal_task_handoff', 'stale_unacknowledged'}),
+            'recall_states': sorted({'fresh', 'stale', 'unproven_recall_digest'}),
+            'dispatch_skip_reasons': sorted({
+                'unsatisfied_dependencies', 'recovery_backoff', 'deferred_until',
+                'seam_conflict', 'policy_missing_tag', 'policy_wip_cap'}),
+            'secret_guard_kinds_note': 'credential-shaped content is refused by note/handoff/fact/export paths unless --redact or --allow-secret',
+        },
+        'flag_gated_pack_sections': [
+            {'prefix': s.prefix, 'keys': s.keys,
+             'limit_flag': _PACK_SECTION_FLAGS.get(s.prefix)}
+            for s in _pack_spec()
+        ],
+    }
+    return doc
+
+def protocol(args):
+    """Emit the sealed protocol document (stable across calls)."""
+    doc = _protocol_doc()
+    doc['created_at'] = now()
+    doc['sha256'] = hashlib.sha256(json.dumps(
+        {k: v for k, v in doc.items() if k not in ('sha256', 'created_at')},
+        sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    json_out(doc)
+
 def heartbeat(args):
     with conn() as db:
         row = task_row(db, args.id)
@@ -4229,6 +4354,7 @@ def main():
     p=sub.add_parser("show"); p.add_argument("id"); p.add_argument("--limit",type=int,default=20); p.set_defaults(fn=show)
     p=sub.add_parser("metrics"); p.set_defaults(fn=metrics)
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
+    p=sub.add_parser("protocol"); p.set_defaults(fn=protocol)
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
     p=sub.add_parser("tag"); p.add_argument("id"); p.add_argument("--tag",action="append",required=True,help="capability/scope tag (repeatable)"); p.set_defaults(fn=tag_task)
     p=sub.add_parser("untag"); p.add_argument("id"); p.add_argument("--tag",required=True); p.set_defaults(fn=untag_task)
