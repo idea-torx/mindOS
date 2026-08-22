@@ -42,6 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import autopilot as ap  # noqa: E402  (shared home resolution, schema, guards)
+from mindos_sqlite_adapter import ingest_session, resolve_state_db  # noqa: E402
 
 LEDGER_SCHEMA = """
 CREATE TABLE IF NOT EXISTS bridge_hindsight_ledger (
@@ -183,6 +184,18 @@ def _ingest_store(args) -> dict:
     plan["dry_run"] = not apply_mode
     plan["applied_files"] = applied if apply_mode else 0
     return plan
+
+
+def bridge_sqlite_sync(args):
+    """Near-real-time ingest of one live Hermes session by session_id.
+
+    Native SQLite adapter over HERMES_HOME/state.db (sessions + messages),
+    read-only. Same guard ladder, ledger, provenance and idempotence as the
+    JSONL sync path.
+    """
+    result = ingest_session(args)
+    result["bridge"] = {"command": "sqlite-sync", "trigger": "on_session_end"}
+    ap.json_out(result)
 
 
 def bridge_sync(args):
@@ -375,6 +388,19 @@ def main():
     sp = sub.add_parser("sync", help="incremental ingest of Hermes-style session stores")
     common(sp)
     sp.set_defaults(fn=bridge_sync)
+
+    sp = sub.add_parser("sqlite-sync",
+                        help="ingest one live Hermes session by session_id from state.db")
+    sp.add_argument("--state-db", dest="state_db", default="",
+                    help="Hermes state.db path (default: HERMES_HOME/state.db)")
+    sp.add_argument("--sqlite-session-id", dest="sqlite_session_id", required=True)
+    sp.add_argument("--max-messages", dest="max_messages", type=int, default=5000)
+    sp.add_argument("--profile", default="")
+    sp.add_argument("--project", default="")
+    sp.add_argument("--bank", default="")
+    sp.add_argument("--redact", action="store_true")
+    sp.add_argument("--allow-secret", dest="allow_secret", action="store_true")
+    sp.set_defaults(fn=bridge_sqlite_sync)
 
     sp = sub.add_parser("watch", help="poll-and-ingest on an interval (near-real-time)")
     common(sp, apply_flag=False)

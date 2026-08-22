@@ -5,8 +5,12 @@ Wired from config.yaml (ACTIVE Hermes home, honors HERMES_HOME)::
 
     mindos_bridge:
       enabled: false            # opt-in; safe/off by default
+      sqlite_mode: true         # with a session_id, ingest the live session
+                                # from HERMES_HOME/state.db (native adapter);
+                                # false = legacy JSONL root sync only
+      state_db: ""              # explicit state.db path; default HERMES_HOME/state.db
       source: hermes-gateway
-      root: ""                  # session-store root to ingest (required when enabled)
+      root: ""                  # JSONL store root (fallback when no session_id)
       profile: ""               # Hermes profile label recorded as provenance
       project: ""
       bank: autopilot-shared-context
@@ -82,23 +86,52 @@ def _as_bool(v, default=False) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _build_command(cfg: dict) -> list[str] | None:
+def _build_commands(cfg: dict) -> tuple[list[str] | None, list[str] | None]:
+    """Primary ingest command + optional fallback command.
+
+    Native SQLite adapter first when a session_id is present (sqlite_mode
+    defaults on); if that attempt exits non-zero (e.g. no state.db in this
+    profile home), the worker falls back to the legacy JSONL root sync so
+    both adapters coexist.
+    """
     if not _as_bool(cfg.get("enabled"), False):
-        return None
+        return None, None
+
+    def _common(cmd):
+        for flag, key in (("--profile", "profile"), ("--project", "project"),
+                          ("--bank", "bank")):
+            val = str(cfg.get(key, "") or "").strip()
+            if val:
+                cmd += [flag, val]
+        if _as_bool(cfg.get("redact"), True):
+            cmd.append("--redact")
+        return cmd
+
+    session_id = str(cfg.get("_session_id", "") or "").strip()
+    state_db = str(cfg.get("state_db", "") or "").strip()
     root = str(cfg.get("root", "") or "").strip()
+
+    root_cmd = None
+    if root:
+        root_cmd = _common([
+            sys.executable, str(HOOK_DIR / "mindos_bridge.py"), "sync",
+            "--source", str(cfg.get("source", "hermes-gateway")),
+            "--root", root, "--apply"])
+
+    if session_id and _as_bool(cfg.get("sqlite_mode"), True):
+        sql_cmd = [sys.executable, str(HOOK_DIR / "mindos_bridge.py"), "sqlite-sync",
+                   "--sqlite-session-id", session_id]
+        if state_db:
+            sql_cmd += ["--state-db", state_db]
+        return _common(sql_cmd), root_cmd
+
     if not root:
-        return None  # misconfigured -> refuse to guess paths; stay inert
-    cmd = [sys.executable, str(HOOK_DIR / "mindos_bridge.py"), "sync",
-           "--source", str(cfg.get("source", "hermes-gateway")),
-           "--root", root, "--apply"]
-    for flag, key in (("--profile", "profile"), ("--project", "project"),
-                      ("--bank", "bank")):
-        val = str(cfg.get(key, "") or "").strip()
-        if val:
-            cmd += [flag, val]
-    if _as_bool(cfg.get("redact"), True):
-        cmd.append("--redact")
-    return cmd
+        return None, None  # misconfigured -> refuse to guess paths; stay inert
+    return root_cmd, None
+
+
+def _build_command(cfg: dict) -> list[str] | None:
+    return _build_commands(cfg)[0]
 
 
 def _export_command(cfg: dict) -> list[str] | None:
@@ -129,11 +162,18 @@ def main() -> int:
         data = {}
 
     cfg = _config()
-    cmd = _build_command(cfg)
-    if not cmd:
+    sid = str(data.get("session_id", "")).strip() if isinstance(data, dict) else ""
+    # sqlite_mode (default on): with a session_id, ingest the live session
+    # directly from Hermes state.db via the native adapter; without one (or
+    # with sqlite_mode: false) fall back to the JSONL store-root sync.
+    if sid:
+        cfg["_session_id"] = sid
+    cmd, fallback_cmd = _build_commands(cfg)
+    if not cmd and not fallback_cmd:
         return 0  # disabled or unconfigured: instant no-op, fail open
 
     job = {"cmd": cmd,
+           "fallback_cmd": fallback_cmd,
            "export_cmd": _export_command(cfg),
            "deadline_s": max(10, int(cfg.get("worker_seconds", 120))),
            "session_id": str(data.get("session_id", "")) if isinstance(data, dict) else ""}
@@ -146,33 +186,40 @@ def main() -> int:
     except Exception:
         # Last-resort synchronous fallback with a tiny bound; still non-fatal.
         try:
-            subprocess.run(cmd, timeout=10, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
+            subprocess.run(cmd or fallback_cmd or [], timeout=10,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
     return 0
 
 
 def _worker_main() -> int:
-    """Runs in the detached process: execute the queued commands with hard caps."""
+    """Runs in the detached process: execute the queued commands with hard caps.
+
+    Ingest order: primary cmd; if it exits non-zero and a JSONL fallback_cmd
+    exists, run that too. Export always attempts (honest pending semantics).
+    """
     try:
         job = json.loads(sys.stdin.read() or "{}")
     except Exception:
         return 0
     import time
     deadline = time.time() + max(10, int(job.get("deadline_s", 120)))
-    for step in ("cmd", "export_cmd"):
-        c = job.get(step)
+    steps = [job.get("cmd"), job.get("fallback_cmd"), job.get("export_cmd")]
+    for c in steps:
         if not isinstance(c, list) or not c:
             continue
         remaining = deadline - time.time()
         if remaining <= 0:
             break
         try:
-            subprocess.run(c, timeout=remaining, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
+            r = subprocess.run(c, timeout=remaining, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            # A successful primary ingest makes the fallback redundant.
+            if c is job.get("cmd") and r.returncode == 0:
+                job["fallback_cmd"] = None
         except Exception:
-            pass
+            continue
     return 0
 
 
