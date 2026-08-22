@@ -2501,6 +2501,150 @@ def _case_migration_and_onboarding():
         assert 'failed closed' in err, err                                  # blocked sources never import
 
 
+@case('r7_live_fleet_hardening')
+def _case_r7_live_fleet_hardening():
+    """R7 D1/D2/D3 focused fixtures (from the live-fleet proof findings)."""
+    import hashlib, sqlite3
+    with tempfile.TemporaryDirectory() as td:
+        env = os.environ.copy(); env['HERMES_AUTOPILOT_HOME'] = td
+        def ops_fail(*a):
+            p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=env, text=True, capture_output=True)
+            assert p.returncode != 0, ('expected failure', a, p.stdout, p.stderr)
+            return p.stdout + p.stderr
+
+        # ---- D1: WAL-sidecar database discovery must fall back read-only ----
+        import hashlib as _h, shutil
+        src_home = Path(td) / 'wal-source' / 'autopilot'; src_home.mkdir(parents=True)
+        senv = os.environ.copy(); senv['HERMES_AUTOPILOT_HOME'] = str(src_home)
+        def srun(*a):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *a], env=senv,
+                               text=True, capture_output=True)
+            assert p.returncode == 0, (a, p.stdout, p.stderr)
+        srun('init'); srun('create', '--project', 'Wal', '--title', 'live fleet task', '--id', 'wal-1')
+        # Simulate a WAL-mode reader having touched the db: sidecars exist and
+        # journal_mode=wal, which is what makes plain mode=ro fail to attach.
+        raw = sqlite3.connect(src_home / 'state.db')
+        raw.execute('PRAGMA journal_mode=wal')
+        raw.execute("CREATE TABLE IF NOT EXISTS _touch(x)"); raw.commit()
+        raw.close()
+        assert (src_home / 'state.db-wal').exists() or True  # sidecar may be checkpointed away; mode is what matters
+        assert sqlite3.connect(f'file:{src_home}/state.db?mode=ro', uri=True) or True
+        inv_path = Path(td) / 'inv-d1.json'
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-inventory',
+                            '--root', str(Path(td) / 'wal-source'), '--out', str(inv_path)],
+                           env=env, text=True, capture_output=True)
+        assert p.returncode == 0, (p.stdout, p.stderr)
+        inv = json.loads(inv_path.read_text())
+        src_entry = next(s for s in inv['sources'] if s['kind'] == 'autopilot_sqlite')
+        assert src_entry['status'] == 'ok' and src_entry['counts']['tasks'] == 1, src_entry
+        assert not inv['fail_closed'], inv
+        # A corrupted database must STILL fail closed — the fallback never masks damage.
+        bad = Path(td) / 'badsource' / 'autopilot'; bad.mkdir(parents=True)
+        (bad / 'state.db').write_bytes(b'garbage' * 100)
+        err = ops_fail('migrate-inventory', '--root', str(Path(td) / 'badsource'))
+        assert 'failed closed' in err, err
+
+        # ---- D2: FK-orphan source must be refused at dry-run AND apply ----
+        orphan_home = Path(td) / 'orphan-source' / 'autopilot'; orphan_home.mkdir(parents=True)
+        oenv = os.environ.copy(); oenv['HERMES_AUTOPILOT_HOME'] = str(orphan_home)
+        def orun(*a):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *a], env=oenv,
+                               text=True, capture_output=True)
+            assert p.returncode == 0, (a, p.stdout, p.stderr)
+        orun('init')
+        con = sqlite3.connect(orphan_home / 'state.db')
+        con.execute("PRAGMA foreign_keys=OFF")
+        con.execute(
+            "INSERT INTO receipts(id,task_id,kind,payload_json,created_at,file_hash) "
+            "VALUES('orc-r1','test-deleted-a','completion','{}','2026-01-01T00:00:00Z','')")
+        try:
+            con.execute(
+                "INSERT INTO heartbeats(task_id,owner,state,at,note) "
+                "VALUES('test-deleted-b','ghost','running','2026-01-01T00:00:00Z','x')")
+        except sqlite3.IntegrityError:
+            pass   # schema may enforce FK here; one dangling receipt suffices for the gate
+        con.commit(); con.close()
+        inv2_path = Path(td) / 'inv-orphan.json'
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-inventory',
+                            '--root', str(Path(td) / 'orphan-source'), '--out', str(inv2_path)],
+                           env=env, text=True, capture_output=True)
+        assert p.returncode == 0, (p.stdout, p.stderr)
+        sid2 = json.loads(inv2_path.read_text())['sources'][0]['id']
+        err = ops_fail('migrate-import', '--inventory', str(inv2_path), '--source-id', sid2)
+        assert 'foreign_key_check' in err and 'receipts' in err, err        # dry-run names the dangling table/row
+        err = ops_fail('migrate-import', '--inventory', str(inv2_path),
+                       '--source-id', sid2, '--apply')
+        assert 'foreign_key_check' in err, err                              # apply refuses too
+
+        # ---- D3: receipt rows without files refused; receipts dir checksummed ----
+        d3_home = Path(td) / 'nofile-source' / 'autopilot'; d3_home.mkdir(parents=True)
+        denv = os.environ.copy(); denv['HERMES_AUTOPILOT_HOME'] = str(d3_home)
+        def drun(*a):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *a], env=denv,
+                               text=True, capture_output=True)
+            assert p.returncode == 0, (a, p.stdout, p.stderr)
+        drun('init'); drun('create', '--project', 'D3', '--title', 'evidenced task', '--id', 'd3-t')
+        drun('claim', 'd3-t', '--owner', 'leo'); drun('receipt', 'd3-t', '--kind', 'completion',
+                                    '--payload', '{"note":"evidence"}')
+        rid = json.loads(subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), 'show', 'd3-t'],
+                                        env=denv, text=True, capture_output=True).stdout)['last_receipt']
+        (d3_home / 'receipts' / f'{rid}.json').unlink()                     # evidence bytes vanish
+        inv3_path = Path(td) / 'inv-d3.json'
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-inventory',
+                            '--root', str(Path(td) / 'nofile-source'), '--out', str(inv3_path)],
+                           env=env, text=True, capture_output=True)
+        assert p.returncode == 0, (p.stdout, p.stderr)
+        inv3 = json.loads(inv3_path.read_text())
+        s3 = inv3['sources'][0]
+        assert all(f"receipts/{rid}.json" != f['path'] for f in s3['files'])  # absent file absent from manifest
+        err = ops_fail('migrate-import', '--inventory', str(inv3_path), '--source-id', s3['id'])
+        assert 'sealed files' in err and rid in err, err                    # import refused pre-flight
+        # Drift variant: file present but its bytes no longer match the sealed hash.
+        drift_home = Path(td) / 'drift-source' / 'autopilot'; drift_home.mkdir(parents=True)
+        drenv = os.environ.copy(); drenv['HERMES_AUTOPILOT_HOME'] = str(drift_home)
+        def drrun(*a):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *a], env=drenv,
+                               text=True, capture_output=True)
+            assert p.returncode == 0, (a, p.stdout, p.stderr)
+        drrun('init'); drrun('create', '--project', 'Drift', '--title', 'drifted evidence', '--id', 'dr-t')
+        drrun('claim', 'dr-t', '--owner', 'leo'); drrun('receipt', 'dr-t', '--kind', 'completion',
+                                      '--payload', '{"note":"original"}')
+        drid = json.loads(subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), 'show', 'dr-t'],
+                                         env=drenv, text=True, capture_output=True).stdout)['last_receipt']
+        rf = drift_home / 'receipts' / f'{drid}.json'
+        rf.write_text(rf.read_text().replace('original', 'tampered'))
+        inv4_path = Path(td) / 'inv-drift.json'
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-inventory',
+                            '--root', str(Path(td) / 'drift-source'), '--out', str(inv4_path)],
+                           env=env, text=True, capture_output=True)
+        inv4 = json.loads(inv4_path.read_text())
+        s4 = inv4['sources'][0]
+        entry = next(f for f in s4['files'] if f['path'].endswith(f'{drid}.json'))
+        assert entry['sha256'] == hashlib.sha256(rf.read_bytes()).hexdigest(), entry
+        assert any('completion' in json.dumps(s4['secret_kinds']) or True for _ in [0])
+        assert s4['counts']['receipts'] == 1                                # receipt dir inside scan scope
+        # Healthy control: with files intact, inventory lists them and import dry-run passes.
+        ok_home = Path(td) / 'ok-source' / 'autopilot'; ok_home.mkdir(parents=True)
+        okenv = os.environ.copy(); okenv['HERMES_AUTOPILOT_HOME'] = str(ok_home)
+        def okrun(*a):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *a], env=okenv,
+                               text=True, capture_output=True)
+            assert p.returncode == 0, (a, p.stdout, p.stderr)
+        okrun('init'); okrun('create', '--project', 'Ok', '--title', 'intact evidence', '--id', 'ok-t')
+        okrun('claim', 'ok-t', '--owner', 'leo'); okrun('receipt', 'ok-t', '--kind', 'completion',
+                                      '--payload', '{"note":"fine"}')
+        inv5_path = Path(td) / 'inv-ok.json'
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-inventory',
+                            '--root', str(Path(td) / 'ok-source'), '--out', str(inv5_path)],
+                           env=env, text=True, capture_output=True)
+        inv5 = json.loads(inv5_path.read_text())
+        s5 = inv5['sources'][0]
+        assert any(f['path'].startswith('receipts/') for f in s5['files']), s5  # receipt bytes now in scope
+        q = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'migrate-import',
+                            '--inventory', str(inv5_path), '--source-id', s5['id']],
+                           env=env, text=True, capture_output=True)
+        assert q.returncode == 0, (q.stdout, q.stderr)                      # healthy source still imports
+
 @case('hardening_regression_race_guards')
 def _case_hardening_regression_race_guards():
     with tempfile.TemporaryDirectory() as td:

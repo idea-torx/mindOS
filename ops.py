@@ -1454,24 +1454,52 @@ def _classify_sqlite(path: Path):
     'ambiguous' for valid SQLite that is not an Autopilot schema — the caller
     fails closed on anything other than 'ok'.
     """
-    try:
-        c = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=5)
-    except sqlite3.Error as e:
-        return 'corrupted', [f'{type(e).__name__}: {e}'], {}
+    # D1 (R7 live-fleet finding): a database touched by any WAL-mode reader
+    # carries -shm/-wal sidecars that a plain mode=ro connection cannot attach
+    # (SQLite must create/write the shm file), so discovery of exactly the
+    # live homes this migrator exists to read failed closed as 'corrupted'.
+    # Note sqlite3.connect is lazy — the open failure surfaces at the first
+    # statement — so each candidate URI is fully exercised (integrity check
+    # included) before falling back. Fallback order, all strictly read-only
+    # against the SOURCE:
+    #   1. mode=ro  — the normal case, WAL-aware when sidecars are writable;
+    #   2. mode=ro&immutable=1 — zero-sidecar snapshot view; only trusted
+    #     after an explicit integrity_check passes on that same connection,
+    #     so a torn/WAL-divergent file is still reported corrupted rather
+    #     than silently read at a possibly stale snapshot. The open mode
+    #     actually used is returned so the sealed inventory can report it
+    #     honestly instead of implying a plain read-only attach.
+    opened, mode_note, open_err = None, '', None
+    for uri in (f'file:{path}?mode=ro', f'file:{path}?mode=ro&immutable=1'):
+        try:
+            c = sqlite3.connect(uri, uri=True, timeout=5)
+            if c.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                raise ValueError('integrity_check failed')   # never trust an unsound snapshot
+            c.close()
+            opened = uri
+            mode_note = 'immutable=1 fallback' if 'immutable' in uri else ''
+            break
+        except (sqlite3.Error, ValueError) as e:
+            open_err = e
+            continue
+    if opened is None:
+        detail = f'{type(open_err).__name__}: {open_err}' if open_err else 'unable to open database file read-only'
+        return 'corrupted', [detail], {}, ''
+    c = sqlite3.connect(opened, uri=True, timeout=5)
     try:
         result = c.execute('PRAGMA integrity_check').fetchone()[0]
         if result != 'ok':
-            return 'corrupted', [f'integrity_check: {result}'], {}
+            return 'corrupted', [f'integrity_check: {result}'], {}, mode_note
         names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if 'tasks' not in names:
-            return 'ambiguous', ['valid sqlite without the Autopilot schema'], {}
+            return 'ambiguous', ['valid sqlite without the Autopilot schema'], {}, mode_note
         counts = {t: c.execute(f'SELECT COUNT(*) AS n FROM "{t}"').fetchone()[0]
                   for t in ('tasks', 'notes', 'handoffs', 'receipts',
                             'heartbeats', 'task_deps', 'audit_events')
                   if t in names}
-        return 'ok', [], counts
+        return 'ok', [], counts, mode_note
     except sqlite3.Error as e:
-        return 'corrupted', [f'{type(e).__name__}: {e}'], {}
+        return 'corrupted', [f'{type(e).__name__}: {e}'], {}, mode_note
     finally:
         c.close()
 
@@ -1566,10 +1594,30 @@ def migrate_inventory(args=None):
     for kind, path in _discover_migration_sources(root):
         status, problems, counts = 'ok', [], {}
         if kind in ('autopilot_sqlite', 'unknown_sqlite'):
-            status, problems, counts = _classify_sqlite(path)
+            status, problems, counts, open_mode = _classify_sqlite(path)
+            # D1 honesty: when discovery needed the immutable=1 fallback, the
+            # sealed inventory says so (and that integrity_check passed on
+            # that view) instead of presenting a plain read-only attach.
+            if status == 'ok' and open_mode:
+                problems = [f'discovery used {open_mode} after mode=ro could not attach; '
+                            'integrity_check passed on the immutable snapshot']
         files, truncated = _scan_source_files(
             path.parent if path.is_file() else path.parent if kind == 'autopilot_sqlite' else path,
             path)
+        # D3 (R7 live-fleet finding): migrate-import restores receipt FILES
+        # from <db_dir>/receipts/, so those bytes are part of the source's
+        # migration surface even though they are not adjacent to state.db.
+        # Include them in the same checksummed, secret-scanned scope so a
+        # missing or drifted receipt file is visible at stage one instead of
+        # surfacing later as doctor receipt_file_missing findings post-import.
+        if kind == 'autopilot_sqlite':
+            receipts_dir = path.parent / 'receipts'
+            if receipts_dir.is_dir():
+                extra, extra_trunc = _scan_source_files(path.parent, receipts_dir)
+                seen = {f['path'] for f in files}
+                files += [f for f in extra if f['path'] not in seen]
+                truncated = truncated or extra_trunc
+                files.sort(key=lambda f: f['path'])
         kinds = sorted({k for f in files for k in f['secret_kinds']})
         if problems or truncated:
             problems = list(problems)
@@ -1777,11 +1825,42 @@ def migrate_import(args=None):
     dry = not getattr(args, 'apply', False)
     autopilot.ensure()
     try:
-        src = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=5)
+        src = sqlite3.connect(f'file:{db_path}?mode=ro&immutable=1', uri=True, timeout=5)
         src.row_factory = sqlite3.Row
         integrity = src.execute('PRAGMA integrity_check').fetchone()[0]
         if integrity != 'ok':
             raise SystemExit(f'source integrity check failed at import time: {integrity}')
+        # D2 (R7 live-fleet finding): the live fleet carried receipts and a
+        # heartbeat pointing at deleted tasks. The dry-run plan reported them
+        # as importable and --apply died mid-transaction on the FK constraint
+        # (clean rollback, but no migration). Fail closed HERE, in both
+        # dry-run and apply, naming every dangling row — detection and an
+        # explicit refusal is this tool's whole job; live remediation of
+        # orphan rows stays a separate approved operation.
+        fk_violations = []
+        for r in src.execute('PRAGMA foreign_key_check').fetchall():
+            # Column count varies by SQLite build (3 vs 6 columns); normalize.
+            v = {'table': r[0], 'rowid': r[1], 'referred_table': r[2],
+                 'fkid': r[3] if len(r) > 3 else '', 'parent': r[4] if len(r) > 4 else '',
+                 'fk': r[5] if len(r) > 5 else ''}
+            fk_violations.append(v)
+        if fk_violations:
+            raise SystemExit(
+                'source database fails PRAGMA foreign_key_check; refusing to import '
+                '(apply would abort mid-transaction and the dry-run plan would be false):\n  '
+                + '\n  '.join(f"{v['table']} rowid={v['rowid']} -> missing "
+                              f"{v['referred_table']} ({v['parent']})"
+                              for v in sorted(map(dict, fk_violations), key=lambda v: (
+                                  v['table'], v['rowid'])))
+                + '\nResolve orphaned rows in the source first (an approved remediation '
+                  'operation); this tool detects and refuses but never repairs live data.')
+        # D3 companion gate: receipt ROWS whose sealed file does not exist in
+        # the source home would import fine and then fail doctor with
+        # receipt_file_missing forever. Inventory checksums the receipts
+        # directory (above), so absence/drift is visible at stage one; here we
+        # refuse to offer an import that would insert evidence without files.
+        # Rows whose task is gone entirely are NOT gated here: they follow the
+        # documented orphan-receipt quarantine accounting instead.
         tgt = sqlite3.connect(DB, timeout=10)
         tgt.row_factory = sqlite3.Row
         tgt.execute('PRAGMA foreign_keys=ON')
@@ -1813,6 +1892,24 @@ def migrate_import(args=None):
         hb_count = src.execute('SELECT COUNT(*) FROM heartbeats').fetchone()[0] \
             if 'heartbeats' in {r[0] for r in src.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")} else 0
+        # D3 companion gate: a receipt ROW whose sealed file does not exist in
+        # the source home would import fine and then fail doctor with
+        # receipt_file_missing forever. Inventory checksums the receipts
+        # directory (above), so absence/drift is visible at stage one; here we
+        # refuse to offer an import that would insert evidence without files.
+        # Rows whose task is gone entirely are NOT gated here: they follow the
+        # documented orphan-receipt quarantine accounting instead.
+        src_task_ids = {r['id'] for r in rows['tasks']}
+        missing_receipt_files = sorted(
+            r['id'] for r in rows['receipts']
+            if r.get('task_id') in src_task_ids
+            and not (db_path.parent / 'receipts' / f"{r['id']}.json").exists())
+        if missing_receipt_files:
+            raise SystemExit(
+                'source carries receipt rows without their sealed files '
+                f'(<source>/receipts/): {", ".join(missing_receipt_files)}; importing '
+                'would create unresolvable receipt_file_missing findings. Restore the '
+                'receipt files or quarantine those rows before migrating.')
         sanitized_ids = sorted(r['id'] for r in rows['tasks']
                                if r['status'] in WORKORDER_ACTIVE_STATUSES)
         for r in rows['tasks']:
