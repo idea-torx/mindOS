@@ -125,7 +125,8 @@ def fetch_session(store: SqliteStoreRef, session_id: str,
             raise LookupError(f"session_id not found in {store.path}: {session_id!r}")
         rows = con.execute(
             "SELECT role, content, timestamp, active, compacted "
-            "FROM messages WHERE session_id=? ORDER BY id ASC LIMIT ?",
+            "FROM messages WHERE session_id=? AND active=1 AND compacted=0 "
+            "ORDER BY id ASC LIMIT ?",
             (session_id, max_messages)).fetchall()
     finally:
         con.close()
