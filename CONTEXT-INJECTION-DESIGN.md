@@ -80,6 +80,45 @@ the command prints `{"enabled": false}` and exits 0 without reading sources.
 Absent the env kill-switch the tool is opt-in by invocation — nothing calls
 it unless a session-start hook or operator does.
 
+## Session-start integration (host context path)
+
+Lifecycle inspection findings (hermes-agent):
+
+- `agent/conversation_loop.py` fires the plugin hook `on_session_start` once
+  per brand-new session — but discards its return value: it is observer-only
+  and has **no context channel**.
+- `agent/turn_context.py` consumes `pre_llm_call` hook results of shape
+  `{"context": "..."}` and injects them **ephemerally into the current turn's
+  user message** (never persisted to the session DB; system prompt untouched).
+  `is_first_turn=True` marks exactly one turn per new session.
+- Shell hooks receive `extra.is_first_turn`
+  (`agent/shell_hooks._serialize_payload`) and `_parse_response` passes a
+  `{"context": ...}` stdout through for any event;
+  `pre_llm_call` is shell-hookable (not in `SHELL_UNSUPPORTED_HOOKS`).
+
+Integration (`mindos_gateway_hook.py`, same script, second wiring): with
+`mindos_bridge.context_pack: true` in config.yaml, a `pre_llm_call` shell-hook
+invocation whose `extra.is_first_turn` is truthy runs
+`mindos_context_pack.py session-pack` synchronously under a wall-clock cap
+(`context_pack_seconds`, default 15) and prints `{"context": <pack rendered
+as deterministic markdown>}`. The HOST then injects it once at session start.
+
+Properties by construction:
+
+- no synthetic user messages after turn 1 (continuation turns print nothing);
+- no per-turn rewriting and no prompt-cache breakage (the system prompt is
+  never touched; the host's own injection channel is ephemeral);
+- no role-alternation change (host appends into the existing user message);
+- zero live-state writes (pack generation is read-only; no `--out`);
+- opt-in per profile home via `context_pack: true` (default off), with
+  `context_pack_max_bytes` (default 4096); the `HERMES_MINDOS_CONTEXT=off`
+  kill switch is honored end-to-end (pack tool prints `{"enabled": false}`,
+  hook emits nothing);
+- fail-open: any pack-tool failure or timeout prints nothing — the reply path
+  is never blocked.
+
+Focused proof: `tests_context_integration.py`.
+
 ## Live sentinel (proof without touching live runtime)
 
 `mindos_context_pack.py sentinel` builds an entirely disposable fixture

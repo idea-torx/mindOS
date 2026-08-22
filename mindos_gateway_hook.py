@@ -18,6 +18,11 @@ Wired from config.yaml (ACTIVE Hermes home, honors HERMES_HOME)::
       export_on_sync: true      # also write the pending-export manifest (GET-only honesty)
       export_out: ""            # manifest path (default <mindos home>/bridge-exports/latest.jsonl)
       worker_seconds: 120       # hard wall-clock cap for the detached worker
+      context_pack: false       # opt-in: answer pre_llm_call first-turn with a
+                                # MindOS session-start pack via the host's
+                                # ephemeral plugin-context channel (read-only)
+      context_pack_max_bytes: 4096
+      context_pack_seconds: 15  # wall-clock cap for pack generation
 
 Contract honored:
 - Reads ONLY shell-hook stdin metadata (session_id, platform). Message contents never
@@ -29,6 +34,25 @@ Contract honored:
 - Non-blocking: actual work runs in a detached grandchild process with a hard
   wall-clock kill; this parent exits immediately so the gateway reply path is never
   delayed by bridge failure or slowness. The batch `watch` fallback remains available.
+
+Session-start context injection (opt-in, separate from ingest):
+- Hermes fires the shell hook `pre_llm_call` every turn; `extra.is_first_turn`
+  is true exactly once, at the first turn of a brand-new session. That is the
+  new-session boundary used here. (`on_session_start` exists but its return
+  value is discarded by agent/conversation_loop.py — it has no context
+  channel; `pre_llm_call` results shaped {"context": "..."} are injected by
+  agent/turn_context.py ephemerally into the current turn's user message,
+  never persisted to the session DB and never touching the system prompt.)
+- With `context_pack: true` in the mindos_bridge block (default off) and only
+  on the first turn, this hook runs mindos_context_pack.py session-pack
+  synchronously under a hard wall-clock cap and prints {"context": <pack
+  markdown>} so the HOST injects it once at session start. No synthetic
+  messages are added after turn 1 (empty stdout), no per-turn rewriting, no
+  prompt-cache breakage (system prompt byte-stable), no role alternation
+  change (host appends into the existing user message), and zero writes:
+  pack generation is read-only and no --out is passed.
+- HERMES_MINDOS_CONTEXT=off|0|false|no is honored end-to-end: the pack tool
+  prints {"enabled": false} and this hook emits nothing.
 """
 from __future__ import annotations
 
@@ -39,6 +63,8 @@ import sys
 from pathlib import Path
 
 HOOK_DIR = Path(__file__).resolve().parent
+PACK_TOOL = HOOK_DIR / "mindos_context_pack.py"
+PACK_FORMAT = "mindos-session-context-pack-v1"
 
 
 def _config() -> dict:
@@ -153,6 +179,87 @@ def _export_command(cfg: dict) -> list[str] | None:
     return cmd
 
 
+def _render_context_markdown(pack: dict) -> str:
+    """Deterministic bounded markdown rendering of a sealed context pack.
+
+    Provenance survives injection: format, digest, generated_at, scope,
+    budget, per-section statuses (ok/empty/unavailable/refused-secret) and
+    the refused-secret counts. Item lines are compact sorted-key JSON so an
+    unchanged state renders byte-stably.
+    """
+    budget = pack.get("budget", {})
+    lines = [
+        "# MindOS session context",
+        f"format: {pack.get('format', '')}",
+        f"digest: {pack.get('digest', '')}",
+        f"generated_at: {pack.get('generated_at', '')}",
+        f"scope: profile={pack.get('profile', '*')} project={pack.get('project', '*')}",
+        f"budget: used={budget.get('used_bytes', 0)}/{budget.get('max_bytes', 0)} bytes "
+        f"items<={budget.get('max_items', 0)} truncated={bool(budget.get('truncated'))}",
+    ]
+    sources = pack.get("sources", {})
+    for section in ("temporal_facts", "handoffs", "receipts", "session_context",
+                    "semantic"):
+        meta = sources.get(section, {})
+        lines.append(
+            f"## {section} status={meta.get('status', 'unknown')} "
+            f"packed={meta.get('packed_items', 0)}/{meta.get('requested_items', 0)}")
+        for item in pack.get("sections", {}).get(section, []):
+            lines.append("- " + json.dumps(item, sort_keys=True,
+                                           separators=(",", ":")))
+    refused = pack.get("refused_secret_items") or {}
+    if refused:
+        lines.append("refused-secret-items: " + json.dumps(refused, sort_keys=True))
+    return "\n".join(lines)
+
+
+def _session_context_response(cfg: dict, data: dict) -> str | None:
+    """First-turn-only MindOS pack via the host pre_llm_call context channel.
+
+    Returns the stdout JSON string {"context": ...} or None for a silent
+    no-op. Fail-open: any failure prints nothing and returns exit 0 — the
+    reply path can never be blocked or delayed beyond the wall-clock cap.
+    """
+    if not _as_bool(cfg.get("context_pack"), False):
+        return None
+    extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
+    if not _as_bool(extra.get("is_first_turn"), False):
+        return None  # continuation turn: silent no-op, cache stays warm
+
+    cmd = [sys.executable, str(PACK_TOOL), "session-pack"]
+    for flag, key in (("--profile", "profile"), ("--project", "project")):
+        val = str(cfg.get(key, "") or "").strip()
+        if val:
+            cmd += [flag, val]
+    if _as_bool(cfg.get("redact"), True):
+        cmd.append("--redact")
+    try:
+        max_bytes = max(256, int(cfg.get("context_pack_max_bytes", 4096)))
+    except (TypeError, ValueError):
+        max_bytes = 4096
+    cmd += ["--max-bytes", str(max_bytes)]
+    try:
+        cap = max(5, int(cfg.get("context_pack_seconds", 15)))
+    except (TypeError, ValueError):
+        cap = 15
+    try:
+        r = subprocess.run(cmd, timeout=cap, text=True,
+                           capture_output=True)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        pack = json.loads(r.stdout)
+    except Exception:
+        return None
+    if not isinstance(pack, dict) or \
+            pack.get("format") != PACK_FORMAT or pack.get("enabled") is not True:
+        # Includes the HERMES_MINDOS_CONTEXT=off kill-switch response.
+        return None
+    return json.dumps({"context": _render_context_markdown(pack)})
+
+
 def main() -> int:
     # Drain stdin (hook protocol) but keep only metadata — never message content.
     try:
@@ -162,6 +269,18 @@ def main() -> int:
         data = {}
 
     cfg = _config()
+    event = str(data.get("hook_event_name", "") or "").strip() \
+        if isinstance(data, dict) else ""
+    if event == "pre_llm_call":
+        # Session-start context path: synchronous but wall-clock capped,
+        # read-only, fail-open. Empty stdout = silent no-op for the host.
+        try:
+            out = _session_context_response(cfg, data)
+        except Exception:
+            out = None
+        if out:
+            sys.stdout.write(out + "\n")
+        return 0
     sid = str(data.get("session_id", "")).strip() if isinstance(data, dict) else ""
     # sqlite_mode (default on): with a session_id, ingest the live session
     # directly from Hermes state.db via the native adapter; without one (or
