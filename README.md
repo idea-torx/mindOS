@@ -1744,6 +1744,29 @@ concurrency and false-success seams it found:
   `HERMES_AUTOPILOT_HOME` instead of a hardcoded live-home path; `ops.py` is
   importable (`__main__`-guarded) for in-process testing.
 
+## Semantic recall (Hindsight adapter)
+
+Optional semantic memory behind the same shape as sessions/facts. The bank is a
+JSONL file at `$HERMES_HINDSIGHT_HOME/bank.jsonl` (default
+`~/.hermes/hindsight/bank.jsonl`), one memory per line:
+`{"id","text","kind","project","created_at","tags"}` (bank v1).
+
+- **Recall (`--related-semantic N`)** on `context`, `recall`,
+  `recall-verify`, `resume`, and `next --claim` packs up to N matching memories
+  under the same budget as other sections, each row carrying its own engine tag
+  (`hindsight-bank-v1`) so staleness detection covers the semantic section.
+  Ordering is deterministic (`created_at DESC`, then id) so digests are exactly
+  recomputable; project scoping prefers same-project/project-less memories;
+  torn bank lines degrade silently instead of failing recall.
+- **Unavailable is healthy**: with no bank configured the flag is a no-op and
+  `ops.py doctor` reports hindsight as a note (`status: unavailable`), never a
+  problem.
+- **Retain (`hindsight-retain`)** appends to the bank behind the same secret
+  guard as notes (`--redact` stores placeholders, `--allow-secret` overrides,
+  both audited); it refuses without `--create` when no bank exists so a typo'd
+  environment never forks an accidental memory store. Retains are audited in
+  the Autopilot ledger with the memory id.
+
 ## Next integration
 
 The hourly control tower should read this registry and report task changes. Existing project-specific policies should be added under `policies/` before allowing automatic side effects.
