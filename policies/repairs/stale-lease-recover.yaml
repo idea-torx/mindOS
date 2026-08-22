@@ -1,0 +1,8 @@
+# Tier-1 stale lease repair: recover leases expired past their window.
+trigger: doctor_stale_lease
+preconditions: lease_expires_at in the past while status is claimed/running/waiting_for_agent
+command: recover
+rollback_command: recover --dry-run
+receipt_kind: repair
+blast_radius_tier: 1
+requires_user: false

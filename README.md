@@ -1551,8 +1551,7 @@ python3 "$O" migrate-import --inventory inventory.json --source-id src-… --app
 Design rules, enforced and tested:
 
 - **Dry-run first**: without `--apply` nothing is written; the plan reports
-  per-table source/already-present counts, sanitized tasks, quarantined
-  orphan receipts, secret kinds,
+  per-table source/already-present counts, sanitized tasks, secret kinds,
   skipped disposable heartbeats, and whether the target would need
   `--relink-audit`.
 - **Idempotent**: an identical re-run deduplicates to nothing (`deduplicated:
@@ -1563,21 +1562,12 @@ Design rules, enforced and tested:
   `waiting_for_agent`) are reset to `queued` with leases cleared, because the
   prior owner does not exist here; heartbeats are disposable liveness cache
   and are deliberately not carried.
-- **Orphan receipts are quarantined, never attached**: disposable verification
-  receipts routinely outlive their tasks, and a source can carry receipt rows
-  whose `task_id` matches no task in the source tasks table (or this home).
-  Importing one would violate foreign-key integrity; the forbidden
-  alternatives — weakening the key, inventing a task, or re-pointing evidence
-  at a guess — are exactly how broken execution truth gets created. So an
-  orphan is withheld from the import entirely: it appears in the dry-run
-  plan and the sealed result doc with its identity, kind, `file_hash`, and a
-  sha256 of the full row (`orphan_receipts_quarantined`), it is recorded in a
-  digest-only audited `migration_orphan_receipt_quarantined` event so no
-  secret value ever enters the ledger, its bytes stay behind in the immutable
-  source home, the coverage health check excludes it from the receipts
-  expectation, and the rollback journal never contains it (there is nothing
-  to undo). A receipt whose task already exists here imports normally,
-  attached to that task by identity.
+- **FK-orphan refusal**: before either dry-run or apply, the source is checked
+  with `PRAGMA foreign_key_check`. Any dangling receipt, heartbeat, or other
+  foreign-key row is named and refused; the importer never weakens constraints,
+  invents tasks, attaches evidence by guess, or repairs the source in place.
+  Resolve the source separately through an approved remediation path, then
+  re-seal the inventory.
 - **Audit-chain integrity**: a fresh home imports the source chain verbatim;
   a home with genuine history refuses to merge a foreign chain (that would
   break tamper evidence) unless `--relink-audit` explicitly relinks the
@@ -1879,6 +1869,29 @@ read-only doctor sweep first (audit chain, sealed checkpoints under
 `<home>/backups`, stale leases) — selection fails closed naming every problem,
 so a default switch only ever follows verified health. Deselecting is the
 one-command rollback; the old home's data is never mutated by any of this.
+
+## Semantic recall (Hindsight adapter)
+
+Optional semantic memory behind the same shape as sessions/facts. The bank is a
+JSONL file at `$HERMES_HINDSIGHT_HOME/bank.jsonl` (default
+`~/.hermes/hindsight/bank.jsonl`), one memory per line:
+`{"id","text","kind","project","created_at","tags"}` (bank v1).
+
+- **Recall (`--related-semantic N`)** on `context`, `recall`,
+  `recall-verify`, `resume`, and `next --claim` packs up to N matching memories
+  under the same budget as other sections, each row carrying its own engine tag
+  (`hindsight-bank-v1`) so staleness detection covers the semantic section.
+  Ordering is deterministic (`created_at DESC`, then id) so digests are exactly
+  recomputable; project scoping prefers same-project/project-less memories;
+  torn bank lines degrade silently instead of failing recall.
+- **Unavailable is healthy**: with no bank configured the flag is a no-op and
+  `ops.py doctor` reports hindsight as a note (`status: unavailable`), never a
+  problem.
+- **Retain (`hindsight-retain`)** appends to the bank behind the same secret
+  guard as notes (`--redact` stores placeholders, `--allow-secret` overrides,
+  both audited); it refuses without `--create` when no bank exists so a typo'd
+  environment never forks an accidental memory store. Retains are audited in
+  the Autopilot ledger with the memory id.
 
 ## Next integration
 

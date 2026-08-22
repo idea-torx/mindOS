@@ -1,0 +1,6 @@
+source database fails PRAGMA foreign_key_check; refusing to import (apply would abort mid-transaction and the dry-run plan would be false):
+  heartbeats rowid=1 -> missing tasks ()
+  receipts rowid=1 -> missing tasks ()
+  receipts rowid=2 -> missing tasks ()
+Resolve orphaned rows in the source first (an approved remediation operation); this tool detects and refuses but never repairs live data.
+exit=1
