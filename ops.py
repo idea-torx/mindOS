@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Autopilot v1.1 safe operations: recovery, approvals, reconciliation, reports."""
 from __future__ import annotations
-import json, os, re, sqlite3, subprocess, sys, tempfile, urllib.request, hashlib
-import contextlib, io
+import json, os, re, shlex, sqlite3, subprocess, sys, tempfile, urllib.request, hashlib
+import contextlib, io, uuid
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2460,6 +2460,338 @@ def policy(args):
     requires=key in text
     print(json.dumps({'project':args.project,'action':args.action,'allowed':not requires,'requires_user':requires,'policy':str(path)}))
 
+# ---------------------------------------------------------------------------
+# §3 minimum slice: sense → playbook repair → breaker → learning.
+#
+# `sense` is ONE sweep that reuses the existing read-only checks (doctor,
+# verify-chain, recall-stale, unverified-completions) and folds their outputs
+# into typed findings: each carries an id, a severity, the concrete evidence,
+# and the repair kind that can fix it. A finding's identity is a content hash
+# over its kind + evidence, so the same defect recurring produces the same
+# hash — exactly what the repair circuit breaker counts.
+# ---------------------------------------------------------------------------
+
+SEVERITY_BY_PROBLEM_KIND = {
+    'audit_chain_break': 'P0',
+    'receipt_file_hash_mismatch': 'P1',
+    'checkpoint_file_invalid': 'P1',
+    'last_receipt_dangling': 'P1',
+    'stale_lease': 'P1',
+    'receipt_file_missing': 'P2',
+    'receipt_row_missing': 'P2',
+    'fts_index_drift': 'P2',
+    'fact_task_missing': 'P2',
+    'multiple_live_handoffs': 'P2',
+    'supersede_target_missing': 'P3',
+    'handoff_supersede_target_missing': 'P3',
+    'orphan_dependency': 'P3',
+    'orphan_note': 'P3',
+    'orphan_handoff': 'P3',
+}
+
+# Problem kinds that have a shipped playbook (everything else is reported for
+# a human — sense never improvises repairs).
+REPAIR_KIND_BY_PROBLEM_KIND = {
+    'fts_index_drift': 'fts-rebuild',
+    'stale_lease': 'stale-lease-recover',
+}
+
+
+def _make_finding(kind, severity, evidence, repair_kind=''):
+    """Content-hashed finding identity: same defect ⇒ same hash ⇒ recurrence
+    is observable by exact equality instead of fuzzy matching."""
+    body = json.dumps({'kind': kind, 'evidence': evidence}, sort_keys=True)
+    h = hashlib.sha256(body.encode()).hexdigest()[:16]
+    return {'id': f'find-{h}', 'hash': h, 'kind': kind, 'severity': severity,
+            'evidence': evidence,
+            **({'suggested_repair': repair_kind} if repair_kind else {})}
+
+
+def _problem_finding(p):
+    kind = p.get('kind', 'unknown')
+    sev = SEVERITY_BY_PROBLEM_KIND.get(
+        kind, 'P2' if kind == 'audit_chain_break' else 'P3')
+    return _make_finding(f'doctor_{kind}', sev, p,
+                         REPAIR_KIND_BY_PROBLEM_KIND.get(kind, ''))
+
+
+def sense(args=None):
+    """One typed-finding sweep over the fleet's existing consistency checks.
+
+    Read-only. Reuses doctor, verify-chain, recall-stale, and
+    unverified-completions verbatim (in-process, via _capture_json) rather
+    than reimplementing any check, then maps each concrete problem onto a
+    typed finding with a stable content hash. Findings whose kind matches a
+    shipped repair playbook carry `suggested_repair`; everything else is
+    surfaced at its severity for a human.
+    """
+    findings = []
+    doctor_doc = _capture_json(doctor)
+    for p in doctor_doc.get('problems', []):
+        findings.append(_problem_finding(p))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        autopilot.verify_chain(SimpleNamespace(checkpoint=''))
+    chain = json.loads(buf.getvalue())
+    for p in chain.get('problems', []):
+        findings.append(_make_finding('audit_chain_break', 'P0', p))
+    rs = _capture_json(recall_stale)
+    for item in rs.get('items', []):
+        if item.get('state') == 'stale':
+            findings.append(_make_finding('recall_stale', 'P3', item))
+    uv = _capture_json(unverified_completions)
+    for item in uv.get('items', []):
+        findings.append(_make_finding(f"unverified_{item.get('kind')}", 'P2', item))
+    counts = {}
+    for f in findings:
+        counts[f['severity']] = counts.get(f['severity'], 0) + 1
+    print(json.dumps({'ok': True, 'generated_at': utc(), 'count': len(findings),
+                      'by_severity': counts, 'findings': findings},
+                     sort_keys=True))
+
+
+def _repairs_dir():
+    # Playbooks ship in-tree next to ops.py; a HERMES_AUTOPILOT_HOME
+    # policies/repairs directory overrides them so isolated/test homes can
+    # inject their own without touching the shipped files.
+    d = autopilot.POLICIES / 'repairs'
+    return d if d.exists() else Path(__file__).parent / 'policies' / 'repairs'
+
+
+def _parse_flat_yaml(text):
+    """Minimal flat `key: value` reader for playbook files (no nested shapes,
+    no dependencies): strips comments, splits on the first ': '."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or ':' not in line:
+            continue
+        k, v = line.split(':', 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _load_playbooks():
+    d = _repairs_dir()
+    if not d.exists():
+        return {}
+    return {p.stem: _parse_flat_yaml(p.read_text()) for p in sorted(d.glob('*.yaml'))}
+
+
+def _breaker_fact_id(kind):
+    return f'playbook:{kind}'
+
+
+def _live_breaker(c, kind):
+    t = utc()
+    row = c.execute(
+        "SELECT id FROM facts WHERE subject=? AND predicate='breaker-tripped' "
+        f"AND {autopilot._fact_live_sql()}", (_breaker_fact_id(kind), t)).fetchone()
+    return row['id'] if row else ''
+
+
+def _repair_count(c, finding_hash, window_hours):
+    since = (datetime.now(timezone.utc)
+             - timedelta(hours=window_hours)).replace(microsecond=0).isoformat()
+    return c.execute(
+        "SELECT COUNT(*) n FROM audit_events WHERE action='repair_completed' "
+        "AND payload_json LIKE ? AND created_at>=?",
+        ('%"finding_hash": "' + finding_hash + '"%', since)).fetchone()['n']
+
+
+def _trip_breaker(c, pb_name, finding_hash, window_hours):
+    """A playbook stuck in a repair loop stops being a repair: disable it by
+    recording a live breaker fact with a validity window, open a P0
+    investigate task, and leave an audited trail."""
+    t = utc()
+    fid = uuid.uuid4().hex
+    valid_until = (datetime.now(timezone.utc)
+                   + timedelta(hours=24)).replace(microsecond=0).isoformat()
+    c.execute(
+        "INSERT INTO facts(id,subject,predicate,object,source,task_id,valid_from,valid_until,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
+        (fid, _breaker_fact_id(pb_name), 'breaker-tripped', 'true', 'ops-sense',
+         '', t, valid_until, t))
+    autopilot.audit(c, 'fact', fid, 'circuit_breaker_tripped',
+                    {'playbook': pb_name, 'finding_hash': finding_hash,
+                     'repeat_window_hours': window_hours, 'valid_until': valid_until})
+    task_id = f'investigate-{pb_name}-{finding_hash[:8]}'
+    ct = utc()
+    try:
+        c.execute(
+            "INSERT INTO tasks(id,project,title,description,owner,status,priority,"
+            "next_action,due_at,not_before,tags,requires_receipts,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (task_id, 'Repairs', f'Investigate recurring finding {pb_name}',
+             f'Circuit breaker tripped: playbook {pb_name} repaired finding '
+             f'{finding_hash} repeatedly within the window; root-cause before '
+             're-enabling.', 'ops-sense', 'queued', 'P0',
+             'root-cause the recurring finding', '', '', '[]', '[]', ct, ct))
+    except sqlite3.IntegrityError:
+        cur = c.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        task_id = cur['id'] if cur else task_id
+    autopilot.audit(c, 'task', task_id, 'created',
+                    {'project': 'Repairs', 'owner': 'ops-sense', 'priority': 'P0',
+                     'reason': 'circuit_breaker_tripped'})
+    return {'breaker_fact_id': fid, 'investigate_task': task_id,
+            'valid_until': valid_until}
+
+
+def repair(args):
+    """Execute a playbook repair as a normal leased task.
+
+    The whole lifecycle is the ordinary queue's: create → claim (lease) → run
+    the playbook command → seal a receipt of the playbook's required kind →
+    complete citing that receipt. Gates run before anything mutates:
+
+    - breaker: a live breaker fact for this playbook refuses execution;
+      `--break-after` repeats of the same finding hash within
+      `--window-hours` trip the breaker instead of repairing again;
+    - blast-radius tier policy: a playbook marked requires_user in its
+      policies/repairs file refuses until --approved-by names the human
+      (the same policies-file shape as merge/deploy gates);
+    - idempotence: the deterministic task id makes a double-submit of the
+      same repair attempt a refusal, not a duplicate task.
+    """
+    name = args.playbook
+    pbs = _load_playbooks()
+    if name not in pbs:
+        raise SystemExit(f'unknown repair playbook: {name} '
+                         f'(known: {", ".join(sorted(pbs)) or "none"})')
+    pb = pbs[name]
+    dry = bool(getattr(args, 'dry_run', False))
+    threshold = getattr(args, 'break_after', 3)
+    window_hours = getattr(args, 'window_hours', 24.0)
+    cmd = shlex.split(pb['command'])
+    rollback = shlex.split(pb.get('rollback_command', ''))
+    finding_hash = getattr(args, 'finding_hash', '') or ''
+    plan = {'playbook': name, 'tier': int(pb.get('blast_radius_tier', '0')),
+            'command': cmd, 'rollback_command': rollback,
+            'receipt_kind': pb.get('receipt_kind', '')}
+    if dry:
+        plan.update({'ok': True, 'dry_run': True})
+        print(json.dumps(plan, sort_keys=True))
+        return
+    with db() as c:
+        breaker = _live_breaker(c, name)
+        if breaker:
+            raise SystemExit(f'playbook disabled by circuit breaker (fact {breaker}); '
+                             'investigate before re-enabling')
+        if finding_hash:
+            n = _repair_count(c, finding_hash, window_hours)
+            if n >= threshold:
+                # Trip on its own connection: the refusal below must not roll
+                # the breaker's durable record back with the refused repair.
+                with db() as bc:
+                    trip = _trip_breaker(bc, name, finding_hash, window_hours)
+                raise SystemExit(f'circuit breaker tripped after {n} repeats in the '
+                                 f'window: {json.dumps(trip, sort_keys=True)}')
+        if str(pb.get('requires_user', '')).lower() == 'true':
+            approver = (getattr(args, 'approved_by', '') or '').strip()
+            if not approver:
+                raise SystemExit(f"playbook '{name}' is tier-{plan['tier']} "
+                                 "(requires_user); re-run with --approved-by <name>")
+            plan['approved_by'] = approver
+        seq = _repair_count(c, finding_hash, 24 * 36500) + 1 if finding_hash else 1
+        task_id = (f"repair-{name}-{finding_hash[:8]}-{seq}" if finding_hash
+                   else f"repair-{name}-{uuid.uuid4().hex[:8]}")
+        if c.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone():
+            raise SystemExit(f'repair task already exists: {task_id}')
+        ct = utc()
+        c.execute(
+            "INSERT INTO tasks(id,project,title,description,owner,status,priority,"
+            "next_action,due_at,not_before,tags,requires_receipts,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (task_id, 'Repairs', f'Repair: {name}',
+             f'Playbook repair for finding {finding_hash or "ad-hoc"} '
+             f'(tier {plan["tier"]}): {" ".join(cmd)}',
+             'ops-repair', 'queued', 'P2', ' '.join(cmd), '', '', '[]', '[]', ct, ct))
+        autopilot.audit(c, 'task', task_id, 'created',
+                        {'project': 'Repairs', 'owner': 'ops-repair', 'priority': 'P2',
+                         'playbook': name, 'finding_hash': finding_hash})
+    # Lease + execute outside the schema transaction: the command itself opens
+    # its own connection(s) and must see the claimed state.
+    autopilot.claim(SimpleNamespace(id=task_id, owner='ops-repair', minutes=30,
+                                    max_active=None, force=False))
+    proc = subprocess.run([sys.executable, str(Path(__file__).parent / 'ops.py'), *cmd],
+                          text=True, capture_output=True, timeout=120)
+    if proc.returncode != 0:
+        autopilot.fail(SimpleNamespace(id=task_id, owner='ops-repair',
+                                       reason=f'playbook command failed: {proc.stderr[:400]}',
+                                       no_retry=True, max_retries=0, backoff_base=60,
+                                       backoff_cap=3600, epoch=None))
+        raise SystemExit(f'repair command failed: {proc.stderr.strip()[:400]}')
+    rec = _capture_json(autopilot.receipt, SimpleNamespace(
+        task_id=task_id, kind=pb.get('receipt_kind', 'repair'),
+        payload=json.dumps({'playbook': name, 'finding_hash': finding_hash,
+                            'command': cmd})))
+    autopilot.complete(SimpleNamespace(id=task_id, owner='ops-repair', epoch=None,
+                                       recall_digest='',
+                                       note=f'repair via playbook {name}',
+                                       evidence_receipts=[rec['receipt_id']]))
+    # Learning: a successful repair asserts the finding-hash triple into the
+    # fact graph so later agents can query which playbook fixed which defect.
+    learn = ''
+    if finding_hash:
+        fa = SimpleNamespace(subject=f'finding:{finding_hash}', predicate='repaired-by',
+                             object=name, source='ops-repair', task=task_id,
+                             valid_hours=None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            autopilot.fact_assert(fa)
+        learn = json.loads(buf.getvalue())['id']
+        with db() as c:
+            autopilot.audit(c, 'task', task_id, 'repair_completed',
+                            {'playbook': name, 'finding_hash': finding_hash,
+                             'learning_fact_id': learn})
+    plan.update({'ok': True, 'task_id': task_id, 'receipt_id': rec['receipt_id'],
+                 'learning_fact_id': learn})
+    print(json.dumps(plan, sort_keys=True))
+
+
+def repair_list(args=None):
+    """Inventory shipped playbooks (name + gate fields) for operators."""
+    out = [{'name': k, **v} for k, v in _load_playbooks().items()]
+    print(json.dumps({'ok': True, 'count': len(out), 'playbooks': out}, sort_keys=True))
+
+
+def repair_fts_rebuild(args=None):
+    """Tier-0 repair: rebuild every external-content FTS index from its table.
+
+    The indexes are derived cache — a rebuild cannot lose source rows — but it
+    is still gated behind the playbook so it only ever runs as a leased,
+    receipted task. --dry-run reports current drift without writing.
+    """
+    tables = (('notes', 'notes_fts', autopilot._fts_ready),
+              ('tasks', 'tasks_fts', autopilot._fts_ready),
+              ('handoffs', 'handoffs_fts', autopilot._handoffs_fts_ready),
+              ('session_messages', 'session_messages_fts', autopilot._sessions_fts_ready),
+              ('facts', 'facts_fts', autopilot._facts_fts_ready))
+    rebuilt, skipped, drifted = [], [], []
+    with db() as c:
+        for table, fts, ready in tables:
+            if not ready(c):
+                skipped.append(fts)
+                continue
+            src = {r[0] for r in c.execute(f'SELECT rowid FROM {table}')}
+            try:
+                idx = _fts_index_docs(c, fts)
+            except sqlite3.Error:
+                idx = None
+            n_idx = c.execute(f'SELECT COUNT(*) n FROM {fts}').fetchone()['n']
+            if idx is None:
+                if len(src) != n_idx:
+                    drifted.append({'table': table, 'rows': len(src), 'indexed': n_idx})
+            elif src != idx:
+                drifted.append({'table': table, 'rows': len(src), 'indexed': len(idx)})
+            if not getattr(args, 'dry_run', False):
+                c.execute(f"INSERT INTO {fts}({fts}) VALUES('rebuild')")
+                autopilot.audit(c, 'system', fts, 'fts_rebuilt', {'table': table})
+                rebuilt.append(fts)
+    print(json.dumps({'ok': True, 'dry_run': bool(getattr(args, 'dry_run', False)),
+                      'drift_before': drifted, 'rebuilt': rebuilt,
+                      'skipped_no_fts5': skipped}, sort_keys=True))
+
 import argparse
 p=argparse.ArgumentParser(); s=p.add_subparsers(dest='cmd',required=True)
 for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning),('doctor',doctor)]:
@@ -2471,6 +2803,10 @@ x=s.add_parser('secret-scan'); x.add_argument('--all',action='store_true'); x.se
 x=s.add_parser('consolidate'); x.add_argument('--task',default=''); x.add_argument('--threshold',type=float,default=None); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=consolidate)
 x=s.add_parser('dup-tasks'); x.add_argument('--threshold',type=float,default=None); x.set_defaults(fn=dup_tasks)
 x=s.add_parser('unverified-completions'); x.set_defaults(fn=unverified_completions)
+x=s.add_parser('sense'); x.set_defaults(fn=sense)
+x=s.add_parser('repair'); x.add_argument('playbook'); x.add_argument('--finding-hash',dest='finding_hash',default=''); x.add_argument('--dry-run',action='store_true'); x.add_argument('--break-after',dest='break_after',type=int,default=3,help='trip the circuit breaker after this many repeats of the same finding hash in the window'); x.add_argument('--window-hours',dest='window_hours',type=float,default=24.0); x.add_argument('--approved-by',dest='approved_by',default='',help='user approving a requires_user (tier-gated) playbook'); x.set_defaults(fn=repair)
+x=s.add_parser('repair-list'); x.set_defaults(fn=repair_list)
+x=s.add_parser('fts-rebuild'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=repair_fts_rebuild)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--backoff-base',type=int,default=60); x.add_argument('--backoff-cap',type=int,default=3600); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('escalate'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=escalate)
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)

@@ -3157,5 +3157,140 @@ def _case_hindsight_semantic_recall():
             assert any('this line is torn json' in line for line in f)
 
 
+@case('sense_repair_breaker_learning')
+def _case_sense_repair_breaker_learning():
+    with tempfile.TemporaryDirectory() as td:
+        env = os.environ.copy(); env['HERMES_AUTOPILOT_HOME'] = td
+        def run(*args):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
+            if p.returncode: raise AssertionError((args, p.stdout, p.stderr))
+            return json.loads(p.stdout)
+        def ops(*a):
+            p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=env, text=True, capture_output=True)
+            assert p.returncode == 0, (a, p.stdout, p.stderr)
+            out = p.stdout.strip()
+            # repair prints the intermediate lifecycle docs before its final plan;
+            # parse every JSON document and keep the last.
+            dec = json.JSONDecoder(); docs = []; idx = 0
+            while idx < len(out):
+                obj, end = dec.raw_decode(out, idx); docs.append(obj); idx = end
+                while idx < len(out) and out[idx] in ' \n\t': idx += 1
+            return docs[-1]
+        def ops_fail(*a):
+            p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=env, text=True, capture_output=True)
+            assert p.returncode != 0, ('expected failure', a, p.stdout, p.stderr)
+            return p.stderr + p.stdout
+        import sqlite3, time
+
+        def inject_fts_drift():
+            run('create', '--project', 'Verify', '--title', 'drift host', '--id', f'drift-{inject_fts_drift.n}')
+            run('note', f'drift-{inject_fts_drift.n}', '--content', f'drift probe body {inject_fts_drift.n}')
+            inject_fts_drift.n += 1
+            db = sqlite3.connect(Path(td) / 'state.db')
+            rowid = db.execute("SELECT rowid FROM notes ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+            db.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')")
+            db.execute("DELETE FROM notes_fts WHERE rowid=?", (rowid,))
+            db.commit(); db.close()
+        inject_fts_drift.n = 1
+
+        # ------------------------------------------------------------------
+        # sense: typed, content-hashed findings over injected faults
+        # ------------------------------------------------------------------
+        assert ops('sense')['count'] == 0          # clean fleet: no findings
+        inject_fts_drift()
+        s = ops('sense')
+        fts_f = [x for x in s['findings'] if x['kind'] == 'doctor_fts_index_drift']
+        assert len(fts_f) == 1, s
+        assert fts_f[0]['severity'] == 'P2' and fts_f[0]['suggested_repair'] == 'fts-rebuild'
+        assert len(fts_f[0]['hash']) == 16 and fts_f[0]['id'] == 'find-' + fts_f[0]['hash']
+        fh = fts_f[0]['hash']
+        # Recurrence: the same defect shape (same table, same drift kind)
+        # yields an identical content hash even from a different row.
+        run('create', '--project', 'Verify', '--title', 'drift host 2', '--id', 'drift-b')
+        run('note', 'drift-b', '--content', 'another probe body')
+        db = sqlite3.connect(Path(td) / 'state.db')
+        rowid = db.execute("SELECT rowid FROM notes ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+        db.execute("DELETE FROM notes_fts WHERE rowid=?", (rowid,))
+        db.commit(); db.close()
+        s2 = ops('sense')
+        hashes = [x['hash'] for x in s2['findings']
+                  if x['kind'] == 'doctor_fts_index_drift' and x['evidence']['table'] == 'notes']
+        assert len(set(hashes)) == 1, (hashes, s2)
+
+        # ------------------------------------------------------------------
+        # playbooks ship as data; dry-run plan is runnable and non-mutating
+        # ------------------------------------------------------------------
+        inv = ops('repair-list')
+        kinds = {p['name'] for p in inv['playbooks']}
+        assert {'fts-rebuild', 'stale-lease-recover'} <= kinds, inv
+        plan = ops('repair', 'fts-rebuild', '--finding-hash', fh, '--dry-run')
+        assert plan['dry_run'] is True and plan['tier'] == 0
+        assert plan['rollback_command'][0] == 'fts-rebuild'
+        rb = ops(*plan['rollback_command'])        # rollback in dry-run form runs
+        assert rb['dry_run'] is True and rb['rebuilt'] == []
+        unknown = ops_fail('repair', 'no-such-playbook')
+        assert 'unknown repair playbook' in unknown
+
+        # ------------------------------------------------------------------
+        # repair executes end-to-end as a leased task with receipt + learning
+        # ------------------------------------------------------------------
+        rep = ops('repair', 'fts-rebuild', '--finding-hash', fh)
+        assert rep['ok'] is True and rep['task_id'].startswith('repair-fts-rebuild-')
+        task = run('show', rep['task_id'])
+        assert task['status'] == 'completed' and task['lease_owner'] == ''
+        kinds_seen = [r['kind'] for r in task['receipts']]
+        assert 'repair' in kinds_seen, task
+        cited = next(e for e in reversed(task['audit']) if e['action'] == 'completed')['payload']['evidence_receipts']
+        assert rep['receipt_id'] in cited
+        facts = run('facts', '--subject', f'finding:{fh}')
+        assert [(f['predicate'], f['object']) for f in facts] == [('repaired-by', 'fts-rebuild')]
+        assert facts[0]['task_id'] == rep['task_id']
+        doc = ops('doctor')
+        assert not [p for p in doc['problems'] if p['kind'] == 'fts_index_drift'], doc
+        # Learning triple was audited as part of the repair.
+        with sqlite3.connect(Path(td) / 'state.db') as db:
+            n = db.execute("SELECT COUNT(*) FROM audit_events WHERE action='repair_completed'").fetchone()[0]
+            assert n == 1, n
+
+        # ------------------------------------------------------------------
+        # stale-lease playbook: tier-1 recovery via the same path
+        # ------------------------------------------------------------------
+        run('create', '--project', 'Verify', '--title', 'stale host', '--id', 'stale-x')
+        db = sqlite3.connect(Path(td) / 'state.db')
+        db.execute("UPDATE tasks SET status='running',lease_owner='ghost',"
+                   "lease_expires_at='2020-01-01T00:00:00+00:00' WHERE id='stale-x'")
+        db.commit(); db.close()
+        sf = [x for x in ops('sense')['findings'] if x['kind'] == 'doctor_stale_lease']
+        assert len(sf) == 1 and sf[0]['severity'] == 'P1' and sf[0]['suggested_repair'] == 'stale-lease-recover'
+        rep2 = ops('repair', 'stale-lease-recover', '--finding-hash', sf[0]['hash'])
+        assert rep2['ok'] is True
+        assert run('show', 'stale-x')['status'] == 'queued'
+        assert run('facts', '--subject', f"finding:{sf[0]['hash']}")
+
+        # ------------------------------------------------------------------
+        # circuit breaker: default 3 repeats trips, disables the playbook,
+        # opens a P0 investigate task, records a windowed fact-graph entry
+        # ------------------------------------------------------------------
+        inject_fts_drift()
+        fh3 = [x for x in ops('sense')['findings'] if x['kind'] == 'doctor_fts_index_drift'][0]['hash']
+        for _ in range(3):                       # threshold default: break-after 3
+            ops('repair', 'fts-rebuild', '--finding-hash', fh3)
+        err = ops_fail('repair', 'fts-rebuild', '--finding-hash', fh3)
+        assert 'circuit breaker tripped after 3 repeats' in err, err
+        trip = json.loads(err.split(': ', 1)[1].split('\n')[0])
+        breaker = run('facts', '--subject', 'playbook:fts-rebuild')
+        assert len(breaker) == 1 and breaker[0]['predicate'] == 'breaker-tripped'
+        assert breaker[0]['valid_until'] > __import__('datetime').datetime.now(__import__('datetime').timezone.utc).replace(microsecond=0).isoformat()[:19]
+        queued = {t['id']: t for t in run('list', '--status', 'queued')}
+        assert trip['investigate_task'] in queued
+        assert queued[trip['investigate_task']]['priority'] == 'P0'
+        err2 = ops_fail('repair', 'fts-rebuild', '--finding-hash', 'different-defect')
+        assert 'disabled by circuit breaker' in err2, err2
+        # The chain stayed intact across create/claim/receipt/complete/breaker events.
+        assert run('verify-chain')['ok'] is True
+
+
+
+
 if __name__ == '__main__':
     main()
