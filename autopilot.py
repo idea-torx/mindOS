@@ -16,6 +16,7 @@ import uuid
 import hashlib
 import tempfile
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(os.environ.get("HERMES_AUTOPILOT_HOME", Path.home() / ".hermes" / "autopilot"))
@@ -1307,37 +1308,94 @@ def _dep_context_cost(entry: dict) -> int:
             + len(r["id"]) + len(r["kind"]) + len(r["created_at"]) + 8
     return c
 
-def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
-                rerank: bool = False, recency_half_life_hours: float = 168.0,
-                pinned_boost: float = 0.5, rel_handoffs: int = 0,
-                dep_context: int = 0, rel_sessions: int = 0, rel_facts: int = 0) -> dict:
-    """Assemble the prompt-ready context bundle for a task within a char budget.
+@dataclass
+class _PackSection:
+    """One flag-gated context-pack section in the pack spec.
 
-    Shared by `context` and `recall`: task summary header + unsatisfied
-    dependencies, then the live handoff, then live notes pinned-first
-    (oldest→newest within each group), then cross-task related notes.
-    With rerank=True the related-note candidates are temporally re-scored
-    (see `_rerank_notes`) and the pack reports the rerank parameters so
-    recall digests stay exactly recomputable. With rel_handoffs > 0, up to
-    that many cross-task related handoffs (live resume points of neighboring
-    work) pack after related notes within the same budget; every related-
-    handoff output key is present only when the flag is used, so packs built
-    without it stay byte-identical (and digest-compatible) to the legacy shape.
-    With dep_context > 0, up to that many completed direct prerequisites
-    contribute their verified evidence (live handoff + latest sealed receipt)
-    after related handoffs within the same budget; the same flag-gated key
-    rule keeps legacy packs byte-identical.
-    With rel_sessions > 0, up to that many ingested session-message snippets
-    (matching this task's text) pack after dep context under the same rules —
-    raw conversation is the freshest record of what agents actually tried.
-    With rel_facts > 0, up to that many currently-valid temporal facts from
-    the sidecar graph (matching this task's text) pack last under the same
-    flag-gated rules; every related-fact output key is present only when the
-    flag is used, so legacy packs stay byte-identical and digest-compatible.
+    `collect(db, ctx)` returns the candidate rows (possibly empty); a section
+    is active only when its flag count is > 0, so packs built without the
+    flag keep the legacy byte-identical shape. `keys`/`prefix` name the
+    output keys (`<prefix>_requested/_matched/_packed` + `keys`), `cost`
+    prices one row against the remaining budget, and `decorate` may tag a
+    row before packing (e.g. related=True).
+    """
+    prefix: str
+    keys: str
+    collect: object          # (db, ctx, limit) -> [rows]
+    cost: object             # (row) -> int
+    decorate: object = None  # (row) -> row
+
+def _pack_section_rows(section, db, ctx, limit):
+    return section.collect(db, ctx, max(0, limit)) if limit > 0 else []
+
+def _pack_fit(rows, used, budget, truncated, section):
+    """Greedy in-order fit of candidate rows into the remaining budget.
+
+    Shared by every section (and by notes): rows that do not fit mark the
+    pack truncated and are skipped, not fatal.
+    """
+    packed = []
+    for r in rows:
+        if section.decorate is not None:
+            r = section.decorate(r)
+        c = section.cost(r)
+        if used + c > budget:
+            truncated = True
+            continue
+        packed.append(r)
+        used += c
+    return packed, used, truncated
+
+def _pack_spec():
+    """The context-pack specification: every flag-gated cross-task section.
+
+    Adding a flag-gated section is one registration here rather than
+    threading kwargs through five signatures; ordering below is the pack
+    order (related notes -> handoffs -> dep context -> sessions -> facts).
+    """
+    rel_note_cost = lambda r: (len(r["content"]) + len(r["kind"]) + len(r["source"])
+                               + len(r["created_at"]) + len(r["task_id"])
+                               + len(r["via_task_title"]) + 16)
+    return [
+        _PackSection("related", "notes",
+            lambda db, ctx, n: _related_note_candidates(
+                db, ctx["task_id"], ctx["pack_text"], n, ctx["rel_scope"],
+                rerank=ctx["rerank"],
+                recency_half_life_hours=ctx["recency_half_life_hours"],
+                pinned_boost=ctx["pinned_boost"]),
+            rel_note_cost,
+            decorate=lambda r: {**r, "related": True}),
+        _PackSection("related_handoffs", "related_handoffs",
+            lambda db, ctx, n: _related_handoff_candidates(db, ctx["task_id"], ctx["pack_text"], n, ctx["rel_scope"]),
+            lambda h: (len(h["objective"]) + len(h["status"]) + len(h["from_agent"])
+                       + len(h["to_agent"]) + len(h["commit_ref"]) + len(h["created_at"])
+                       + len(h["task_id"]) + len(h["via_task_title"]) + 16)),
+        _PackSection("dep_context", "dep_context",
+            lambda db, ctx, n: _dep_context_candidates(db, ctx["task_id"], n),
+            _dep_context_cost),
+        _PackSection("related_sessions", "related_sessions",
+            lambda db, ctx, n: _related_session_candidates(db, ctx["task_id"], ctx["pack_text"], n, ctx["rel_scope"]),
+            lambda m: (len(m["content"]) + len(m["role"]) + len(m["at"])
+                       + len(m["source"]) + len(m["session_id"]) + 16)),
+        _PackSection("related_facts", "related_facts",
+            lambda db, ctx, n: _related_fact_candidates(db, ctx["task_id"], ctx["pack_text"], n),
+            lambda ft: (len(ft["id"]) + len(ft["subject"]) + len(ft["predicate"])
+                        + len(ft["object"]) + len(ft["valid_from"]) + len(ft["valid_until"])
+                        + len(ft["source"]) + 16)),
+    ]
+
+def _assemble_pack(db, task_id, budget, rel_limit, rel_scope, rerank=False,
+                   recency_half_life_hours=168.0, pinned_boost=0.5,
+                   section_limits=None):
+    """Spec-driven pack assembly shared by `_build_pack` and `_build_recall_pack`.
+
+    Sections come from `_pack_spec()`; each contributes at most
+    `section_limits[prefix]` candidates (default 0 = inactive = legacy shape).
     """
     budget = max(0, budget)
     rel_limit = max(0, rel_limit)
     rel_scope = rel_scope or "project"
+    section_limits = dict(section_limits or {})
     row = task_row(db, task_id)
     summary = {k: row[k] for k in ("id", "project", "title", "status", "priority", "next_action", "blocked_reason", "due_at")}
     pending = unsatisfied_deps(db, task_id)
@@ -1352,19 +1410,7 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
     retired = [r for r in rows if _note_retired(r, t)]
     if retired:
         rows = [r for r in rows if not _note_retired(r, t)]
-    related = _related_note_candidates(
-        db, task_id,
-        " ".join(filter(None, (row["title"], row["description"], row["next_action"]))),
-        rel_limit, rel_scope, rerank=rerank,
-        recency_half_life_hours=recency_half_life_hours, pinned_boost=pinned_boost)
     pack_text = " ".join(filter(None, (row["title"], row["description"], row["next_action"])))
-    related_handoffs = _related_handoff_candidates(
-        db, task_id, pack_text, max(0, rel_handoffs), rel_scope) if rel_handoffs > 0 else []
-    dep_ctx = _dep_context_candidates(db, task_id, max(0, dep_context)) if dep_context > 0 else []
-    rel_sessions_list = (_related_session_candidates(db, task_id, pack_text,
-                          max(0, rel_sessions), rel_scope) if rel_sessions > 0 else [])
-    rel_facts_list = (_related_fact_candidates(db, task_id, pack_text,
-                      max(0, rel_facts)) if rel_facts > 0 else [])
     hrow = _live_handoff(db, task_id)
     # Stable sort: pinned notes first, original (oldest→newest) order within groups.
     ordered = sorted(rows, key=lambda r: not r["pinned"])
@@ -1393,86 +1439,79 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
         packed.append(r); used += cost
         if r["pinned"]:
             pinned_packed += 1
-    related_packed = 0
-    for r in related:
-        r["related"] = True
-        cost = (len(r["content"]) + len(r["kind"]) + len(r["source"]) + len(r["created_at"])
-                + len(r["task_id"]) + len(r["via_task_title"]) + 16)
-        if used + cost > budget:
-            truncated = True
-            continue
-        packed.append(r); used += cost; related_packed += 1
-    rh_packed = []
-    for h in related_handoffs:
-        cost = (len(h["objective"]) + len(h["status"]) + len(h["from_agent"])
-                + len(h["to_agent"]) + len(h["commit_ref"]) + len(h["created_at"])
-                + len(h["task_id"]) + len(h["via_task_title"]) + 16)
-        if used + cost > budget:
-            truncated = True
-            continue
-        rh_packed.append(h); used += cost
-    dc_packed = []
-    for e in dep_ctx:
-        cost = _dep_context_cost(e)
-        if used + cost > budget:
-            truncated = True
-            continue
-        dc_packed.append(e); used += cost
-    rs_packed = []
-    for m in rel_sessions_list:
-        cost = (len(m["content"]) + len(m["role"]) + len(m["at"])
-                + len(m["source"]) + len(m["session_id"]) + 16)
-        if used + cost > budget:
-            truncated = True
-            continue
-        rs_packed.append(m); used += cost
-    rf_packed = []
-    for ft in rel_facts_list:
-        cost = (len(ft["id"]) + len(ft["subject"]) + len(ft["predicate"])
-                + len(ft["object"]) + len(ft["valid_from"]) + len(ft["valid_until"])
-                + len(ft["source"]) + 16)
-        if used + cost > budget:
-            truncated = True
-            continue
-        rf_packed.append(ft); used += cost
+    ctx = {"task_id": task_id, "pack_text": pack_text, "rel_scope": rel_scope,
+           "rerank": rerank, "recency_half_life_hours": recency_half_life_hours,
+           "pinned_boost": pinned_boost}
     out = {"task_id": task_id, "budget": budget, "used_chars": used,
             "truncated": truncated, "task": summary,
             "unsatisfied_dependencies": pending,
             "handoff": handoff if handoff_packed else None,
             "handoff_packed": handoff_packed,
-            "notes_total": len(rows), "notes_packed": len(packed) - related_packed,
+            "notes_total": len(rows), "notes_packed": len(packed),
             "notes_pinned_packed": pinned_packed,
-            "related_requested": rel_limit, "related_matched": len(related),
-            "related_packed": related_packed,
+            "related_requested": rel_limit, "related_matched": 0,
+            "related_packed": 0,
             "notes": packed}
+    for section in _pack_spec():
+        limit = section_limits.get(section.prefix, 0)
+        cand = _pack_section_rows(section, db, ctx, limit)
+        got, used, truncated = _pack_fit(cand, used, budget, truncated, section)
+        out["used_chars"] = used; out["truncated"] = truncated
+        if limit <= 0:
+            continue  # inactive section: legacy shape keeps no keys at all
+        key = section.keys
+        out[key] = got
+        if key == "notes":
+            # The first spec section shares the `notes` list with own notes;
+            # report its counters under the historical related_* names and
+            # fold its rows back into `out["notes"]`.
+            pass
+        out[f"{section.prefix}_requested"] = limit
+        out[f"{section.prefix}_matched"] = len(cand)
+        out[f"{section.prefix}_packed"] = len(got)
+        if key != "notes":
+            out[key] = got
+        else:
+            packed.extend(got)
+            out["notes"] = packed
+            out["related_matched"] = len(cand)
+            out["related_packed"] = len(got)
+            out["notes_packed"] = len(packed) - len(got)
     if retired:
         out["notes_expired_excluded"] = len(retired)
-    if rel_handoffs > 0:
-        out["related_handoffs_requested"] = max(0, rel_handoffs)
-        out["related_handoffs_matched"] = len(related_handoffs)
-        out["related_handoffs_packed"] = len(rh_packed)
-        out["related_handoffs"] = rh_packed
-    if dep_context > 0:
-        out["dep_context_requested"] = max(0, dep_context)
-        out["dep_context_matched"] = len(dep_ctx)
-        out["dep_context_packed"] = len(dc_packed)
-        out["dep_context"] = dc_packed
-    if rel_sessions > 0:
-        out["related_sessions_requested"] = max(0, rel_sessions)
-        out["related_sessions_matched"] = len(rel_sessions_list)
-        out["related_sessions_packed"] = len(rs_packed)
-        out["related_sessions"] = rs_packed
-    if rel_facts > 0:
-        out["related_facts_requested"] = max(0, rel_facts)
-        out["related_facts_matched"] = len(rel_facts_list)
-        out["related_facts_packed"] = len(rf_packed)
-        out["related_facts"] = rf_packed
     if rerank:
         # Reported only when enabled so packs built without rerank stay
         # byte-identical to the legacy shape (and digest-compatible).
         out["rerank"] = {"recency_half_life_hours": recency_half_life_hours,
                          "pinned_boost": pinned_boost}
     return out
+
+def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
+                rerank: bool = False, recency_half_life_hours: float = 168.0,
+                pinned_boost: float = 0.5, rel_handoffs: int = 0,
+                dep_context: int = 0, rel_sessions: int = 0, rel_facts: int = 0) -> dict:
+    """Assemble the prompt-ready context bundle for a task within a char budget.
+
+    Thin wrapper over the spec-driven `_assemble_pack`: task summary header +
+    unsatisfied dependencies, then the live handoff, then live notes
+    pinned-first (oldest→newest within each group), then flag-gated sections
+    from `_pack_spec()` (related notes, handoffs, dep evidence, sessions,
+    facts). With rerank=True the related-note candidates are temporally
+    re-scored (see `_rerank_notes`) and the pack reports the rerank parameters
+    so recall digests stay exactly recomputable. Every flag-gated output key
+    is present only when that flag is used, so packs built without them stay
+    byte-identical (and digest-compatible) to the legacy shape.
+    """
+    return _assemble_pack(db, task_id, budget, rel_limit, rel_scope,
+                          rerank=rerank,
+                          recency_half_life_hours=recency_half_life_hours,
+                          pinned_boost=pinned_boost,
+                          section_limits={
+                              "related": rel_limit,
+                              "related_handoffs": rel_handoffs,
+                              "dep_context": dep_context,
+                              "related_sessions": rel_sessions,
+                              "related_facts": rel_facts})
 
 def task_context(args):
     """Pack a prompt-ready context bundle within a character budget.
@@ -3564,6 +3603,117 @@ def remove_dep(args):
         audit(db, "task", args.id, "dependency_removed", {"depends_on": args.depends_on})
     json_out({"ok": True, "task_id": args.id, "removed": args.depends_on})
 
+def _dispatch_candidates(db, args, t_now):
+    """Stage 1 — candidates: queued tasks in scope (project/tag), due-ordered."""
+    q = "SELECT * FROM tasks WHERE status='queued'"
+    vals = []
+    if args.project:
+        q += " AND project=?"; vals.append(args.project)
+    if getattr(args, "tag", ""):
+        # Tag-scoped dispatch: an agent constrained to a capability (e.g.
+        # --tag autopilot-safe) only ever sees work marked for it. The
+        # LIKE filter is exact because tags are validated against a
+        # charset that cannot contain quotes.
+        q += " AND tags LIKE ?"; vals.append('%"' + _valid_tag(args.tag) + '"%')
+    q += _due_order()
+    return db.execute(q, vals).fetchall()
+
+def _filter_candidate(db, r, args, t_now, explain, skipped, pol_cache, inherited,
+                      t_dt=None):
+    t_dt = t_dt or datetime.now(timezone.utc)
+    """Stage 2 — filter: one candidate's admissibility gates, in order.
+
+    Returns (eligible_tuple | None). Refusals append an explain record to
+    `skipped` when `explain` is set: deferred_until, unsatisfied_dependencies,
+    recovery_backoff, policy_missing_tag, policy_wip_cap, seam_conflict.
+    """
+    if r["not_before"] and r["not_before"] > t_now:
+        if explain:
+            skipped.append({"task_id": r["id"], "reason": "deferred_until",
+                            "not_before": r["not_before"]})
+        return None
+    pending = unsatisfied_deps(db, r["id"])
+    if pending:
+        if explain:
+            skipped.append({"task_id": r["id"], "reason": "unsatisfied_dependencies",
+                            "blocked_by": [d["id"] for d in pending]})
+        return None
+    if r["recover_after"] and r["recover_after"] > t_now:
+        if explain:
+            skipped.append({"task_id": r["id"], "reason": "recovery_backoff",
+                            "recover_after": r["recover_after"]})
+        return None
+    # Project dispatch policy: cache per project so a fleet-wide
+    # sweep reads each policy file once.
+    pol = pol_cache.get(r["project"])
+    if pol is None:
+        pol = pol_cache[r["project"]] = _project_policy(r["project"])
+    required_tag = _dispatch_required_tag(pol)
+    if required_tag and required_tag not in _task_tags(r):
+        if explain:
+            skipped.append({"task_id": r["id"], "reason": "policy_missing_tag",
+                            "required_tag": required_tag})
+        return None
+    if args.claim:
+        cap = _wip_cap(pol)
+        if cap:
+            held = _owner_project_leases(db, args.owner, r["project"], r["id"])
+            if len(held) >= cap:
+                if explain:
+                    skipped.append({"task_id": r["id"], "reason": "policy_wip_cap",
+                                    "cap": cap, "held": held})
+                return None
+    if args.claim:
+        # Dispatch must not hand out work whose seam (worktree/branch)
+        # is already held by another live lease — the claim would
+        # collide physically. Skip rather than fail after picking.
+        conflicts = _seam_conflicts(db, r["id"], r["worktree"], r["branch"], r["project"])
+        if conflicts:
+            if explain:
+                skipped.append({"task_id": r["id"], "reason": "seam_conflict",
+                                "conflicts": conflicts})
+            return None
+    eff, boost = _effective_priority(r, t_dt, getattr(args, "aging_minutes", 360),
+                                     getattr(args, "aging_boost", 2))
+    inh = inherited.get(r["id"])
+    via = None
+    if inh is not None and _prio_rank(inh[0]) < _prio_rank(eff):
+        eff, via = inh[0], inh[1]
+    return (eff, boost, r, via, unblock_count(db, r["id"]))
+
+def _rank_candidates(eligible, prefer_unblocking):
+    """Stage 3 — rank: order the eligible candidates and return the pick.
+
+    Effective priority first, then earliest deadline (undated last),
+    then oldest-created first: within one effective tier the
+    longest-waiting task wins, which is what makes aging fair.
+    With --prefer-unblocking, the count of queued direct dependents
+    breaks ties before age: between equally urgent, equally due
+    candidates, finishing the hub frees more of the graph than
+    finishing a leaf (critical-path scheduling as a tie-break — it
+    never overrides priority or deadlines).
+    """
+    if not eligible:
+        return None
+    eligible = sorted(eligible, key=lambda e: (
+        _prio_rank(e[0]), e[2]["due_at"] == "", e[2]["due_at"],
+        (-e[4] if prefer_unblocking else 0), e[2]["created_at"]))
+    return eligible[0]
+
+def _claim_pick(db, picked, args):
+    """Stage 4 — claim: acquire the lease for the picked candidate.
+
+    Mirrors `claim` exactly: fenced acquire, heartbeat row, audited
+    claimed event with via=next. Returns (expires_at, epoch).
+    """
+    cap = resolve_max_active(args)
+    acquired, exp, epoch = _acquire(db, picked["id"], args.owner, args.minutes, cap)
+    if not acquired:
+        raise SystemExit(_explain_acquire_failure(db, picked["id"], args.owner, cap))
+    db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (picked["id"],args.owner,"claimed",now(),"claimed via next"))
+    audit(db, "task", picked["id"], "claimed", {"owner": args.owner, "lease_expires_at": exp, "lease_epoch": epoch, "via": "next"})
+    return exp, epoch
+
 def next_task(args):
     """Dispatch: highest-priority queued task whose dependencies are all completed.
 
@@ -3615,126 +3765,47 @@ def next_task(args):
     was taken against, instead of a follow-up `recall` round trip. The agent
     defaults to the claiming --owner; --budget/--related/--related-scope tune
     the bundle exactly like `recall`.
+
+    The pipeline is staged for independent testability: `_dispatch_candidates`
+    selects, `_filter_candidate` gates each row, `_rank_candidates` orders and
+    picks, and `_claim_pick` acquires the lease.
     """
     explain = bool(getattr(args, "explain", False))
     if getattr(args, "recall", False) and not args.claim:
         raise SystemExit("--recall requires --claim: the bundle seals the context of the task you claimed")
     t_now = now()
     t_dt = datetime.now(timezone.utc)
-    aging_minutes = getattr(args, "aging_minutes", 360)
-    aging_boost = getattr(args, "aging_boost", 2)
     with conn() as db:
         inherited = _inherit_priorities(db)
-        q = "SELECT * FROM tasks WHERE status='queued'"
-        vals = []
-        if args.project:
-            q += " AND project=?"; vals.append(args.project)
-        if getattr(args, "tag", ""):
-            # Tag-scoped dispatch: an agent constrained to a capability (e.g.
-            # --tag autopilot-safe) only ever sees work marked for it. The
-            # LIKE filter is exact because tags are validated against a
-            # charset that cannot contain quotes.
-            q += " AND tags LIKE ?"; vals.append('%"' + _valid_tag(args.tag) + '"%')
-        q += _due_order()
-        rows = db.execute(q, vals).fetchall()
+        rows = _dispatch_candidates(db, args, t_now)
         eligible = []
         skipped = []
         pol_cache = {}
         for r in rows:
-            if r["not_before"] and r["not_before"] > t_now:
-                if explain:
-                    skipped.append({"task_id": r["id"], "reason": "deferred_until",
-                                    "not_before": r["not_before"]})
-                continue
-            pending = unsatisfied_deps(db, r["id"])
-            if pending:
-                if explain:
-                    skipped.append({"task_id": r["id"], "reason": "unsatisfied_dependencies",
-                                    "blocked_by": [d["id"] for d in pending]})
-                continue
-            if r["recover_after"] and r["recover_after"] > t_now:
-                if explain:
-                    skipped.append({"task_id": r["id"], "reason": "recovery_backoff",
-                                    "recover_after": r["recover_after"]})
-                continue
-            # Project dispatch policy: cache per project so a fleet-wide
-            # sweep reads each policy file once.
-            pol = pol_cache.get(r["project"])
-            if pol is None:
-                pol = pol_cache[r["project"]] = _project_policy(r["project"])
-            required_tag = _dispatch_required_tag(pol)
-            if required_tag and required_tag not in _task_tags(r):
-                if explain:
-                    skipped.append({"task_id": r["id"], "reason": "policy_missing_tag",
-                                    "required_tag": required_tag})
-                continue
-            if args.claim:
-                cap = _wip_cap(pol)
-                if cap:
-                    held = _owner_project_leases(db, args.owner, r["project"], r["id"])
-                    if len(held) >= cap:
-                        if explain:
-                            skipped.append({"task_id": r["id"], "reason": "policy_wip_cap",
-                                            "cap": cap, "held": held})
-                        continue
-            if args.claim:
-                # Dispatch must not hand out work whose seam (worktree/branch)
-                # is already held by another live lease — the claim would
-                # collide physically. Skip rather than fail after picking.
-                conflicts = _seam_conflicts(db, r["id"], r["worktree"], r["branch"], r["project"])
-                if conflicts:
-                    if explain:
-                        skipped.append({"task_id": r["id"], "reason": "seam_conflict",
-                                        "conflicts": conflicts})
-                    continue
-            eff, boost = _effective_priority(r, t_dt, aging_minutes, aging_boost)
-            inh = inherited.get(r["id"])
-            via = None
-            if inh is not None and _prio_rank(inh[0]) < _prio_rank(eff):
-                eff, via = inh[0], inh[1]
-            eligible.append((eff, boost, r, via, unblock_count(db, r["id"])))
-        picked = None
-        picked_eff = None
-        picked_boost = 0
-        picked_via = None
-        picked_unblocks = 0
+            got = _filter_candidate(db, r, args, t_now, explain, skipped, pol_cache, inherited)
+            if got is not None:
+                eligible.append(got)
         prefer_unblocking = bool(getattr(args, "prefer_unblocking", False))
-        if eligible:
-            # Effective priority first, then earliest deadline (undated last),
-            # then oldest-created first: within one effective tier the
-            # longest-waiting task wins, which is what makes aging fair.
-            # With --prefer-unblocking, the count of queued direct dependents
-            # breaks ties before age: between equally urgent, equally due
-            # candidates, finishing the hub frees more of the graph than
-            # finishing a leaf (critical-path scheduling as a tie-break — it
-            # never overrides priority or deadlines).
-            eligible.sort(key=lambda e: (
-                _prio_rank(e[0]), e[2]["due_at"] == "", e[2]["due_at"],
-                (-e[4] if prefer_unblocking else 0), e[2]["created_at"]))
-            picked_eff, picked_boost, picked, picked_via, picked_unblocks = eligible[0]
+        pick = _rank_candidates(eligible, prefer_unblocking)
+        picked = pick[2] if pick else None
         out = {"ok": True, "task": _task_view(picked) if picked else None}
         if picked is not None:
-            out["unblocks"] = picked_unblocks
+            out["unblocks"] = pick[4]
         if explain:
             out["considered"] = len(rows)
             out["skipped"] = skipped
             if picked is not None:
-                out["effective_priority"] = picked_eff
-                out["priority_boost"] = picked_boost
-                if picked_via:
-                    out["inherited_via"] = picked_via
+                out["effective_priority"] = pick[0]
+                out["priority_boost"] = pick[1]
+                if pick[3]:
+                    out["inherited_via"] = pick[3]
             if prefer_unblocking:
                 out["unblock_scheduling"] = True
         if picked is None:
             json_out(out)
             return
         if args.claim:
-            cap = resolve_max_active(args)
-            acquired, exp, epoch = _acquire(db, picked["id"], args.owner, args.minutes, cap)
-            if not acquired:
-                raise SystemExit(_explain_acquire_failure(db, picked["id"], args.owner, cap))
-            db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (picked["id"],args.owner,"claimed",now(),"claimed via next"))
-            audit(db, "task", picked["id"], "claimed", {"owner": args.owner, "lease_expires_at": exp, "lease_epoch": epoch, "via": "next"})
+            exp, epoch = _claim_pick(db, picked, args)
             out["claimed"] = True
             out["lease_expires_at"] = exp
             out["lease_epoch"] = epoch
@@ -3770,6 +3841,7 @@ def next_task(args):
                 out["recall"] = bundle
                 out["recall_digest"] = bundle["digest"]
         json_out(out)
+
 
 def heartbeat(args):
     with conn() as db:
