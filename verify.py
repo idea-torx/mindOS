@@ -3049,5 +3049,113 @@ def _case_protocol_self_description():
         assert bad_digest != d1['sha256'], 'tampering must change the digest'
 
 
+@case('hindsight_semantic_recall')
+def _case_hindsight_semantic_recall():
+    """R4 gate: fixture-bank recall, secret guard, unavailable path, staleness."""
+    with tempfile.TemporaryDirectory() as td:
+        env = os.environ.copy(); env['HERMES_AUTOPILOT_HOME'] = td
+        bank_home = Path(td) / 'hindsight'
+        env['HERMES_HINDSIGHT_HOME'] = str(bank_home)
+        def run(*args):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
+            if p.returncode: raise AssertionError((args, p.stdout, p.stderr))
+            return json.loads(p.stdout)
+        def run_fail(*args):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
+            assert p.returncode != 0, ('expected failure', args, p.stdout, p.stderr)
+            return p.stderr
+        def ops(*a):
+            p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=env, text=True, capture_output=True)
+            assert p.returncode == 0, (a, p.stdout, p.stderr)
+            return json.loads(p.stdout)
+        import sqlite3, hashlib
+        run('create', '--project', 'Auth', '--title', 'fix login redirect bug in auth module', '--id', 'hs-t1')
+        run('claim', 'hs-t1', '--owner', 'leo', '--minutes', '5')
+        # Unavailable path: no bank configured -> --related-semantic is a no-op,
+        # doctor reports hindsight as a healthy-with-note, never a problem.
+        pack = run('context', 'hs-t1', '--related-semantic', '3')
+        assert pack.get('related_semantic') == [], pack  # no-op: zero memories
+        doc = ops('doctor')
+        assert doc['ok'] is True, doc
+        note = [n for n in doc.get('notes', []) if n.get('kind') == 'hindsight_status']
+        assert note and note[0]['status'] == 'unavailable', doc
+        assert not any(p.get('kind', '').startswith('hindsight') for p in doc['problems']), doc
+        # Retain refuses to fork an accidental bank without --create.
+        err = run_fail('hindsight-retain', '--text', 'auth uses cookie sessions')
+        assert 'no Hindsight bank configured' in err, err
+        # Secret guard: credential-shaped content is refused like notes.
+        err = run_fail('hindsight-retain', '--text',
+                       'the api_key is "sk-live-abc123def456ghi789"', '--create')
+        assert 'credential-shaped' in err, err
+        # --redact stores a tagged placeholder instead of the raw value.
+        red = run('hindsight-retain', '--text', 'the api_key is "sk-live-abc123def456ghi789"',
+                  '--create', '--redact', '--kind', 'decision', '--project', 'Auth')
+        assert red['ok'] is True and red.get('secret_kinds'), red
+        # Fixture bank: write memories in the documented bank v1 JSONL format.
+        bank_home.mkdir(parents=True, exist_ok=True)
+        mems = [
+            {"id": "hs-fix-001", "text": "login redirect bug in auth module was caused by a stale cookie session",
+             "kind": "decision", "project": "Auth", "created_at": "2026-08-20T10:00:00+00:00", "tags": ["auth", "cookies"]},
+            {"id": "hs-fix-002", "text": "unrelated note about the deploy pipeline",
+             "kind": "memory", "project": "Deploy", "created_at": "2026-08-19T10:00:00+00:00", "tags": []},
+            {"id": "hs-fix-003", "text": "auth module review: redirect handling must preserve query params",
+             "kind": "fact", "project": "", "created_at": "2026-08-21T08:00:00+00:00", "tags": ["auth"]},
+            "this line is torn json and must degrade silently\n",
+        ]
+        with (bank_home / 'bank.jsonl').open('w', encoding='utf-8') as f:
+            for m in mems:
+                f.write(m if isinstance(m, str) else json.dumps(m, sort_keys=True) + '\n')
+        # Fixture-bank recall: matching memories pack with the engine tag; the
+        # torn line degrades instead of failing; ordering is deterministic.
+        pack = run('context', 'hs-t1', '--related-semantic', '3')
+        ids = [m['id'] for m in pack['related_semantic']]
+        assert 'hs-fix-001' in ids and 'hs-fix-003' in ids, pack
+        assert 'hs-fix-002' not in ids, pack
+        assert all(m['engine'] == 'hindsight-bank-v1' for m in pack['related_semantic']), pack
+        assert ids == sorted(ids, key=lambda i: ['hs-fix-003', 'hs-fix-001'].index(i)), pack
+        # Project scoping prefers same-project memories when available.
+        assert pack['related_semantic'][0]['id'] == 'hs-fix-003', pack
+        # Recall loop: digest seals the semantic section and verifies fresh.
+        rb = run('recall', 'hs-t1', '--agent', 'codex', '--related-semantic', '3')
+        dig = rb['digest']
+        v = run('recall-verify', 'hs-t1', '--digest', dig, '--agent', 'codex', '--related-semantic', '3')
+        assert v['fresh'] is True, v
+        # Changed bank content is real drift -> digest goes stale (own engine
+        # tag means the semantic section participates in staleness detection).
+        with (bank_home / 'bank.jsonl').open('a', encoding='utf-8') as f:
+            f.write(json.dumps({"id": "hs-fix-004", "text": "auth module followup: rotate session cookies on redirect",
+                                "kind": "memory", "project": "Auth",
+                                "created_at": "2026-08-21T09:00:00+00:00", "tags": ["auth"]}, sort_keys=True) + '\n')
+        v2 = run('recall-verify', 'hs-t1', '--digest', dig, '--agent', 'codex', '--related-semantic', '3')
+        assert v2['fresh'] is False, v2
+        pack2 = run('context', 'hs-t1', '--related-semantic', '3')
+        assert 'hs-fix-004' in [m['id'] for m in pack2['related_semantic']], pack2
+        # recall-stale recomputes with the semantic section and flags it stale:
+        # the drift must be cited by a live handoff for the sweep to see it.
+        run('handoff', 'hs-t1', '--from-agent', 'codex',
+            '--objective', 'continue auth redirect fix',
+            '--evidence', 'recalled with semantic memory', '--recall-digest', dig)
+        stale = ops('recall-stale')
+        item = next(i for i in stale['items'] if i['task_id'] == 'hs-t1')
+        assert item['state'] == 'stale', stale
+        # Doctor now reports the bank as available with the memory count.
+        doc = ops('doctor')
+        note = [n for n in doc.get('notes', []) if n.get('kind') == 'hindsight_status']
+        assert note and note[0]['status'] == 'available' and note[0]['memories'] >= 5, doc
+        # Retain into the existing bank works and lands in recall.
+        ret = run('hindsight-retain', '--text', 'auth module decision: sessions expire after 30 days',
+                  '--kind', 'decision', '--project', 'Auth')
+        assert ret['ok'] is True, ret
+        pack3 = run('context', 'hs-t1', '--related-semantic', '5')
+        assert any('expire after 30 days' in m['content'] for m in pack3['related_semantic']), pack3
+        # The retain was audited with the memory id.
+        with sqlite3.connect(Path(td) / 'state.db') as db:
+            n = db.execute("SELECT COUNT(*) FROM audit_events WHERE action='hindsight_retained'").fetchone()[0]
+            assert n >= 2, n
+        # Bank file was only ever appended, never rewritten: the torn line survives.
+        with (bank_home / 'bank.jsonl').open('r', encoding='utf-8') as f:
+            assert any('this line is torn json' in line for line in f)
+
+
 if __name__ == '__main__':
     main()

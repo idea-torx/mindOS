@@ -1382,6 +1382,12 @@ def _pack_spec():
             lambda ft: (len(ft["id"]) + len(ft["subject"]) + len(ft["predicate"])
                         + len(ft["object"]) + len(ft["valid_from"]) + len(ft["valid_until"])
                         + len(ft["source"]) + 16)),
+        _PackSection("related_semantic", "related_semantic",
+            lambda db, ctx, n: _hindsight_candidates(db, ctx["task_id"], ctx["pack_text"],
+                                                     n, ctx["rel_scope"]),
+            lambda m: (len(m["id"]) + len(m["engine"]) + len(m["kind"]) + len(m["project"])
+                       + len(m["at"]) + sum(len(t) for t in m["tags"]) + len(m["content"]) + 16),
+            decorate=lambda r: {**r, "semantic": True}),
     ]
 
 def _assemble_pack(db, task_id, budget, rel_limit, rel_scope, rerank=False,
@@ -1489,7 +1495,8 @@ def _assemble_pack(db, task_id, budget, rel_limit, rel_scope, rerank=False,
 def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
                 rerank: bool = False, recency_half_life_hours: float = 168.0,
                 pinned_boost: float = 0.5, rel_handoffs: int = 0,
-                dep_context: int = 0, rel_sessions: int = 0, rel_facts: int = 0) -> dict:
+                dep_context: int = 0, rel_sessions: int = 0, rel_facts: int = 0,
+                rel_semantic: int = 0) -> dict:
     """Assemble the prompt-ready context bundle for a task within a char budget.
 
     Thin wrapper over the spec-driven `_assemble_pack`: task summary header +
@@ -1511,7 +1518,8 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
                               "related_handoffs": rel_handoffs,
                               "dep_context": dep_context,
                               "related_sessions": rel_sessions,
-                              "related_facts": rel_facts})
+                              "related_facts": rel_facts,
+                              "related_semantic": rel_semantic})
 
 def task_context(args):
     """Pack a prompt-ready context bundle within a character budget.
@@ -1533,13 +1541,15 @@ def task_context(args):
                              pinned_boost=getattr(args, "pinned_boost", 0.5),
                              rel_handoffs=getattr(args, "related_handoffs", 0),
                              dep_context=getattr(args, "dep_context", 0),
-                                      rel_sessions=getattr(args, "related_sessions", 0),
-                             rel_facts=getattr(args, "related_facts", 0)))
+                             rel_sessions=getattr(args, "related_sessions", 0),
+                             rel_facts=getattr(args, "related_facts", 0),
+                             rel_semantic=getattr(args, "related_semantic", 0)))
 
 def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: int, rel_scope: str,
                          rerank: bool = False, recency_half_life_hours: float = 168.0,
                          pinned_boost: float = 0.5, rel_handoffs: int = 0,
-                         dep_context: int = 0, rel_sessions: int = 0, rel_facts: int = 0) -> dict:
+                         dep_context: int = 0, rel_sessions: int = 0, rel_facts: int = 0,
+                         rel_semantic: int = 0) -> dict:
     """Assemble the recall bundle and its deterministic digest (no audit write).
 
     Shared by `recall` (which audits the digest) and `recall-verify` (which
@@ -1552,7 +1562,7 @@ def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: i
                        rerank=rerank, recency_half_life_hours=recency_half_life_hours,
                        pinned_boost=pinned_boost, rel_handoffs=rel_handoffs,
                        dep_context=dep_context, rel_sessions=rel_sessions,
-                       rel_facts=rel_facts)
+                       rel_facts=rel_facts, rel_semantic=rel_semantic)
     lease_live = bool(row["lease_owner"]) and row["lease_expires_at"] > t
     bundle = {
         **pack,
@@ -1626,6 +1636,8 @@ def _bundle_sections(bundle: dict) -> dict:
             f"{x['session_id']}:{x['seq']}" for x in bundle["related_sessions"]]
     if "related_facts" in bundle:
         sections["related_facts"] = [x["id"] for x in bundle["related_facts"]]
+    if "related_semantic" in bundle:
+        sections["related_semantic"] = [x["id"] for x in bundle["related_semantic"]]
     return sections
 
 def _diff_sections(old: dict, new: dict) -> dict:
@@ -1673,6 +1685,9 @@ def _diff_sections(old: dict, new: dict) -> dict:
     orf, nrf = set(old.get("related_facts") or []), set(new.get("related_facts") or [])
     if orf != nrf:
         changes["related_facts"] = {"added": sorted(nrf - orf), "removed": sorted(orf - nrf)}
+    osem, nsem = set(old.get("related_semantic") or []), set(new.get("related_semantic") or [])
+    if osem != nsem:
+        changes["related_semantic"] = {"added": sorted(nsem - osem), "removed": sorted(osem - nsem)}
     if old["lease"] != new["lease"]:
         changes["lease"] = {"from": old["lease"], "to": new["lease"]}
     orec, nrec = set(old["receipts"]), set(new["receipts"])
@@ -1702,7 +1717,8 @@ def recall(args):
                                       rel_handoffs=getattr(args, "related_handoffs", 0),
                                       dep_context=getattr(args, "dep_context", 0),
                                       rel_sessions=getattr(args, "related_sessions", 0),
-                                      rel_facts=getattr(args, "related_facts", 0))
+                                      rel_facts=getattr(args, "related_facts", 0),
+                                      rel_semantic=getattr(args, "related_semantic", 0))
         # Record the bundle parameters alongside the digest so fleet sweeps
         # (ops.py recall-stale) can recompute the digest exactly as recalled.
         audit(db, "task", args.task_id, "context_recalled",
@@ -1717,6 +1733,7 @@ def recall(args):
                "dep_context": getattr(args, "dep_context", 0),
                 "related_sessions": getattr(args, "related_sessions", 0),
                "related_facts": getattr(args, "related_facts", 0),
+               "related_semantic": getattr(args, "related_semantic", 0),
                "sections": _bundle_sections(bundle)})
     json_out(bundle)
 
@@ -1745,7 +1762,8 @@ def recall_verify(args):
                                       rel_handoffs=getattr(args, "related_handoffs", 0),
                                       dep_context=getattr(args, "dep_context", 0),
                                       rel_sessions=getattr(args, "related_sessions", 0),
-                                      rel_facts=getattr(args, "related_facts", 0))
+                                      rel_facts=getattr(args, "related_facts", 0),
+                                      rel_semantic=getattr(args, "related_semantic", 0))
     json_out({"ok": True, "task_id": args.task_id,
               "fresh": bundle["digest"] == digest,
               "recalled_digest": digest, "current_digest": bundle["digest"]})
@@ -1799,6 +1817,7 @@ def recall_diff(args):
         # digest exactly.
         rel_sess_n = payload.get("related_sessions") or 0
         rel_facts_n = payload.get("related_facts") or 0
+        rel_sema_n = payload.get("related_semantic") or 0
         rerank = bool(payload.get("rerank"))
         half_life = payload.get("recency_half_life_hours")
         boost = payload.get("pinned_boost")
@@ -1814,7 +1833,8 @@ def recall_diff(args):
                                       rel_handoffs=rel_handoffs,
                                       dep_context=dep_ctx_n,
                                       rel_sessions=rel_sess_n,
-                                      rel_facts=rel_facts_n)
+                                      rel_facts=rel_facts_n,
+                                      rel_semantic=rel_sema_n)
         fresh = bundle["digest"] == digest
         out["current_digest"] = bundle["digest"]
         out["fresh"] = fresh
@@ -1887,7 +1907,8 @@ def resume(args):
                                       rel_handoffs=getattr(args, "related_handoffs", 0),
                                       dep_context=getattr(args, "dep_context", 0),
                                       rel_sessions=getattr(args, "related_sessions", 0),
-                                      rel_facts=getattr(args, "related_facts", 0))
+                                      rel_facts=getattr(args, "related_facts", 0),
+                                      rel_semantic=getattr(args, "related_semantic", 0))
         # session_resumed doubles as recall provenance: the digest is recorded
         # with its bundle parameters so a handoff citing a resume digest passes
         # the handoff-check lint and fleet sweeps can recompute it exactly.
@@ -1903,6 +1924,7 @@ def resume(args):
                "dep_context": getattr(args, "dep_context", 0),
                 "related_sessions": getattr(args, "related_sessions", 0),
                "related_facts": getattr(args, "related_facts", 0),
+               "related_semantic": getattr(args, "related_semantic", 0),
                "sections": _bundle_sections(bundle)})
     json_out({"ok": True, "task_id": args.task_id, "action": action, **bundle})
 
@@ -2634,6 +2656,96 @@ def _related_session_candidates(db, task_id: str, text: str, limit: int, scope: 
         d["content"] = snippet(d["content"])
         rows.append(d)
     return rows
+
+# ---------------------------------------------------------------------------
+# Hindsight semantic-memory adapter (read-only recall + guarded retain).
+#
+# Documented bank format ("bank v1"): a single JSONL file at
+# $HERMES_HINDSIGHT_HOME/bank.jsonl (default ~/.hermes/hindsight/bank.jsonl),
+# one memory per line: {"id","text","kind","project","created_at","tags"}.
+# The runtime never mutates a live bank except through `hindsight-retain`,
+# which appends after the same secret guard notes use. Recall is strictly
+# read-only and deterministic (created_at DESC, then id) so pack digests are
+# exactly recomputable; every packed row carries its own engine tag so
+# staleness detection covers the semantic sections independently.
+# ---------------------------------------------------------------------------
+HINDSIGHT_ENGINE_TAG = "hindsight-bank-v1"
+
+def _hindsight_home():
+    return Path(os.environ.get("HERMES_HINDSIGHT_HOME",
+                               Path.home() / ".hermes" / "hindsight"))
+
+def _hindsight_bank_path():
+    return _hindsight_home() / "bank.jsonl"
+
+def _hindsight_available() -> bool:
+    return _hindsight_bank_path().is_file()
+
+def _hindsight_candidates(db, task_id: str, text: str, limit: int, scope: str) -> list:
+    """Semantic recall from a Hindsight bank matching this task's text.
+
+    Same shape discipline as the session/fact collectors: empty when the flag
+    is unset, the bank is absent/unreadable, or the task text has no usable
+    tokens (the graceful-unavailable path — never an error). Deterministic
+    ordering keeps digests stable; snippets are bounded like sessions.
+    """
+    if limit <= 0 or not text.strip() or not _hindsight_available():
+        return []
+    toks = []
+    for raw in text.split():
+        tok = raw.replace('"', "")
+        low = tok.lower()
+        if tok and any(c.isalnum() for c in tok):
+            toks.append(low)
+    if not toks:
+        return []
+    mems = []
+    try:
+        with _hindsight_bank_path().open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    m = json.loads(line)
+                except ValueError:
+                    continue  # a torn/corrupt line degrades, never fails recall
+                if not isinstance(m, dict) or not m.get("text"):
+                    continue
+                mems.append(m)
+    except OSError:
+        return []
+    def matches(m):
+        hay = " ".join(str(m.get(k) or "") for k in
+                       ("text", "kind", "project")).lower() \
+              + " " + " ".join(str(t).lower() for t in (m.get("tags") or []))
+        return any(t in hay for t in toks)
+    hits = [m for m in mems if matches(m)]
+    if scope != "global":
+        try:
+            proj = db.execute("SELECT project FROM tasks WHERE id=?",
+                              (task_id,)).fetchone()
+        except sqlite3.Error:
+            proj = None
+        proj = proj["project"] if proj else ""
+        scoped = [m for m in hits if (m.get("project") or "") in ("", proj)]
+        if scoped:
+            hits = scoped
+    hits.sort(key=lambda m: (str(m.get("created_at") or ""), str(m.get("id") or "")),
+              reverse=True)
+    out = []
+    for m in hits[:max(0, limit)]:
+        txt = str(m.get("text") or "")
+        if len(txt) > SESSION_SNIPPET_CHARS:
+            txt = txt[:SESSION_SNIPPET_CHARS - 1] + "…"
+        out.append({"id": str(m.get("id") or ""),
+                    "engine": HINDSIGHT_ENGINE_TAG,
+                    "kind": str(m.get("kind") or "memory"),
+                    "project": str(m.get("project") or ""),
+                    "at": str(m.get("created_at") or ""),
+                    "tags": sorted(str(t) for t in (m.get("tags") or [])),
+                    "content": txt})
+    return out
 
 def release(args):
     """Voluntarily give up a live lease without consuming retry budget."""
@@ -3820,7 +3932,8 @@ def next_task(args):
                                               rel_handoffs=getattr(args, "related_handoffs", 0),
                                       dep_context=getattr(args, "dep_context", 0),
                                       rel_sessions=getattr(args, "related_sessions", 0),
-                                      rel_facts=getattr(args, "related_facts", 0))
+                                      rel_facts=getattr(args, "related_facts", 0),
+                                      rel_semantic=getattr(args, "related_semantic", 0))
                 # Same provenance contract as `recall`: the digest is recorded
                 # with its bundle parameters so handoffs/completions can cite
                 # it and fleet sweeps can recompute it exactly.
@@ -3836,6 +3949,7 @@ def next_task(args):
                        "dep_context": getattr(args, "dep_context", 0),
                 "related_sessions": getattr(args, "related_sessions", 0),
                        "related_facts": getattr(args, "related_facts", 0),
+                       "related_semantic": getattr(args, "related_semantic", 0),
                        "sections": _bundle_sections(bundle),
                        "via": "next"})
                 out["recall"] = bundle
@@ -3872,6 +3986,7 @@ _PACK_SECTION_FLAGS = {
     "dep_context": "--dep-context",
     "related_sessions": "--related-sessions",
     "related_facts": "--related-facts",
+    "related_semantic": "--related-semantic",
 }
 
 def _protocol_doc() -> dict:
@@ -3967,6 +4082,46 @@ def protocol(args):
         {k: v for k, v in doc.items() if k not in ('sha256', 'created_at')},
         sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     json_out(doc)
+
+def hindsight_retain(args):
+    """Guarded retain of facts/decisions into the Hindsight bank.
+
+    Write path behind the same secret guard as notes: credential-shaped
+    content is refused unless --redact or --allow-secret. Appends one JSONL
+    line to bank.jsonl (creating the bank directory only when explicitly
+    asked via --create); refuses when no bank is configured so a typo'd
+    environment never forks an accidental new memory store. The append is
+    audited in the Autopilot ledger with the memory id.
+    """
+    text = (args.text or "").strip()
+    if not text:
+        raise SystemExit("--text is required")
+    with conn() as db:
+        kinds, guarded = _secret_guard(
+            {"content": text}, getattr(args, "redact", False),
+            getattr(args, "allow_secret", False), args.task_id or "hindsight")
+        t = now()
+        bank = _hindsight_bank_path()
+        if not _hindsight_available():
+            if not args.create:
+                raise SystemExit(
+                    f"no Hindsight bank configured at {bank}; "
+                    "pass --create to initialize one")
+            bank.parent.mkdir(parents=True, exist_ok=True)
+        mid = "hs-" + hashlib.sha256(
+            f"{t}|{guarded['content']}".encode()).hexdigest()[:16]
+        mem = {"id": mid, "text": guarded["content"], "kind": args.kind,
+               "project": args.project or "", "created_at": t,
+               "tags": [x for x in (args.tag or []) if x],
+               **({"secret_kinds": kinds} if kinds else {})}
+        with bank.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(mem, sort_keys=True) + "\n")
+        audit(db, "task", args.task_id or "", "hindsight_retained",
+              {"memory_id": mid, "kind": args.kind,
+               "project": mem["project"],
+               **({"secret_kinds": kinds} if kinds else {})})
+        json_out({"ok": True, "memory_id": mid, "bank": str(bank),
+                  **({"secret_kinds": kinds} if kinds else {})})
 
 def heartbeat(args):
     with conn() as db:
@@ -4355,19 +4510,20 @@ def main():
     p=sub.add_parser("metrics"); p.set_defaults(fn=metrics)
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
     p=sub.add_parser("protocol"); p.set_defaults(fn=protocol)
+    p=sub.add_parser("hindsight-retain"); p.add_argument("--text",required=True); p.add_argument("--kind",default="decision"); p.add_argument("--project",default=""); p.add_argument("--tag",action="append",default=[]); p.add_argument("--task-id",dest="task_id",default=""); p.add_argument("--redact",action="store_true"); p.add_argument("--allow-secret",action="store_true"); p.add_argument("--create",action="store_true"); p.set_defaults(fn=hindsight_retain)
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
     p=sub.add_parser("tag"); p.add_argument("id"); p.add_argument("--tag",action="append",required=True,help="capability/scope tag (repeatable)"); p.set_defaults(fn=tag_task)
     p=sub.add_parser("untag"); p.add_argument("id"); p.add_argument("--tag",required=True); p.set_defaults(fn=untag_task)
     p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
-    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); p.add_argument("--prefer-unblocking",dest="prefer_unblocking",action="store_true",help="tie-break equal-priority candidates by queued dependents freed (critical-path scheduling)"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N Hindsight semantic memories matching this task (no-op when no bank is configured)"); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); p.add_argument("--prefer-unblocking",dest="prefer_unblocking",action="store_true",help="tie-break equal-priority candidates by queued dependents freed (critical-path scheduling)"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.add_argument("--tag",default=""); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=supersede_note)
-    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
-    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
-    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
-    p=sub.add_parser("recall-diff"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.set_defaults(fn=recall_diff)
+    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N Hindsight semantic memories matching this task (no-op when no bank is configured)"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
+    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N Hindsight semantic memories matching this task (no-op when no bank is configured)"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
+    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N Hindsight semantic memories matching this task (no-op when no bank is configured)"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
+    p=sub.add_parser("recall-diff"); p.add_argument("task_id"); p.add_argument("--digest",required=True); _add_rerank_flags(p); p.set_defaults(fn=recall_diff)
     p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--include-expired",dest="include_expired",action="store_true"); _add_rerank_flags(p); p.set_defaults(fn=search_notes)
     p=sub.add_parser("search-handoffs"); p.add_argument("query"); p.add_argument("--task",default=""); p.add_argument("--from-agent",dest="from_agent",default=""); p.add_argument("--to-agent",dest="to_agent",default=""); p.add_argument("--project",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=search_handoffs)
     p=sub.add_parser("session-scan"); p.add_argument("--root",required=True,help="directory tree of session transcripts to inventory (read-only)"); p.add_argument("--profile",default=""); p.add_argument("--project",default=""); p.add_argument("--since",default="",help="only files modified at/after this ISO timestamp"); p.add_argument("--max-file-bytes",dest="max_file_bytes",type=int,default=DEFAULT_SESSION_MAX_FILE_BYTES); p.set_defaults(fn=session_scan)
@@ -4388,7 +4544,7 @@ def main():
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)
     p=sub.add_parser("renew"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=renew)
     p=sub.add_parser("transfer"); p.add_argument("id"); p.add_argument("--from-owner",required=True,dest="from_owner"); p.add_argument("--to-owner",required=True,dest="to_owner"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=transfer)
-    p=sub.add_parser("resume"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=resume)
+    p=sub.add_parser("resume"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N Hindsight semantic memories matching this task (no-op when no bank is configured)"); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=resume)
     p=sub.add_parser("leases"); p.add_argument("--owner"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=leases)
     args=ap.parse_args(); args.fn(args)
 

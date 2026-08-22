@@ -814,6 +814,7 @@ def _fts_index_docs(c, fts: str):
 def doctor(args=None):
     """Read-only consistency sweep: orphan deps, receipt index/files, audit chain, stale leases."""
     problems = []
+    notes = []
     with db() as c:
         for r in c.execute(
             "SELECT d.task_id,d.depends_on FROM task_deps d "
@@ -910,7 +911,26 @@ def doctor(args=None):
                                  'rows': len(src), 'indexed': len(idx),
                                  'missing_from_index': sorted(src - idx)[:20],
                                  'stale_in_index': sorted(idx - src)[:20]})
-    print(json.dumps({'ok': not problems, 'problems': problems, 'count': len(problems)}, sort_keys=True))
+        # Hindsight semantic recall: reported as a healthy-with-note when no
+        # bank is configured — an absent bank degrades --related-semantic to a
+        # no-op and must never fail the doctor sweep, so it lands in `notes`,
+        # never in `problems`.
+        if autopilot._hindsight_available():
+            n = 0
+            try:
+                with autopilot._hindsight_bank_path().open("r", encoding="utf-8") as f:
+                    n = sum(1 for line in f if line.strip())
+                notes.append({'kind': 'hindsight_status', 'status': 'available',
+                              'memories': n})
+            except OSError as e:
+                notes.append({'kind': 'hindsight_unreadable', 'error': str(e),
+                              'note': '--related-semantic degrades to a no-op'})
+        else:
+            notes.append({'kind': 'hindsight_status', 'status': 'unavailable',
+                          'path': str(autopilot._hindsight_bank_path()),
+                          'note': 'no bank configured; --related-semantic is a no-op (healthy-with-note)'})
+    print(json.dumps({'ok': not problems, 'problems': problems, 'count': len(problems),
+                      'notes': notes}, sort_keys=True))
 
 def handoff_check(args=None):
     """Protocol lint over live handoffs: enforce the handoff contract read-only.
@@ -1050,6 +1070,9 @@ def recall_stale(args=None):
                 # way; absent means the original bundle was built without them.
                 rel_sess_n = payload.get('related_sessions') or 0
                 rel_facts_n = payload.get('related_facts') or 0
+                # --related-semantic is optional the same way; absent means the
+                # original bundle was built without the Hindsight section.
+                rel_sema_n = payload.get('related_semantic') or 0
                 # Rerank parameters are optional (feature added after the
                 # provenance loop); absent keys mean the original bundle was
                 # built without rerank, which is exactly how it must be
@@ -1073,7 +1096,8 @@ def recall_stale(args=None):
                         rel_handoffs=rel_handoffs,
                         dep_context=dep_ctx_n,
                         rel_sessions=rel_sess_n,
-                        rel_facts=rel_facts_n)
+                        rel_facts=rel_facts_n,
+                        rel_semantic=rel_sema_n)
                     item['state'] = ('fresh' if bundle['core_digest'] == payload['core_digest']
                                      else 'stale')
                     item['current_digest'] = bundle['digest']
