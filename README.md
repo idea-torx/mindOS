@@ -41,6 +41,20 @@ Persistent findings are carried forward by digest instead of being narrated as
 repeated status spam. A task's model, autonomy grant, recap, receipts, and
 audit events remain tied together for later continuation.
 
+## Managed intra-bot communication
+
+The managed botmail layer adds a provider-neutral envelope for Hermes, DSH,
+OpenCode, Codex, Claude Code, and future harnesses. It validates peer
+allowlists, capability epochs, profile scope, content class, replay budgets,
+and provenance before accepting bot-originated messages. Delivery is
+idempotent and produces accepted, rejected, duplicate, expired, or failed
+receipts. Bot chat remains distinct from user relay, handoffs, and task
+receipts; bounded bot-chat context is profile-scoped and redacted.
+
+The live layer is installed with explicit follow-up gates for Hermes peer-DM
+delivery, gateway roster reconciliation, semantic bot-chat synchronization,
+and the cross-profile end-to-end sentinel.
+
 ## Hermes session-start context
 
 When enabled in the Hermes configuration, MindOS supplies one bounded context
