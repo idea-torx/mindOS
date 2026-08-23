@@ -4499,7 +4499,11 @@ def _case_nanny_bounded_double_run_and_impulse_states():
         assert total_recovered == 1, ([t['recovered'] for t in ticks])
         assert all(t['state'] in VOCAB for t in ticks)
         t2 = ops('nanny')
+        # A quiet second tick must also be finding-clean: a forked audit chain
+        # (concurrent appenders racing the tail read) shows up here first as
+        # broken_link/hash_mismatch noise instead of at the final verify-chain.
         assert t2['recovered'] == [] and t2['repairs'] == []
+        assert t2['counts']['findings_open'] == 0, t2
 
         # ------------------------------------------------------------------
         # working / momentum memory: a repaired finding is resolved, not a
@@ -4544,6 +4548,192 @@ def _case_nanny_bounded_double_run_and_impulse_states():
         breaker = run('facts', '--subject', 'playbook:fts-rebuild')
         assert breaker and breaker[0]['predicate'] == 'breaker-tripped'
         # Every tick left the audit chain intact.
+        assert run('verify-chain')['ok'] is True
+
+
+
+
+@case('runner_activity_and_correction_continuation')
+def _case_runner_activity_and_correction_continuation():
+    with tempfile.TemporaryDirectory() as td:
+        env = os.environ.copy(); env['HERMES_AUTOPILOT_HOME'] = td
+        def run(*args):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
+            if p.returncode: raise AssertionError((args, p.stdout, p.stderr))
+            return json.loads(p.stdout)
+        def run_fail(*args):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
+            if p.returncode == 0: raise AssertionError(('expected refusal', args, p.stdout))
+            return p.stderr
+        def ops(*a):
+            p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=env, text=True, capture_output=True)
+            assert p.returncode == 0, (a, p.stdout, p.stderr)
+            out = p.stdout.strip()
+            dec = json.JSONDecoder(); docs = []; idx = 0
+            while idx < len(out):
+                obj, end = dec.raw_decode(out, idx); docs.append(obj); idx = end
+                while idx < len(out) and out[idx] in ' \n\t': idx += 1
+            return docs[-1]
+        def sql(stmt, params=()):
+            import sqlite3
+            db = sqlite3.connect(Path(td) / 'state.db'); db.execute(stmt, params)
+            db.commit(); db.close()
+        MODEL = 'opencode/x-preview-f-free'
+
+        # ------------------------------------------------------------------
+        # provider-neutral runner receipts: two different harnesses seal the
+        # identical runner/v1 schema; malformed payloads refuse fail-closed;
+        # doctor sees ordinary sealed receipts
+        # ------------------------------------------------------------------
+        run('create', '--project', 'Verify', '--title', 'continuation host', '--id', 'cont-1')
+        ra = run('run-receipt', 'cont-1', '--harness', 'hermes', '--model', MODEL,
+                 '--session', 'sess-a', '--workspace', 'wt-main', '--outcome', 'ran',
+                 '--timeout-seconds', '120', '--capability', 'autopilot-safe')
+        rb = run('run-receipt', 'cont-1', '--harness', 'opencode', '--model', MODEL,
+                 '--session', 'sess-b', '--workspace', 'wt-other', '--outcome', 'failed')
+        assert ra['ok'] and rb['ok']
+        shown = run('show', 'cont-1', '--limit', '10')['receipts']
+        runs = {r['payload']['harness']: r for r in shown if r['kind'] == 'run'}
+        assert set(runs) == {'hermes', 'opencode'}, sorted(runs)
+        keys_a = sorted(runs['hermes']['payload'])
+        assert keys_a == ['capabilities', 'harness', 'model', 'outcome',
+                          'schema', 'session', 'timeout_seconds', 'workspace']
+        assert sorted(runs['opencode']['payload']) == [
+            'capabilities', 'harness', 'model', 'outcome', 'schema', 'session', 'workspace']
+        assert all(p['schema'] == 'runner/v1' for p in
+                   [runs['hermes']['payload'], runs['opencode']['payload']])
+        assert 'invalid harness' in run_fail('run-receipt', 'cont-1', '--harness', 'Bad Harness!',
+                                             '--model', MODEL, '--outcome', 'ran')
+        run_fail('run-receipt', 'cont-1', '--harness', 'hermes', '--model', MODEL, '--outcome', 'exploded')
+        run_fail('run-receipt', 'cont-1', '--harness', 'hermes', '--model', MODEL,
+                 '--outcome', 'ran', '--timeout-seconds', '0')
+
+        # ------------------------------------------------------------------
+        # activity report contract: durable action/intent/state/evidence plus
+        # a declared stall deadline; evidence must really exist on the task
+        # ------------------------------------------------------------------
+        run('claim', 'cont-1', '--owner', 'w', '--minutes', '5')
+        failed_rid = [r for r in shown if r['payload'].get('outcome') == 'failed'][0]['id']
+        err = run_fail('heartbeat', 'cont-1', '--owner', 'w', '--evidence', 'no-such-rid')
+        assert 'not found on this task' in err, err
+        hb = run('heartbeat', 'cont-1', '--owner', 'w',
+                 '--action', 'implemented runner slice', '--intent', 'run full gates',
+                 '--progress-state', 'working', '--stall-deadline', '+30m',
+                 '--evidence', failed_rid)
+        act = hb['activity']
+        assert act['last_action'] == 'implemented runner slice'
+        assert act['next_intent'] == 'run full gates'
+        assert act['progress_state'] == 'working'
+        assert act['stall_deadline'].endswith('+00:00') and act['evidence'] == [failed_rid]
+        run_fail('heartbeat', 'cont-1', '--owner', 'w', '--progress-state', 'vibing')
+
+        # ------------------------------------------------------------------
+        # stalled activity: silence past the declared deadline surfaces as a
+        # typed finding through the existing impulse pipeline, then carries
+        # over compactly; a healthy deadline produces nothing
+        # ------------------------------------------------------------------
+        sql("UPDATE heartbeats SET stall_deadline='2020-01-01T00:00:00+00:00'")
+        s1 = ops('nanny')
+        assert s1['state'] == 'hit_snag', s1['state']
+        stall_f = [f for f in s1['new_findings'] if f['kind'] == 'activity_stalled']
+        assert stall_f and not stall_f[0].get('suggested_repair')   # human seam, no auto-repair
+        sense_f = [f for f in ops('sense')['findings'] if f['kind'] == 'activity_stalled']
+        assert sense_f and sense_f[0]['evidence']['task_id'] == 'cont-1'
+        assert sense_f[0]['evidence']['last_action'] == 'implemented runner slice'
+        stall_hash = stall_f[0]['hash']
+        s2 = ops('nanny')
+        assert stall_hash in s2['carried_over'] and \
+            not [f for f in s2['new_findings'] if f['hash'] == stall_hash]
+        import datetime as _dtm
+        future = (_dtm.datetime.now(_dtm.timezone.utc)
+                  + _dtm.timedelta(hours=1)).replace(microsecond=0).isoformat()
+        sql("UPDATE heartbeats SET stall_deadline=?", (future,))
+        s3 = ops('nanny')
+        assert s3['state'] == 'all_clear', (s3['state'], s3['open_hashes'])
+
+        # ------------------------------------------------------------------
+        # failure taxonomy: infra doubles the backoff base; transient keeps
+        # the standard schedule; the cause is stamped into the audit trail
+        # ------------------------------------------------------------------
+        def iso_diff(iso):
+            import datetime as dtm
+            then = dtm.datetime.fromisoformat(iso)
+            return (then - dtm.datetime.now(dtm.timezone.utc)).total_seconds()
+        run('create', '--project', 'Verify', '--title', 'transient host', '--id', 'tr-1')
+        run('claim', 'tr-1', '--owner', 'w', '--minutes', '5')
+        r_tr = run('fail', 'tr-1', '--owner', 'w', '--reason', 'flake', '--cause', 'transient',
+                   '--backoff-base', '60', '--max-retries', '3')
+        assert r_tr['outcome'] == 'retry_scheduled'
+        ev = run('events', '--entity-id', 'tr-1', '--action', 'task_failed')['events']
+        assert any(e['payload'].get('cause') == 'transient' for e in ev)
+        run('create', '--project', 'Verify', '--title', 'infra host', '--id', 'inf-1')
+        run('claim', 'inf-1', '--owner', 'w', '--minutes', '5')
+        r_in = run('fail', 'inf-1', '--owner', 'w', '--reason', 'network down', '--cause', 'infra',
+                   '--backoff-base', '60', '--backoff-cap', '3600', '--max-retries', '3')
+        assert 100 <= iso_diff(r_in['recover_after']) <= 140, r_in   # 60 doubled to 120
+
+        # ------------------------------------------------------------------
+        # bounded correction continuation under a live grant:
+        # fam-1 -> child A -> grandchild B -> refusal at the cap
+        # ------------------------------------------------------------------
+        run('create', '--project', 'Verify', '--title', 'family root', '--id', 'fam-1')
+        dec = run('declare', 'fam-1', '--model', MODEL, '--autonomy-level', 'L2',
+                  '--granted-by', 'leo', '--grant-hours', '24')
+        run('receipt', 'fam-1', '--kind', 'verification', '--payload', '{"gates":"pass"}')
+        run('claim', 'fam-1', '--owner', 'w', '--minutes', '5')
+        f1 = run('fail', 'fam-1', '--owner', 'w', '--reason', 'wrong logic', '--cause', 'defect',
+                 '--no-retry')
+        c1 = f1['correction']
+        assert c1['spawned'] is True and c1['attempt'] == 1 and c1['inherited_grants'] == 1
+        childA = c1['child_task_id']
+        sa = run('show', childA)
+        assert sa['autonomy_level'] == 'L2' and sa['model_binding'] == MODEL
+        assert 'failure_reason: wrong logic' in sa['description'] and 'prior_attempts: 1' in sa['description']
+        assert 'correction' in sa['tags']
+        grants = run('facts', '--subject', f'autonomy:{childA}')
+        assert len(grants) == 1 and grants[0]['object'] == 'L2' and grants[0]['source'] == 'leo'
+        lineage = run('facts', '--subject', f'task:{childA}')
+        assert {f['predicate']: f['object'] for f in lineage} == {
+            'correction-of': 'fam-1', 'correction-root': 'fam-1'}
+        # the inherited grant is real authority: the child can be claimed
+        run('claim', childA, '--owner', 'w2', '--minutes', '5')
+        fa = run('fail', childA, '--owner', 'w2', '--reason', 'still wrong', '--cause', 'defect',
+                 '--no-retry')
+        c2 = fa['correction']
+        assert c2['spawned'] is True and c2['attempt'] == 2 and c2['family_root'] == 'fam-1'
+        childB = c2['child_task_id']
+        run('claim', childB, '--owner', 'w3', '--minutes', '5')
+        fb = run('fail', childB, '--owner', 'w3', '--reason', 'still still wrong',
+                 '--cause', 'defect', '--no-retry')
+        assert fb['correction'] == {'spawned': False, 'refused': 'max_attempts',
+                                    'family_root': 'fam-1', 'attempts_used': 3}
+        refusals = run('events', '--action', 'correction_refused_max_attempts')['events']
+        assert refusals and refusals[0]['payload']['attempts_used'] == 3
+
+        # ------------------------------------------------------------------
+        # fail-closed paths: no declaration -> no child at all; expired grant
+        # -> child waits ungranted at the existing dispatch seam
+        # ------------------------------------------------------------------
+        run('create', '--project', 'Verify', '--title', 'no declaration', '--id', 'nd-1')
+        run('claim', 'nd-1', '--owner', 'w', '--minutes', '5')
+        rnd = run('fail', 'nd-1', '--owner', 'w', '--reason', 'broken', '--cause', 'defect',
+                  '--no-retry')
+        assert 'correction' not in rnd, rnd.get('correction')
+        run('create', '--project', 'Verify', '--title', 'expired grant', '--id', 'ex-1')
+        run('declare', 'ex-1', '--model', MODEL, '--autonomy-level', 'L1',
+            '--granted-by', 'leo', '--grant-hours', '24')
+        sql("UPDATE facts SET valid_until='2020-01-01T00:00:00+00:00' WHERE predicate='level-granted'")
+        run('claim', 'ex-1', '--owner', 'w', '--force')
+        rex = run('fail', 'ex-1', '--owner', 'w', '--reason', 'broken', '--cause', 'defect',
+                  '--no-retry')
+        assert rex['correction']['spawned'] is True
+        gc = rex['correction']['child_task_id']
+        assert rex['correction']['inherited_grants'] == 0
+        assert run('facts', '--subject', f'autonomy:{gc}') == []
+        # the grant-less child waits at the fail-closed claim seam
+        err = run_fail('claim', gc, '--owner', 'w')
+        assert 'no live autonomy grant' in err, err
+
         assert run('verify-chain')['ok'] is True
 
 
