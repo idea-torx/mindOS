@@ -55,4 +55,17 @@ other worktrees: untouched.
     existing tests_bridge.py convention).
 - [g3] Committed on feat/mindos-gateway-bridge as Leo Felix <leo@matteblack.io>.
   Live install NOT performed from this worktree per contract.
+- [g4] Session-start context integration (mindos-context-injection worktree):
+  inspected the Hermes session lifecycle — `on_session_start`
+  (agent/conversation_loop.py) is observer-only (return value discarded, no
+  context channel); the host's documented injection path is `pre_llm_call`
+  results shaped {"context": ...} which agent/turn_context.py injects
+  ephemerally into the first turn's user message. Added an opt-in
+  `context_pack: true` branch to mindos_gateway_hook.py: on first turn only,
+  run mindos_context_pack.py session-pack under a wall-clock cap and print
+  {"context": <deterministic markdown>} for the host to inject once at
+  session start. No writes, no synthetic messages after turn 1, no system-
+  prompt rewriting; HERMES_MINDOS_CONTEXT off switch and profile isolation
+  preserved end-to-end. tests_context_integration.py 9/9 PASS alongside all
+  existing gates.
 
