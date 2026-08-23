@@ -1,10 +1,74 @@
-# IdeatorX Autopilot Control Plane v1
+# MindOS Autopilot v3
 
-Durable local coordination layer for Hermes, Client Manager, Momentum Manager, cron jobs, and explicitly requested Claude Code work.
+Durable local operating layer for Hermes: memory, context continuity, task coordination, autonomy declarations, bounded continuation, receipts, recovery, and explicit human approval seams.
 
 ## Safety boundary
 
-This v1 is a registry and evidence layer. It does **not** deploy, merge, send external messages, submit applications, or run arbitrary agent commands.
+MindOS coordinates durable work and evidence. It does **not** silently deploy,
+merge, send external messages, submit applications, or cross a human approval
+seam. Autonomous continuation is explicit, model-bound, time-limited, and
+receipt-backed.
+
+## Autopilot v3 continuation
+
+Autopilot v3 adds the missing impulse layer for complex work. A bounded nanny
+tick can recover stale leases, detect findings, run capped approved repairs,
+escalate decisions, and emit an audited state report. It is cron-driven rather
+than a resident daemon, so every tick is bounded and independently observable.
+
+Tasks may declare an autonomy level and exact model/provider binding:
+
+```bash
+python3 "$A" declare <task-id> \
+  --model opencode/x-preview-f-free \
+  --autonomy-level L1 \
+  --granted-by leo \
+  --grant-hours 24
+python3 "$O" nanny --dry-run
+python3 "$O" nanny --max-repairs 2
+```
+
+The nanny reports four compact impulse states:
+
+```text
+all_clear       nothing needs attention
+working         work is active or progressing
+hit_snag        bounded work remains blocked or needs correction
+decision_needed a human approval or breaker decision is required
+```
+
+Persistent findings are carried forward by digest instead of being narrated as
+repeated status spam. A task's model, autonomy grant, recap, receipts, and
+audit events remain tied together for later continuation.
+
+## Hermes session-start context
+
+When enabled in the Hermes configuration, MindOS supplies one bounded context
+pack on the first turn of a new session. It can include relevant session
+history, temporal facts, handoffs, receipts, and semantic memory with
+provenance. Continuation turns receive no repeated injection.
+
+```yaml
+mindos_bridge:
+  context_pack: true
+  context_pack_max_bytes: 4096
+  context_pack_seconds: 15
+
+hooks:
+  pre_llm_call:
+    - command: /Users/leofelix/.hermes/mindos/mindos_gateway_hook.py
+      timeout: 15
+```
+
+The pack is ephemeral and bounded. It does not rewrite the system prompt,
+create synthetic user messages, cross profiles, or bypass redaction. Set
+`HERMES_MINDOS_CONTEXT=off` for an end-to-end opt-out. Use
+`python3 mindos_context_pack.py sentinel --json` to exercise the disposable
+proof path without touching live homes.
+
+## Runtime boundaries
+
+This v3 release is a registry, memory, and continuation layer. It does **not** deploy, merge, send external messages, submit applications, or run arbitrary agent commands.
 
 ## Commands
 
