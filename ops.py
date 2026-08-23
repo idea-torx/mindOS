@@ -3717,6 +3717,172 @@ def repair_fts_rebuild(args=None):
                       'drift_before': drifted, 'rebuilt': rebuilt,
                       'skipped_no_fts5': skipped}, sort_keys=True))
 
+# Nanny impulse vocabulary — closed set, deterministic derivation:
+#   all_clear      nothing to do, fleet healthy;
+#   working        this tick took mutation action (recoveries/repairs);
+#   hit_snag       findings remain after the bounded repair budget;
+#   decision_needed a human decision is being asked for (breaker tripped or
+#                  a requires-user playbook suggested).
+NANNY_STATES = ('all_clear', 'working', 'hit_snag', 'decision_needed')
+_NANNY_MAX_DETAIL = 20
+
+
+def _nanny_last_tick(c):
+    row = c.execute(
+        "SELECT payload_json FROM audit_events WHERE action='nanny_tick' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    try:
+        return json.loads(row['payload_json']) if row else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _nanny_capture_repair(playbook, finding_hash):
+    """Run one playbook repair in-process and return its final JSON plan.
+
+    `repair` streams the whole leased-task lifecycle (claim/receipt/complete
+    documents) before its own plan, so the capture must decode every JSON
+    document and keep the last rather than parsing the buffer as one.
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        repair(SimpleNamespace(playbook=playbook, finding_hash=finding_hash,
+                               dry_run=False, break_after=3, window_hours=24.0,
+                               approved_by=''))
+    out = buf.getvalue().strip()
+    dec = json.JSONDecoder()
+    docs, idx = [], 0
+    while idx < len(out):
+        obj, end = dec.raw_decode(out, idx)
+        docs.append(obj)
+        idx = end
+        while idx < len(out) and out[idx] in ' \n\t':
+            idx += 1
+    return docs[-1] if docs else {}
+
+
+def _nanny_playbook_tier(name, pbs):
+    pb = pbs.get(name)
+    if not pb:
+        return None
+    tier = int(pb.get('blast_radius_tier', '0') or 0)
+    requires_user = str(pb.get('requires_user', '')).lower() == 'true'
+    return {'tier': tier, 'requires_user': requires_user}
+
+
+def nanny(args=None):
+    """One bounded self-healing tick over existing primitives — never a daemon.
+
+    Order per tick: recover (guarded stale-lease sweep) → sense (typed
+    content-hashed findings) → at most --max-repairs tier-0 playbook repairs
+    matched to findings (leases, receipts, breakers, and learning all
+    inherited from `repair`) → escalate (overdue SLA sweep). Double-run safe:
+    every stage is a guarded sweep or a deterministically-idempotent leased
+    task, so a concurrent second tick records skips instead of duplicating
+    work. Each real tick audits one `nanny_tick` event carrying its open
+    finding hashes, so the next tick can diff against it (`carried_over`)
+    and spend narrative only on what changed — momentum memory without spam.
+    """
+    dry = bool(getattr(args, 'dry_run', False))
+    max_repairs = getattr(args, 'max_repairs', 2)
+    t = utc()
+    rec = _capture_json(recover, SimpleNamespace(
+        max_retries=3, dry_run=dry, backoff_base=60, backoff_cap=3600))
+    sn = _capture_json(sense)
+    pbs = _load_playbooks()
+    findings = sn.get('findings', [])
+    decisions = []
+    candidates = []
+    for f in findings:
+        kind = f.get('suggested_repair', '')
+        meta = _nanny_playbook_tier(kind, pbs) if kind else None
+        if not meta:
+            continue
+        if meta['requires_user']:
+            decisions.append({'reason': 'requires_user_playbook', 'playbook': kind,
+                              'finding_hash': f.get('hash')})
+            continue
+        if meta['tier'] != 0:
+            continue
+        candidates.append((kind, f))
+    # Deterministic candidate order: playbook name, then finding hash.
+    seen, ordered = set(), []
+    for kind, f in sorted(candidates, key=lambda c: (c[0], c[1].get('hash', ''))):
+        key = (kind, f.get('hash', ''))
+        if key not in seen:
+            seen.add(key)
+            ordered.append({'playbook': kind, 'finding': f})
+    would_repair, repairs, skipped = [], [], []
+    for cand in ordered[:max_repairs if not dry else len(ordered)]:
+        fh = cand['finding'].get('hash', '')
+        if dry:
+            would_repair.append({'playbook': cand['playbook'], 'finding_hash': fh})
+            continue
+        try:
+            out = _nanny_capture_repair(cand['playbook'], fh)
+            repairs.append({'ok': True, 'playbook': cand['playbook'],
+                            'finding_hash': fh, 'task_id': out.get('task_id', '')})
+        except SystemExit as e:
+            msg = str(e)
+            if 'circuit breaker' in msg:
+                decisions.append({'reason': 'circuit_breaker', 'playbook': cand['playbook'],
+                                  'finding_hash': fh, 'detail': msg.split(': ', 1)[-1][:300]})
+            repairs.append({'ok': False, 'playbook': cand['playbook'],
+                            'finding_hash': fh, 'error': msg[:300]})
+        except Exception as e:  # a broken stage must not kill the tick report
+            repairs.append({'ok': False, 'playbook': cand['playbook'],
+                            'finding_hash': fh, 'error': f'{type(e).__name__}: {e}'[:300]})
+    esc = _capture_json(escalate, SimpleNamespace(dry_run=dry)) if not dry else None
+    # Momentum memory: diff this tick's open hashes against the last audited
+    # one; previously-seen findings are reported compactly, never re-narrated.
+    # Findings whose repair succeeded this tick are resolved, not open — a
+    # fixed snag must not read as a lingering one.
+    repaired_hashes = {r['finding_hash'] for r in repairs if r['ok'] and r.get('finding_hash')}
+    remaining = [f for f in findings if f.get('hash') not in repaired_hashes]
+    prev = None if dry else _nanny_last_tick(db())
+    prev_hashes = set((prev or {}).get('open_hashes', []))
+    open_hashes = sorted({f.get('hash', '') for f in remaining if f.get('hash')})
+    carried = [h for h in open_hashes if h in prev_hashes]
+    fresh = [f for f in remaining if f.get('hash') not in prev_hashes]
+    actions = (len(rec.get('recovered', [])) + len(rec.get('failed', []))
+               + sum(1 for r in repairs if r['ok'])
+               + (len(esc.get('escalated', [])) if esc else 0))
+    if decisions:
+        state = 'decision_needed'
+    elif remaining:
+        state = 'hit_snag'
+    elif actions:
+        state = 'working'
+    else:
+        state = 'all_clear'
+    assert state in NANNY_STATES
+    report = {'ok': True, 'generated_at': t, 'state': state, 'dry_run': dry,
+              'recovered': rec.get('recovered', []),
+              'recover_failed': rec.get('failed', []),
+              'recover_skipped': rec.get('skipped', []),
+              'repairs': repairs,
+              'would_repair': would_repair,
+              'escalated': (esc or {}).get('escalated', []) if not dry else [],
+              'new_findings': [
+                  {k: f[k] for k in f if k in ('id', 'hash', 'kind', 'severity',
+                                               'suggested_repair')}
+                  for f in fresh[:_NANNY_MAX_DETAIL]],
+              'carried_over': carried,
+              'open_hashes': open_hashes,
+              'decisions': decisions,
+              'counts': {'findings_open': len(remaining),
+                         'repaired_this_tick': sum(1 for r in repairs if r['ok']),
+                         'repair_budget': max_repairs}}
+    if not dry:
+        with db() as c:
+            autopilot.audit(c, 'system', 'nanny', 'nanny_tick', {
+                'state': state, 'open_hashes': open_hashes,
+                'recovered': len(report['recovered']),
+                'repaired': report['counts']['repaired_this_tick'],
+                'decisions': decisions})
+    print(json.dumps(report, sort_keys=True))
+
+
 import argparse
 p=argparse.ArgumentParser(); s=p.add_subparsers(dest='cmd',required=True)
 for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning),('doctor',doctor)]:
@@ -3736,6 +3902,7 @@ x=s.add_parser('sense'); x.set_defaults(fn=sense)
 x=s.add_parser('repair'); x.add_argument('playbook'); x.add_argument('--finding-hash',dest='finding_hash',default=''); x.add_argument('--dry-run',action='store_true'); x.add_argument('--break-after',dest='break_after',type=int,default=3,help='trip the circuit breaker after this many repeats of the same finding hash in the window'); x.add_argument('--window-hours',dest='window_hours',type=float,default=24.0); x.add_argument('--approved-by',dest='approved_by',default='',help='user approving a requires_user (tier-gated) playbook'); x.set_defaults(fn=repair)
 x=s.add_parser('repair-list'); x.set_defaults(fn=repair_list)
 x=s.add_parser('fts-rebuild'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=repair_fts_rebuild)
+x=s.add_parser('nanny'); x.add_argument('--dry-run',action='store_true'); x.add_argument('--max-repairs',dest='max_repairs',type=int,default=2,help='cap playbook repairs executed per tick (bounded mutation budget)'); x.set_defaults(fn=nanny)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--backoff-base',type=int,default=60); x.add_argument('--backoff-cap',type=int,default=3600); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('escalate'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=escalate)
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)
