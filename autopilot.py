@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS tasks (
    autonomy_level TEXT NOT NULL DEFAULT '',
    model_binding TEXT NOT NULL DEFAULT '',
    recap TEXT NOT NULL DEFAULT '',
+   failure_cause TEXT NOT NULL DEFAULT '',
    created_at TEXT NOT NULL,
    updated_at TEXT NOT NULL,
    last_receipt TEXT NOT NULL DEFAULT ''
@@ -89,7 +90,12 @@ CREATE TABLE IF NOT EXISTS heartbeats (
   owner TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'alive',
   at TEXT NOT NULL,
-  note TEXT NOT NULL DEFAULT ''
+  note TEXT NOT NULL DEFAULT '',
+  last_action TEXT NOT NULL DEFAULT '',
+  next_intent TEXT NOT NULL DEFAULT '',
+  progress_state TEXT NOT NULL DEFAULT '',
+  stall_deadline TEXT NOT NULL DEFAULT '',
+  evidence TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS receipts (
   id TEXT PRIMARY KEY,
@@ -432,9 +438,15 @@ def _migrate(db) -> None:
         db.execute("ALTER TABLE tasks ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
     if "requires_receipts" not in task_cols:
         db.execute("ALTER TABLE tasks ADD COLUMN requires_receipts TEXT NOT NULL DEFAULT '[]'")
-    for col in ("autonomy_level", "model_binding", "recap"):
+    for col in ("autonomy_level", "model_binding", "recap", "failure_cause"):
         if col not in task_cols:
             db.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    hb_cols = {r[1] for r in db.execute("PRAGMA table_info(heartbeats)")}
+    for col in ("last_action", "next_intent", "progress_state",
+                "stall_deadline", "evidence"):
+        if col not in hb_cols:
+            default = "'[]'" if col == "evidence" else "''"
+            db.execute(f"ALTER TABLE heartbeats ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
     handoff_cols = {r[1] for r in db.execute("PRAGMA table_info(handoffs)")}
     if "recall_digest" not in handoff_cols:
         db.execute("ALTER TABLE handoffs ADD COLUMN recall_digest TEXT NOT NULL DEFAULT ''")
@@ -542,6 +554,15 @@ def audit(db, entity_type: str, entity_id: str, action: str, payload=None) -> No
     """Append an immutable, hash-chained local audit event; never include credentials in payloads."""
     payload_json = json.dumps(payload or {}, sort_keys=True)
     created = now()
+    # Serializing concurrent appenders: the tail read below must not race the
+    # insert, or two writers can both observe the same prev hash and fork the
+    # chain (broken_link + hash_mismatch on every later doctor/sense sweep).
+    # A plain SELECT takes no write lock, so take one up front: BEGIN IMMEDIATE
+    # when no transaction is open yet; otherwise the open transaction already
+    # holds the write lock since its first DML and the read-modify-write is
+    # serialized there.
+    if not db.in_transaction:
+        db.execute("BEGIN IMMEDIATE")
     prev = db.execute("SELECT hash FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
     prev_hash = prev[0] if prev else ""
     h = _chain_hash(prev_hash, entity_type, entity_id, action, payload_json, created)
@@ -2979,6 +3000,144 @@ def _seam_message(conflicts: list) -> str:
 AUTONOMY_LEVELS = {"L0": 0, "L1": 1, "L2": 2}
 _MODEL_BINDING_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
 
+# Self-improvement loop vocabularies: closed sets, validated fail-closed so
+# every harness writes the same shapes and no free-text state can drift.
+FAILURE_CAUSES = {"transient", "infra", "defect"}
+PROGRESS_STATES = {"working", "blocked", "waiting_human", "done"}
+RUN_OUTCOMES = {"ran", "passed", "failed"}
+RUNNER_SCHEMA_VERSION = "runner/v1"
+MAX_CORRECTION_ATTEMPTS = 3
+
+def _valid_failure_cause(cause: str) -> str:
+    c = (cause or "").strip().lower()
+    if not c:
+        return ""
+    if c not in FAILURE_CAUSES:
+        raise SystemExit(f"invalid failure cause: {cause!r} (one of {sorted(FAILURE_CAUSES)})")
+    return c
+
+def _parse_stall_deadline(value: str) -> str:
+    """Absolute ISO deadline or relative +Nm/+Nh from now."""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    m = re.fullmatch(r"\+(\d+)([mh])", v)
+    if m:
+        n = int(m.group(1))
+        if n <= 0:
+            raise SystemExit("--stall-deadline relative offset must be > 0")
+        delta = timedelta(minutes=n) if m.group(2) == "m" else timedelta(hours=n)
+        return (datetime.now(timezone.utc) + delta).replace(microsecond=0).isoformat()
+    try:
+        dt = datetime.fromisoformat(v)
+    except ValueError:
+        raise SystemExit(f"invalid stall deadline: {value!r} (ISO timestamp or +N m/h)")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+def _correction_root_fact(db, task_id: str):
+    row = db.execute(
+        "SELECT object FROM facts WHERE task_id=? AND predicate='correction-root' "
+        "AND valid_until='' ORDER BY created_at DESC LIMIT 1", (task_id,)).fetchone()
+    return row["object"] if row else ""
+
+def _correction_attempts(db, root_id: str) -> int:
+    """Attempts consumed by a correction family: the original failure counts as 1,
+    every spawned child adds one."""
+    own = db.execute(
+        "SELECT COUNT(*) n FROM facts WHERE predicate='correction-root' AND object=?",
+        (root_id,)).fetchone()["n"]
+    return 1 + own
+
+def _mirror_autonomy_grants(db, parent_id: str, child_id: str) -> list:
+    """Copy the parent's currently-live grant facts onto the child's subject.
+
+    Copy, never mint: source stays the named human granter and the validity
+    window is byte-identical, so the child can claim only while Leo's original
+    window for this work is still open. Returns the mirrored fact ids.
+    """
+    t = now()
+    grants = db.execute(
+        "SELECT * FROM facts WHERE subject=? AND predicate='level-granted' AND "
+        + _fact_live_sql() + " ORDER BY created_at", (_autonomy_grant_subject(parent_id), t)).fetchall()
+    mirrored = []
+    for g in grants:
+        fid = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO facts(id,subject,predicate,object,source,task_id,valid_from,valid_until,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (fid, _autonomy_grant_subject(child_id), "level-granted", g["object"],
+             g["source"], "", g["valid_from"], g["valid_until"], t))
+        audit(db, "fact", fid, "autonomy_grant_inherited",
+              {"parent_task_id": parent_id, "child_task_id": child_id,
+               "level": g["object"], "source_fact_id": g["id"],
+               "granted_by": g["source"], "valid_until": g["valid_until"]})
+        mirrored.append(fid)
+    return mirrored
+
+def _create_correction_child(db, parent_row, reason: str, owner: str, run_receipts: list) -> dict:
+    """Bounded next-safe-correction planning from durable evidence.
+
+    The child carries the whole failure story in data — reason, attempt count,
+    prior recap, run receipts — plus lineage facts (`correction-of`,
+    `correction-root`) so any harness can reconstruct the chain. Refuses past
+    MAX_CORRECTION_ATTEMPTS per family with an audited refusal instead of
+    recursing forever. Grant inheritance is copy-not-mint (see
+    _mirror_autonomy_grants); without a live parent grant the child simply
+    waits at the existing dispatch seam.
+    """
+    parent_id = parent_row["id"]
+    root = _correction_root_fact(db, parent_id) or parent_id
+    attempts = _correction_attempts(db, root)
+    if attempts >= MAX_CORRECTION_ATTEMPTS:
+        audit(db, "task", parent_id, "correction_refused_max_attempts",
+              {"owner": owner, "reason": reason, "family_root": root,
+               "attempts_used": attempts, "max_attempts": MAX_CORRECTION_ATTEMPTS})
+        return {"spawned": False, "refused": "max_attempts",
+                "family_root": root, "attempts_used": attempts}
+    seq = db.execute(
+        "SELECT COUNT(*) n FROM facts WHERE predicate='correction-of' AND object=?",
+        (parent_id,)).fetchone()["n"] + 1
+    child_id = f"correct-{parent_id}-{seq}"
+    tags = sorted(set(_task_tags(parent_row)) | {"correction"})
+    t = now()
+    desc = (
+        f"Correction {attempts} of {MAX_CORRECTION_ATTEMPTS - 1} for failed task {parent_id}: "
+        f"{parent_row['title']}\n"
+        f"failure_reason: {reason}\n"
+        f"failure_cause: defect\n"
+        f"prior_attempts: {attempts}\n"
+        f"run_receipts: {json.dumps(run_receipts)}\n"
+        + (f"parent_recap: {parent_row['recap']}\n" if parent_row["recap"] else "")
+        + (f"parent_next_action: {parent_row['next_action']}\n" if parent_row["next_action"] else ""))
+    db.execute(
+        "INSERT INTO tasks(id,project,title,description,owner,status,priority,tags,"
+        "requires_receipts,autonomy_level,model_binding,failure_cause,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (child_id, parent_row["project"], f"Correction {attempts}: {parent_row['title']}",
+         desc, parent_row["owner"] or owner, "queued", parent_row["priority"],
+         json.dumps(tags), parent_row["requires_receipts"], parent_row["autonomy_level"],
+         parent_row["model_binding"], "defect", t, t))
+    for kind, obj in (("correction-of", parent_id), ("correction-root", root)):
+        fid = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO facts(id,subject,predicate,object,source,task_id,valid_from,valid_until,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (fid, f"task:{child_id}", kind, obj, "self-improvement-loop", child_id, t, "", t))
+        audit(db, "fact", fid, "correction_lineage",
+              {"child_task_id": child_id, "predicate": kind, "object": obj})
+    mirrored = []
+    if parent_row["autonomy_level"]:
+        mirrored = _mirror_autonomy_grants(db, parent_id, child_id)
+    audit(db, "task", parent_id, "correction_spawned",
+          {"owner": owner, "child_task_id": child_id, "attempt": attempts,
+           "reason": reason, "run_receipts": run_receipts,
+           "inherited_grant_fact_ids": mirrored})
+    return {"spawned": True, "child_task_id": child_id, "attempt": attempts,
+            "family_root": root, "inherited_grants": len(mirrored)}
+
+
 def _autonomy_rank(level: str) -> int:
     return AUTONOMY_LEVELS.get(level, -1)
 
@@ -3375,6 +3534,16 @@ def fail(args):
       `failed` with the reason preserved in blocked_reason, and direct queued
       dependents are reported as dependents_stranded so the operator sees what
       the permanent failure froze.
+    - With the budget exhausted (or --no-retry) the task goes terminally
+      `failed` with the reason preserved in blocked_reason, and direct queued
+      dependents are reported as dependents_stranded so the operator sees what
+      the permanent failure froze.
+    - `--cause` classifies the failure (transient | infra | defect; default
+      empty = legacy) and selects the continuation strategy deterministically:
+      transient keeps the standard backoff; infra doubles the backoff base
+      (the environment is broken — back off harder); defect plans one bounded
+      correction child on the terminal path when the task's autonomy grant
+      permits it (see _create_correction_child).
     - Audited as `task_failed` (retry scheduled) or `task_failed_terminal`;
       metrics reports failures_retried_total / failures_terminal_total.
     """
@@ -3382,6 +3551,10 @@ def fail(args):
         raise SystemExit("--max-retries must be >= 0")
     if args.backoff_cap < args.backoff_base:
         raise SystemExit("--backoff-cap must be >= --backoff-base")
+    cause = _valid_failure_cause(getattr(args, "cause", ""))
+    if cause == "infra" and args.backoff_base > 0:
+        args.backoff_base *= 2
+        args.backoff_cap = max(args.backoff_cap, args.backoff_base)
     with conn() as db:
         row = task_row(db, args.id)
         if row["status"] in TERMINAL_STATUSES:
@@ -3395,14 +3568,15 @@ def fail(args):
             ra = _backoff_deadline(new_retry, args.backoff_base, args.backoff_cap)
             cur = db.execute(
                 "UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',"
-                "blocked_reason=?,retry_count=?,recover_after=?,updated_at=? "
+                "blocked_reason=?,retry_count=?,recover_after=?,failure_cause=?,updated_at=? "
                 "WHERE id=? AND lease_owner=? AND lease_expires_at>?",
-                (reason, new_retry, ra, t, args.id, args.owner, t))
+                (reason, new_retry, ra, cause, t, args.id, args.owner, t))
             if cur.rowcount != 1:
                 raise SystemExit("lease changed since check; reclaim before failing")
             audit(db, "task", args.id, "task_failed",
                   {"owner": args.owner, "reason": reason, "retry_count": new_retry,
-                   "recover_after": ra or None, "max_retries": args.max_retries})
+                   "recover_after": ra or None, "max_retries": args.max_retries,
+                   **({"cause": cause} if cause else {})})
             out = _task_view(task_row(db, args.id))
             out["outcome"] = "retry_scheduled"
             out["recover_after"] = ra
@@ -3412,17 +3586,29 @@ def fail(args):
                               if d["status"] not in TERMINAL_STATUSES)
             cur = db.execute(
                 "UPDATE tasks SET status='failed',lease_owner='',lease_expires_at='',"
-                "blocked_reason=?,retry_count=?,recover_after='',updated_at=? "
+                "blocked_reason=?,retry_count=?,recover_after='',failure_cause=?,updated_at=? "
                 "WHERE id=? AND lease_owner=? AND lease_expires_at>?",
-                (reason, new_retry, t, args.id, args.owner, t))
+                (reason, new_retry, cause, t, args.id, args.owner, t))
             if cur.rowcount != 1:
                 raise SystemExit("lease changed since check; reclaim before failing")
             audit(db, "task", args.id, "task_failed_terminal",
                   {"owner": args.owner, "reason": reason, "retry_count": new_retry,
-                   "no_retry": bool(args.no_retry), "dependents_stranded": stranded})
+                   "no_retry": bool(args.no_retry), "dependents_stranded": stranded,
+                   **({"cause": cause} if cause else {})})
             out = _task_view(task_row(db, args.id))
             out["outcome"] = "failed_terminal"
             out["dependents_stranded"] = stranded
+            if cause == "defect" and \
+                    _autonomy_rank(task_row(db, args.id)["autonomy_level"] or "") >= _autonomy_rank("L1"):
+                # Correction planning is an autonomy feature: only tasks whose
+                # human explicitly declared L1+ continue themselves. A lapsed
+                # grant still plans the child, but the child inherits nothing
+                # live and waits at the existing dispatch seam.
+                run_rids = [r["id"] for r in db.execute(
+                    "SELECT id FROM receipts WHERE task_id=? AND kind='run' ORDER BY created_at",
+                    (args.id,)).fetchall()]
+                out["correction"] = _create_correction_child(
+                    db, task_row(db, args.id), reason, args.owner, run_rids)
         json_out(out)
 
 def block(args):
@@ -4285,6 +4471,23 @@ def hindsight_retain(args):
                   **({"secret_kinds": kinds} if kinds else {})})
 
 def heartbeat(args):
+    """Lease renewal plus an optional durable activity report.
+
+    The report is the anti-silence contract: what was last meaningfully done
+    (`--action`), the concrete next intent (`--intent`), a bounded progress
+    state, receipt ids proving the claim (`--evidence`, must exist on this
+    task), and how long silence is healthy (`--stall-deadline`). A passed
+    stall deadline surfaces to the fleet as an `activity_stalled` finding via
+    ops.py sense — long before the lease itself expires. All fields are
+    optional; without them the command is byte-compatible with legacy use.
+    """
+    action = (getattr(args, "action", "") or "").strip()
+    intent = (getattr(args, "intent", "") or "").strip()
+    state = getattr(args, "progress_state", "") or ""
+    if state and state not in PROGRESS_STATES:
+        raise SystemExit(f"invalid progress state: {state!r} (one of {sorted(PROGRESS_STATES)})")
+    deadline = _parse_stall_deadline(getattr(args, "stall_deadline", "") or "")
+    evidence = [r.strip() for r in (getattr(args, "evidence", None) or []) if r.strip()]
     with conn() as db:
         row = task_row(db, args.id)
         _require_epoch(row, getattr(args, "epoch", None), "heartbeat")
@@ -4299,24 +4502,87 @@ def heartbeat(args):
             if row["lease_owner"] and row["lease_owner"] != args.owner:
                 raise SystemExit(f"lease owned by {row['lease_owner']}")
             raise SystemExit("lease expired; reclaim before heartbeat")
-        db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"alive",now(),args.note))
-        audit(db, "task", args.id, "heartbeat", {"owner": args.owner, "lease_expires_at": exp})
-        json_out({"ok": True, "task_id": args.id, "status": "running", "lease_expires_at": exp,
-                  "lease_epoch": row["lease_epoch"], "heartbeat_at": now()})
+        if evidence:
+            known = {r["id"] for r in db.execute(
+                "SELECT id FROM receipts WHERE task_id=?", (args.id,)).fetchall()}
+            missing = [rid for rid in evidence if rid not in known]
+            if missing:
+                raise SystemExit(f"evidence receipts not found on this task: {missing}")
+        db.execute(
+            "INSERT INTO heartbeats(task_id,owner,state,at,note,last_action,next_intent,"
+            "progress_state,stall_deadline,evidence) VALUES(?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,"
+            "at=excluded.at,note=excluded.note,last_action=excluded.last_action,"
+            "next_intent=excluded.next_intent,progress_state=excluded.progress_state,"
+            "stall_deadline=excluded.stall_deadline,evidence=excluded.evidence",
+            (args.id, args.owner, "alive", now(), args.note, action, intent,
+             state, deadline, json.dumps(evidence)))
+        audit(db, "task", args.id, "heartbeat",
+              {"owner": args.owner, "lease_expires_at": exp,
+               **({"last_action": action} if action else {}),
+               **({"next_intent": intent} if intent else {}),
+               **({"progress_state": state} if state else {}),
+               **({"stall_deadline": deadline} if deadline else {}),
+               **({"evidence": evidence} if evidence else {})})
+        json_out({"ok": True, "task_id": args.id, "status": "running",
+                  "lease_expires_at": exp, "lease_epoch": row["lease_epoch"],
+                  "heartbeat_at": now(),
+                  "activity": {"last_action": action, "next_intent": intent,
+                               "progress_state": state, "stall_deadline": deadline,
+                               "evidence": evidence}})
 
-def receipt(args):
-    payload = json.loads(args.payload) if args.payload else {}
+def run_receipt(args):
+    """Seal a provider-neutral runner/v1 execution record as a `run` receipt.
+
+    One common schema for every harness (hermes/dsh/opencode/codex/claude-code/
+    ...): harness, exact provider/model binding, session and workspace ids,
+    outcome, optional timeout and capability tags. Fail-closed validation keeps
+    the vocabulary closed; the sealed file/hash path is identical to every
+    other receipt so doctor guards run records like all evidence.
+    """
+    harness = (args.harness or "").strip().lower()
+    if not TAG_RE.fullmatch(harness):
+        raise SystemExit(f"invalid harness: {args.harness!r} (lowercase tag token)")
+    model = _valid_model_binding(args.model)
+    session = (args.session or "").strip()
+    workspace = (args.workspace or "").strip()
+    for name, v in (("session", session), ("workspace", workspace)):
+        if len(v) > 256:
+            raise SystemExit(f"--{name} too long (max 256 chars)")
+    if args.outcome not in RUN_OUTCOMES:
+        raise SystemExit(f"invalid outcome: {args.outcome!r} (one of {sorted(RUN_OUTCOMES)})")
+    timeout = getattr(args, "timeout_seconds", None)
+    if timeout is not None and timeout <= 0:
+        raise SystemExit("--timeout-seconds must be > 0")
+    capabilities = [_valid_tag(c) for c in (args.capability or [])]
+    payload = {"schema": RUNNER_SCHEMA_VERSION, "harness": harness, "model": model,
+               "session": session, "workspace": workspace, "outcome": args.outcome,
+               "capabilities": capabilities}
+    if timeout is not None:
+        payload["timeout_seconds"] = timeout
+    sub = _seal_receipt(args.task_id, "run", payload)
+    with conn() as db:
+        audit(db, "task", args.task_id, "run_receipt",
+              {"receipt_id": sub["receipt_id"], "kind": "run", "harness": harness,
+               "model": model, "outcome": args.outcome})
+    sub["payload"] = payload
+    json_out(sub)
+
+def _seal_receipt(task_id: str, kind: str, payload: dict) -> dict:
+    """Core receipt sealing shared by every receipt producer: hash-chained row,
+    atomic 0600 file whose sha256 is recorded so doctor can detect tampering,
+    last_receipt pointer, audited `receipt` event."""
     rid = uuid.uuid4().hex
     created = now()
-    data = json.dumps({"id":rid,"task_id":args.task_id,"kind":args.kind,"created_at":created,"payload":payload}, indent=2, sort_keys=True)+"\n"
+    data = json.dumps({"id":rid,"task_id":task_id,"kind":kind,"created_at":created,"payload":payload}, indent=2, sort_keys=True)+"\n"
     # Seal the receipt file: the sha256 recorded in SQLite must match the bytes
     # on disk, so doctor can detect silent corruption or tampering later.
     file_hash = hashlib.sha256(data.encode()).hexdigest()
     with conn() as db:
-        task_row(db, args.task_id)
-        db.execute("INSERT INTO receipts(id,task_id,kind,payload_json,created_at,file_hash) VALUES(?,?,?,?,?,?)", (rid,args.task_id,args.kind,json.dumps(payload,sort_keys=True),created,file_hash))
-        db.execute("UPDATE tasks SET last_receipt=?,updated_at=? WHERE id=?", (rid,created,args.task_id))
-        audit(db, "task", args.task_id, "receipt", {"receipt_id": rid, "kind": args.kind})
+        task_row(db, task_id)
+        db.execute("INSERT INTO receipts(id,task_id,kind,payload_json,created_at,file_hash) VALUES(?,?,?,?,?,?)", (rid,task_id,kind,json.dumps(payload,sort_keys=True),created,file_hash))
+        db.execute("UPDATE tasks SET last_receipt=?,updated_at=? WHERE id=?", (rid,created,task_id))
+        audit(db, "task", task_id, "receipt", {"receipt_id": rid, "kind": kind})
     target = RECEIPTS / f"{rid}.json"
     fd, tmp = tempfile.mkstemp(prefix=f".{rid}.", dir=RECEIPTS)
     try:
@@ -4324,7 +4590,11 @@ def receipt(args):
         os.chmod(tmp, 0o600); os.replace(tmp, target)
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
-    json_out({"ok": True, "receipt_id": rid, "task_id": args.task_id, "sha256": file_hash})
+    return {"ok": True, "receipt_id": rid, "task_id": task_id, "sha256": file_hash}
+
+def receipt(args):
+    payload = json.loads(args.payload) if args.payload else {}
+    json_out(_seal_receipt(args.task_id, args.kind, payload))
 
 def show(args):
     with conn() as db:
@@ -4653,7 +4923,7 @@ def main():
     p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.add_argument("--receipt",dest="evidence_receipts",action="append",default=[],help="evidence receipt id on this task cited by the completion (repeatable)"); p.add_argument("--recap",default="",help="durable where-this-leaves-off recap stamped into the completed audit event (max 2000 chars)"); p.set_defaults(fn=complete)
     p=sub.add_parser("declare"); p.add_argument("id"); p.add_argument("--model",required=True,help="exact provider/model binding allowed to execute this task (e.g. opencode/x-preview-f-free)"); p.add_argument("--autonomy-level",dest="autonomy_level",choices=sorted(AUTONOMY_LEVELS),default="L1"); p.add_argument("--granted-by",dest="granted_by",required=True,help="the human explicitly granting this autonomy level"); p.add_argument("--grant-hours",dest="grant_hours",type=float,default=24.0,help="grant validity window in hours (>0; default 24)"); p.set_defaults(fn=declare)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
-    p=sub.add_parser("fail"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.add_argument("--no-retry",dest="no_retry",action="store_true",help="skip the retry budget: fail terminally on the first attempt"); p.add_argument("--max-retries",dest="max_retries",type=int,default=3); p.add_argument("--backoff-base",dest="backoff_base",type=int,default=60); p.add_argument("--backoff-cap",dest="backoff_cap",type=int,default=3600); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=fail)
+    p=sub.add_parser("fail"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.add_argument("--cause",default="",choices=["",*sorted(FAILURE_CAUSES)],help="failure taxonomy: transient (standard backoff), infra (doubled backoff), defect (bounded correction child on terminal failure)"); p.add_argument("--no-retry",dest="no_retry",action="store_true",help="skip the retry budget: fail terminally on the first attempt"); p.add_argument("--max-retries",dest="max_retries",type=int,default=3); p.add_argument("--backoff-base",dest="backoff_base",type=int,default=60); p.add_argument("--backoff-cap",dest="backoff_cap",type=int,default=3600); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=fail)
     p=sub.add_parser("block"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=block)
     p=sub.add_parser("unblock"); p.add_argument("id"); p.add_argument("--owner",required=True); p.set_defaults(fn=unblock)
     p=sub.add_parser("defer"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--until",default=""); p.set_defaults(fn=defer)
@@ -4665,7 +4935,8 @@ def main():
     p=sub.add_parser("verify-chain"); p.add_argument("--checkpoint",default=""); p.set_defaults(fn=verify_chain)
     p=sub.add_parser("events"); p.add_argument("--entity-type"); p.add_argument("--entity-id"); p.add_argument("--action"); p.add_argument("--since",default=""); p.add_argument("--until",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--verify",action="store_true"); p.set_defaults(fn=events)
     p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--force",action="store_true",help="claim even if another live lease holds the same worktree/branch seam"); p.set_defaults(fn=claim)
-    p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=heartbeat)
+    p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--action",default="",help="last meaningful action (durable activity report)"); p.add_argument("--intent",default="",help="concrete next intent (durable activity report)"); p.add_argument("--progress-state",dest="progress_state",default="",choices=["",*sorted(PROGRESS_STATES)]); p.add_argument("--evidence",action="append",default=[],help="receipt id on this task backing the report (repeatable)"); p.add_argument("--stall-deadline",dest="stall_deadline",default="",help="ISO timestamp or +Nm/+Nh: how long silence is healthy before the fleet flags a stall"); p.set_defaults(fn=heartbeat)
+    p=sub.add_parser("run-receipt"); p.add_argument("task_id"); p.add_argument("--harness",required=True,help="executor harness token (hermes/dsh/opencode/codex/claude-code/...)"); p.add_argument("--model",required=True,help="exact provider/model binding used for the run"); p.add_argument("--session",default="",help="harness session id"); p.add_argument("--workspace",default="",help="workspace/worktree the run executed in"); p.add_argument("--outcome",choices=sorted(RUN_OUTCOMES),required=True); p.add_argument("--timeout-seconds",dest="timeout_seconds",type=int,default=None); p.add_argument("--capability",action="append",default=[],help="capability tag exercised by the run (repeatable)"); p.set_defaults(fn=run_receipt)
     p=sub.add_parser("receipt"); p.add_argument("task_id"); p.add_argument("--kind",required=True); p.add_argument("--payload",default="{}"); p.set_defaults(fn=receipt)
     p=sub.add_parser("list"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--overdue",action="store_true"); p.add_argument("--tag",default=""); p.set_defaults(fn=list_tasks)
     p=sub.add_parser("show"); p.add_argument("id"); p.add_argument("--limit",type=int,default=20); p.set_defaults(fn=show)
