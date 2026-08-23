@@ -32,6 +32,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -161,6 +162,41 @@ def _session_candidates(db, query: str, profile: str, project: str,
         return [], f"unavailable ({type(e).__name__})"
 
 
+def _bot_candidates(db, profile: str, query: str,
+                    limit: int) -> tuple[list, str]:
+    """Managed intra-bot messages scoped to one target profile.
+
+    Exact-profile match only — bot chat addressed to another profile can
+    never enter this pack. The table is owned by mindos_botmail.py and may
+    not exist yet; that degrades honestly instead of failing the pack.
+    """
+    try:
+        conds, vals = [], []
+        if profile:
+            conds.append("target_profile=?")
+            vals.append(profile)
+        toks = [t for t in re.findall(r"[a-z0-9]+", (query or "").lower())
+                if t] if query else []
+        if toks:
+            conds.append("(" + " OR ".join("content LIKE ?" for _ in toks) + ")")
+            vals.extend("%" + t + "%" for t in toks)
+        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+        rows = db.execute(
+            "SELECT message_id,sender_bot,correlation_id,content_class,"
+            "content,at,autonomy_level,model_binding,provider "
+            "FROM bot_messages" + where +
+            " ORDER BY at DESC, message_id ASC LIMIT ?",
+            (*vals, max(0, limit))).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["content"] = _snippet(d["content"])
+            out.append(d)
+        return out, ("ok" if out else "empty")
+    except Exception as e:  # noqa: BLE001
+        return [], f"unavailable ({type(e).__name__})"
+
+
 def _semantic_candidates(query: str, limit: int) -> tuple[list, str]:
     if limit <= 0 or not ap._hindsight_available():
         return [], ("empty" if limit <= 0 else "unavailable (no bank configured)")
@@ -191,7 +227,7 @@ def build_pack(profile: str = "", project: str = "", query: str = "",
                max_bytes: int = 4096, max_items: int = 24,
                facts_limit: int = 8, handoffs_limit: int = 4,
                receipts_limit: int = 4, sessions_limit: int = 6,
-               semantic_limit: int = 4, max_age_hours: float = 12.0,
+               bots_limit: int = 4, semantic_limit: int = 4, max_age_hours: float = 12.0,
                redact: bool = False, allow_secret: bool = False) -> dict:
     """Assemble the bounded session-start pack. Read-only; never raises."""
     max_bytes = max(256, int(max_bytes))
@@ -261,9 +297,14 @@ def build_pack(profile: str = "", project: str = "", query: str = "",
             sections["session_context"] = []
             fit("session_context", sessions, sessions_limit, st,
                 {"profile_scope": profile or "*"})
+            bots, st = _bot_candidates(db, profile, query, bots_limit)
+            sections["bot_chat"] = []
+            fit("bot_chat", bots, bots_limit, st,
+                {"profile_scope": profile or "*"})
     except Exception as e:  # noqa: BLE001 — no MindOS home/DB at all: honest degradation
         enabled_db = False
-        for s in ("temporal_facts", "handoffs", "receipts", "session_context"):
+        for s in ("temporal_facts", "handoffs", "receipts", "session_context",
+                  "bot_chat"):
             sources[s] = {"status": f"unavailable ({type(e).__name__})",
                           "requested_items": 0, "matched_items": 0, "packed_items": 0}
             sections[s] = []
@@ -286,6 +327,7 @@ def build_pack(profile: str = "", project: str = "", query: str = "",
                    "facts_limit": facts_limit, "handoffs_limit": handoffs_limit,
                    "receipts_limit": receipts_limit,
                    "sessions_limit": sessions_limit,
+                   "bots_limit": bots_limit,
                    "semantic_limit": semantic_limit,
                    "max_age_hours": max_age_hours,
                    "redact": redact, "allow_secret": allow_secret},
@@ -331,8 +373,9 @@ def cmd_session_pack(args):
     pack = build_pack(profile=args.profile, project=args.project, query=args.query,
                       max_bytes=args.max_bytes, max_items=args.max_items,
                       facts_limit=args.facts, handoffs_limit=args.handoffs,
-                      receipts_limit=args.receipts, sessions_limit=args.sessions,
-                      semantic_limit=args.semantic, max_age_hours=args.max_age_hours,
+                    receipts_limit=args.receipts, sessions_limit=args.sessions,
+                    bots_limit=args.bots,
+                    semantic_limit=args.semantic, max_age_hours=args.max_age_hours,
                       redact=args.redact, allow_secret=args.allow_secret)
     if getattr(args, "out", ""):
         out = Path(args.out).expanduser()
@@ -370,6 +413,7 @@ def cmd_verify_pack(args):
         handoffs_limit=int(params.get("handoffs_limit", 4)),
         receipts_limit=int(params.get("receipts_limit", 4)),
         sessions_limit=int(params.get("sessions_limit", 6)),
+        bots_limit=int(params.get("bots_limit", 4)),
         semantic_limit=int(params.get("semantic_limit", 4)),
         max_age_hours=float(params.get(
             "max_age_hours",
@@ -527,6 +571,7 @@ def main():
     sp.add_argument("--handoffs", type=int, default=4)
     sp.add_argument("--receipts", type=int, default=4)
     sp.add_argument("--sessions", type=int, default=6)
+    sp.add_argument("--bots", type=int, default=4)
     sp.add_argument("--semantic", type=int, default=4)
     sp.add_argument("--max-age-hours", dest="max_age_hours", type=float, default=12.0)
     sp.add_argument("--redact", action="store_true")
