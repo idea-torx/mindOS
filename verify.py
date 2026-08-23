@@ -4351,6 +4351,201 @@ def _case_sense_repair_breaker_learning():
         # The chain stayed intact across create/claim/receipt/complete/breaker events.
         assert run('verify-chain')['ok'] is True
 
+@case('autonomy_declaration_grant_expiry_and_enforcement')
+def _case_autonomy_declaration_grant_expiry_and_enforcement():
+    with tempfile.TemporaryDirectory() as td:
+        env = os.environ.copy(); env['HERMES_AUTOPILOT_HOME'] = td
+        def run(*args):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
+            if p.returncode: raise AssertionError((args, p.stdout, p.stderr))
+            return json.loads(p.stdout)
+        def run_fail(*args):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
+            assert p.returncode != 0, ('expected failure', args, p.stdout, p.stderr)
+            return p.stderr
+        import sqlite3
+
+        # ------------------------------------------------------------------
+        # declaration: additive metadata + windowed human grant fact, stamped
+        # ------------------------------------------------------------------
+        run('create', '--project', 'Verify', '--title', 'declared work', '--id', 'auto-1')
+        dec = run('declare', 'auto-1', '--model', 'opencode/x-preview-f-free',
+                  '--autonomy-level', 'L1', '--granted-by', 'leo', '--grant-hours', '1')
+        assert dec['autonomy_level'] == 'L1' and dec['model_binding'] == 'opencode/x-preview-f-free'
+        assert dec['grant']['granted_by'] == 'leo' and dec['grant']['valid_until']
+        grants = run('facts', '--subject', 'autonomy:auto-1')
+        assert len(grants) == 1 and grants[0]['predicate'] == 'level-granted' \
+            and grants[0]['object'] == 'L1' and grants[0]['source'] == 'leo'
+        ev = [e for e in run('show', 'auto-1')['audit'] if e['action'] == 'autonomy_declared']
+        assert len(ev) == 1 and ev[0]['payload']['granted_by'] == 'leo' \
+            and ev[0]['payload']['grant_fact_id'] == grants[0]['id']
+        err = run_fail('declare', 'auto-1', '--model', 'm/x', '--granted-by', '')
+        assert '--granted-by is required' in err                     # fail-closed: a named human grants
+        err = run_fail('declare', 'auto-1', '--model', 'bad model!', '--granted-by', 'leo')
+        assert 'invalid model binding' in err
+
+        # ------------------------------------------------------------------
+        # enforcement: claim allowed under a live grant, refused once expired
+        # ------------------------------------------------------------------
+        run('claim', 'auto-1', '--owner', 'bot', '--minutes', '5')
+        run('release', 'auto-1', '--owner', 'bot')
+        db = sqlite3.connect(Path(td) / 'state.db')
+        db.execute("UPDATE facts SET valid_until='2020-01-01T00:00:00+00:00' WHERE predicate='level-granted'")
+        db.commit(); db.close()
+        err = run_fail('claim', 'auto-1', '--owner', 'bot2', '--minutes', '5')
+        assert 'no live autonomy grant' in err, err
+        refusals = run('events', '--action', 'claim_refused_autonomy', '--entity-id', 'auto-1')
+        assert refusals['count'] == 1 and refusals['events'][0]['payload']['reason'] == 'no_live_grant'
+        # --force is the deliberate override, recorded in the claimed event.
+        forced = run('claim', 'auto-1', '--owner', 'bot2', '--minutes', '5', '--force')
+        assert forced['status'] == 'claimed'
+        claimed_ev = next(e for e in run('show', 'auto-1')['audit']
+                          if e['action'] == 'claimed')   # show lists newest-first
+        assert claimed_ev['payload']['autonomy_override']['reason'] == 'no_live_grant'
+        run('release', 'auto-1', '--owner', 'bot2')
+
+        # ------------------------------------------------------------------
+        # dispatch skips ungranted work instead of failing after the pick
+        # ------------------------------------------------------------------
+        nx = run('next', '--claim', '--owner', 'bot3', '--explain')
+        picked_ids = [t['id'] for t in ([nx['task']] if nx.get('task') else [])]
+        assert 'auto-1' not in picked_ids
+        skip_reasons = {s['task_id']: s['reason'] for s in nx.get('skipped', [])}
+        assert skip_reasons.get('auto-1') == 'autonomy_grant_missing', (nx, skip_reasons)
+
+        # ------------------------------------------------------------------
+        # a lower-level live grant cannot cover a higher declared level
+        # ------------------------------------------------------------------
+        run('declare', 'auto-1', '--model', 'opencode/x-preview-f-free',
+            '--autonomy-level', 'L1', '--granted-by', 'leo', '--grant-hours', '1')
+        db = sqlite3.connect(Path(td) / 'state.db')
+        db.execute("UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',autonomy_level='L2' WHERE id='auto-1'")
+        db.commit(); db.close()
+        err = run_fail('claim', 'auto-1', '--owner', 'bot4', '--minutes', '5')
+        assert 'the live grant is only L1' in err, err
+        refusals = run('events', '--action', 'claim_refused_autonomy', '--entity-id', 'auto-1')
+        assert refusals['events'][0]['payload']['reason'] == 'grant_below_declared_level'  # newest first
+
+        # ------------------------------------------------------------------
+        # recap metadata stamps into the completed audit event beside receipts
+        # ------------------------------------------------------------------
+        run('create', '--project', 'Verify', '--title', 'recapped work', '--id', 'recap-1')
+        run('declare', 'recap-1', '--model', 'opencode/x-preview-f-free',
+            '--autonomy-level', 'L0', '--granted-by', 'leo', '--grant-hours', '1')
+        run('claim', 'recap-1', '--owner', 'bot', '--minutes', '5')
+        run('receipt', 'recap-1', '--kind', 'verification', '--payload', '{"result": "pass"}')
+        done = run('complete', 'recap-1', '--owner', 'bot', '--note', 'done',
+                   '--recap', 'shipped the vertical slice; next: sealed recaps')
+        assert done['status'] == 'completed'
+        shown = run('show', 'recap-1')
+        assert shown['recap'] == 'shipped the vertical slice; next: sealed recaps'
+        comp = next(e for e in reversed(shown['audit']) if e['action'] == 'completed')
+        assert comp['payload']['recap'] == shown['recap']
+        assert any(r['kind'] == 'verification' for r in shown['receipts'])
+        assert run('verify-chain')['ok'] is True
+
+
+@case('nanny_bounded_double_run_and_impulse_states')
+def _case_nanny_bounded_double_run_and_impulse_states():
+    with tempfile.TemporaryDirectory() as td:
+        env = os.environ.copy(); env['HERMES_AUTOPILOT_HOME'] = td
+        def run(*args):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
+            if p.returncode: raise AssertionError((args, p.stdout, p.stderr))
+            return json.loads(p.stdout)
+        def ops(*a):
+            p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), *a], env=env, text=True, capture_output=True)
+            assert p.returncode == 0, (a, p.stdout, p.stderr)
+            out = p.stdout.strip()
+            dec = json.JSONDecoder(); docs = []; idx = 0
+            while idx < len(out):
+                obj, end = dec.raw_decode(out, idx); docs.append(obj); idx = end
+                while idx < len(out) and out[idx] in ' \n\t': idx += 1
+            return docs[-1]
+        import sqlite3
+        VOCAB = {'all_clear', 'working', 'hit_snag', 'decision_needed'}
+
+        def inject_fts_drift(tag):
+            db = sqlite3.connect(Path(td) / 'state.db')
+            rowid = db.execute("SELECT rowid FROM notes ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+            db.execute("DELETE FROM notes_fts WHERE rowid=?", (rowid,))
+            db.commit(); db.close()
+
+        run('create', '--project', 'Verify', '--title', 'drift host', '--id', 'drift-1')
+        run('note', 'drift-1', '--content', 'drift probe body')
+
+        # ------------------------------------------------------------------
+        # bounded tick: dry-run mutates nothing; states stay in the closed
+        # impulse vocabulary derived from actual tick results
+        # ------------------------------------------------------------------
+        run('create', '--project', 'Verify', '--title', 'stale host', '--id', 'stale-1')
+        run('claim', 'stale-1', '--owner', 'ghost', '--minutes', '0')
+        dry = ops('nanny', '--dry-run')
+        assert dry['state'] in VOCAB and dry['dry_run'] is True
+        assert dry['counts']['repair_budget'] >= 0
+        assert run('show', 'stale-1')['status'] in ('claimed', 'running')   # untouched
+
+        # ------------------------------------------------------------------
+        # double-run safety: concurrent ticks cannot both reclaim one lease,
+        # and a second serial tick finds nothing left to do
+        # ------------------------------------------------------------------
+        procs = [subprocess.Popen(
+            [sys.executable, str(ROOT / 'ops.py'), 'nanny'],
+            env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
+        results = [p.communicate() + (p.returncode,) for p in procs]
+        assert all(r[2] == 0 for r in results), results
+        ticks = [json.loads(r[0].strip().splitlines()[-1]) for r in results]
+        total_recovered = sum(len(t['recovered']) for t in ticks)
+        assert total_recovered == 1, ([t['recovered'] for t in ticks])
+        assert all(t['state'] in VOCAB for t in ticks)
+        t2 = ops('nanny')
+        assert t2['recovered'] == [] and t2['repairs'] == []
+
+        # ------------------------------------------------------------------
+        # working / momentum memory: a repaired finding is resolved, not a
+        # lingering snag; a persistent finding carries over compactly
+        # ------------------------------------------------------------------
+        inject_fts_drift('a')
+        t3 = ops('nanny')
+        assert t3['state'] == 'working', t3
+        assert any(r['ok'] and r['playbook'] == 'fts-rebuild' for r in t3['repairs'])
+        assert t3['counts']['findings_open'] == 0          # repaired this tick
+        run('create', '--project', 'Verify', '--title', 'bare completion', '--id', 'bare-1')
+        run('claim', 'bare-1', '--owner', 'w', '--minutes', '5')
+        run('complete', 'bare-1', '--owner', 'w')           # no receipts: snag
+        t4 = ops('nanny')
+        assert t4['state'] == 'hit_snag', t4
+        snag_hash = t4['open_hashes'][0]
+        assert any(f['kind'].startswith('unverified_') for f in t4['new_findings'])
+        t5 = ops('nanny')
+        assert t5['state'] == 'hit_snag'
+        assert snag_hash in t5['carried_over'], t5          # seen last tick
+        assert not [f for f in t5['new_findings'] if f['hash'] == snag_hash]  # not re-narrated
+
+        # ------------------------------------------------------------------
+        # decision_needed: a looping playbook trips its breaker and the tick
+        # asks for the human instead of repairing forever
+        # ------------------------------------------------------------------
+        inject_fts_drift('pre')
+        fh = [x for x in ops('sense')['findings']
+              if x['kind'] == 'doctor_fts_index_drift'][0]['hash']
+        # The earlier tick's successful repair already counts toward the
+        # window, so two more repeats exhaust the default break-after 3.
+        for i in range(2):
+            rep = ops('repair', 'fts-rebuild', '--finding-hash', fh)
+            assert rep['ok'] is True
+        p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'repair', 'fts-rebuild',
+                            '--finding-hash', fh], env=env, text=True, capture_output=True)
+        assert p.returncode != 0 and 'circuit breaker tripped after 3 repeats' in p.stderr, p.stderr
+        inject_fts_drift('post')                            # drift again: the breaker must hold it
+        t6 = ops('nanny')
+        assert t6['state'] == 'decision_needed', t6
+        assert any(d['reason'] == 'circuit_breaker' for d in t6['decisions'])
+        breaker = run('facts', '--subject', 'playbook:fts-rebuild')
+        assert breaker and breaker[0]['predicate'] == 'breaker-tripped'
+        # Every tick left the audit chain intact.
+        assert run('verify-chain')['ok'] is True
+
 
 
 

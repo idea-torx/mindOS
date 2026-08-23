@@ -72,12 +72,15 @@ CREATE TABLE IF NOT EXISTS tasks (
    retry_count INTEGER NOT NULL DEFAULT 0,
    recover_after TEXT NOT NULL DEFAULT '',
    due_at TEXT NOT NULL DEFAULT '',
-   not_before TEXT NOT NULL DEFAULT '',
+    not_before TEXT NOT NULL DEFAULT '',
    tags TEXT NOT NULL DEFAULT '[]',
    requires_receipts TEXT NOT NULL DEFAULT '[]',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  last_receipt TEXT NOT NULL DEFAULT ''
+   autonomy_level TEXT NOT NULL DEFAULT '',
+   model_binding TEXT NOT NULL DEFAULT '',
+   recap TEXT NOT NULL DEFAULT '',
+   created_at TEXT NOT NULL,
+   updated_at TEXT NOT NULL,
+   last_receipt TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project);
@@ -429,6 +432,9 @@ def _migrate(db) -> None:
         db.execute("ALTER TABLE tasks ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
     if "requires_receipts" not in task_cols:
         db.execute("ALTER TABLE tasks ADD COLUMN requires_receipts TEXT NOT NULL DEFAULT '[]'")
+    for col in ("autonomy_level", "model_binding", "recap"):
+        if col not in task_cols:
+            db.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
     handoff_cols = {r[1] for r in db.execute("PRAGMA table_info(handoffs)")}
     if "recall_digest" not in handoff_cols:
         db.execute("ALTER TABLE handoffs ADD COLUMN recall_digest TEXT NOT NULL DEFAULT ''")
@@ -2967,6 +2973,114 @@ def _seam_message(conflicts: list) -> str:
                        for c in conflicts)
     return f"seam conflict: {detail}; complete/release the holder first or pass --force"
 
+# Autonomy vocabulary: L0 observe/report, L1 bounded execute under human
+# seams, L2 unattended continuation. An empty level means a legacy task with
+# no autonomy semantics — every guard is inert for it.
+AUTONOMY_LEVELS = {"L0": 0, "L1": 1, "L2": 2}
+_MODEL_BINDING_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
+
+def _autonomy_rank(level: str) -> int:
+    return AUTONOMY_LEVELS.get(level, -1)
+
+def _valid_model_binding(value: str) -> str:
+    """Validate a model binding: provider/model token, no whitespace or quotes."""
+    v = (value or "").strip()
+    if not _MODEL_BINDING_RE.fullmatch(v):
+        raise SystemExit(f"invalid model binding: {value!r} (provider/model token, max 128 chars)")
+    return v
+
+def _autonomy_grant_subject(task_id: str) -> str:
+    return f"autonomy:{task_id}"
+
+def _live_autonomy_grant(db, task_id: str):
+    """The strongest currently-live grant fact for a task, or None.
+
+    Grants are temporal facts (`level-granted`) with validity windows, so an
+    expired grant simply stops being live — expiry is enforced by the same
+    liveness rule as every other fact, never by a sweep.
+    """
+    t = now()
+    rows = db.execute(
+        "SELECT * FROM facts WHERE subject=? AND predicate='level-granted' AND "
+        + _fact_live_sql() + " ORDER BY created_at", (_autonomy_grant_subject(task_id), t)).fetchall()
+    best = None
+    for r in rows:
+        if _autonomy_rank(r["object"]) < 0:
+            continue
+        if best is None or _autonomy_rank(r["object"]) >= _autonomy_rank(best["object"]):
+            best = r
+    return best
+
+def _check_autonomy_grant(db, row, owner: str, force: bool) -> dict:
+    """Claim-time autonomy gate. Returns an override record when --force
+    bypasses a failed check; raises SystemExit (after auditing the refusal
+    on its own connection) otherwise."""
+    if not row["autonomy_level"]:
+        return {}
+    grant = _live_autonomy_grant(db, row["id"])
+    reason = ""
+    if grant is None:
+        reason = "no_live_grant"
+    elif _autonomy_rank(grant["object"]) < _autonomy_rank(row["autonomy_level"]):
+        reason = "grant_below_declared_level"
+    if not reason:
+        return {}
+    detail = {"reason": reason, "declared_level": row["autonomy_level"],
+              **({"grant_level": grant["object"], "grant_fact_id": grant["id"]} if grant else {})}
+    if force:
+        return {"autonomy_override": detail}
+    _audit_claim_refusal(row["id"], owner, "claim_refused_autonomy", detail)
+    if reason == "no_live_grant":
+        raise SystemExit(
+            f"task declares autonomy {row['autonomy_level']} but no live autonomy "
+            f"grant exists; have a human re-run `declare` or pass --force")
+    raise SystemExit(
+        f"task declares autonomy {row['autonomy_level']} but the live grant is only "
+        f"{grant['object']}; re-declare at the granted level or pass --force")
+
+def declare(args):
+    """Stamp autonomy metadata on a task: level, exact model binding, grant fact.
+
+    Leo's grant is data, not chat: `--granted-by` names the human who explicitly
+    authorized this autonomy level for this task, and the authorization lives as
+    a temporal fact with a validity window (`--grant-hours`, default 24), so it
+    expires by itself and claim-time enforcement refuses work whose grant lapsed.
+    Re-declaring inserts a fresh windowed grant row; history is never rewritten.
+    Audited once as `autonomy_declared`.
+    """
+    level = args.autonomy_level
+    model = _valid_model_binding(args.model)
+    granter = (args.granted_by or "").strip()
+    if not granter:
+        raise SystemExit("--granted-by is required: autonomy is granted by a named human")
+    hours = getattr(args, "grant_hours", 24)
+    if hours <= 0:
+        raise SystemExit("--grant-hours must be > 0")
+    t = now()
+    valid_until = _expires_at(_ttl_hours(hours))
+    with conn() as db:
+        row = task_row(db, args.id)
+        if row["status"] in TERMINAL_STATUSES:
+            raise SystemExit(f"cannot declare autonomy on terminal task: {row['status']}")
+        fid = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO facts(id,subject,predicate,object,source,task_id,valid_from,valid_until,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (fid, _autonomy_grant_subject(args.id), "level-granted", level, granter,
+             "", t, valid_until, t))
+        audit(db, "fact", fid, "autonomy_granted",
+              {"task_id": args.id, "level": level, "granted_by": granter,
+               "model_binding": model, "valid_until": valid_until})
+        db.execute("UPDATE tasks SET autonomy_level=?,model_binding=?,updated_at=? WHERE id=?",
+                   (level, model, t, args.id))
+        audit(db, "task", args.id, "autonomy_declared",
+              {"autonomy_level": level, "model_binding": model, "granted_by": granter,
+               "grant_fact_id": fid, "grant_valid_until": valid_until})
+        out = _task_view(task_row(db, args.id))
+    out["grant"] = {"fact_id": fid, "level": level, "granted_by": granter,
+                    "valid_until": valid_until}
+    json_out(out)
+
 def _audit_claim_refusal(task_id: str, owner: str, action: str, detail: dict) -> None:
     """Record a claim refusal in the audit chain on its own connection.
 
@@ -3190,13 +3304,20 @@ def complete(args):
                 "definition of done unmet: missing required receipt kind(s): "
                 + ", ".join(missing_evidence))
         t = now()
+        # Recap metadata: durable "where this leaves off" prose stamped beside
+        # the completion's evidence (bounded; never a substitute for receipts).
+        recap = (getattr(args, "recap", "") or "").strip()
+        if len(recap) > 2000:
+            raise SystemExit("--recap must be at most 2000 characters")
         # Guarded mutation: the completion only lands while the lease is exactly
         # as checked above. A lease that expired and was re-acquired (or
         # transferred) between the row read and this write must not be clobbered
         # by a stale holder — the rowcount guard turns that race into a refusal.
         cur = db.execute(
-            "UPDATE tasks SET status='completed',lease_owner='',lease_expires_at='',blocked_reason='',updated_at=? "
-            "WHERE id=? AND lease_owner=? AND lease_expires_at>?", (t, args.id, args.owner, t))
+            "UPDATE tasks SET status='completed',lease_owner='',lease_expires_at='',blocked_reason='',"
+            + ("recap=?," if recap else "") + "updated_at=? "
+            "WHERE id=? AND lease_owner=? AND lease_expires_at>?",
+            (([recap] if recap else []) + [t, args.id, args.owner, t]))
         if cur.rowcount != 1:
             raise SystemExit("lease changed since check; reclaim before completing")
         # Downstream feedback: which queued dependents just became dispatchable.
@@ -3205,6 +3326,7 @@ def complete(args):
         audit(db, "task", args.id, "completed", {"owner": args.owner, "note": args.note,
                                                  "recall_digest": recall_digest or None,
                                                  "newly_unblocked": newly,
+                                                 **({"recap": recap} if recap else {}),
                                                  **({"evidence_receipts": evidence} if evidence else {})})
         out = _task_view(task_row(db, args.id))
         out["newly_unblocked"] = newly
@@ -3710,6 +3832,10 @@ def claim(args):
                     raise SystemExit(
                         f"project policy caps owner '{args.owner}' at {cap} live leases in "
                         f"{row['project']} (held: {', '.join(held)}); complete/release first or pass --force")
+        # Autonomy gate: a task with a declared autonomy level executes only
+        # under a live human grant of at least that level. --force is the
+        # deliberate override; the override is recorded in the claimed event.
+        autonomy_override = _check_autonomy_grant(db, row, args.owner, getattr(args, "force", False))
         # Atomic acquire: the WHERE guard makes the lease check-and-set a single
         # statement so concurrent claimers cannot both win the same lease.
         acquired, exp, epoch = _acquire(db, args.id, args.owner, args.minutes, resolve_max_active(args))
@@ -3717,7 +3843,8 @@ def claim(args):
             raise SystemExit(_explain_acquire_failure(db, args.id, args.owner, resolve_max_active(args)))
         db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"claimed",now(),"lease claimed"))
         audit(db, "task", args.id, "claimed", {"owner": args.owner, "lease_expires_at": exp, "lease_epoch": epoch,
-                                               **({"policy_overrides": overrides} if overrides else {})})
+                                               **({"policy_overrides": overrides} if overrides else {}),
+                                               **(autonomy_override or {})})
         out = _task_view(task_row(db, args.id))
         json_out(out)
 
@@ -3808,6 +3935,17 @@ def _filter_candidate(db, r, args, t_now, explain, skipped, pol_cache, inherited
                 skipped.append({"task_id": r["id"], "reason": "seam_conflict",
                                 "conflicts": conflicts})
             return None
+        # Autonomy gate mirrors `claim`: work whose declared level has no
+        # live >= grant is skipped with a reason, never dispatched blind.
+        if r["autonomy_level"]:
+            grant = _live_autonomy_grant(db, r["id"])
+            if grant is None or _autonomy_rank(grant["object"]) < _autonomy_rank(r["autonomy_level"]):
+                if explain:
+                    skipped.append({"task_id": r["id"],
+                                    "reason": "autonomy_grant_missing" if grant is None
+                                    else "autonomy_grant_below_level",
+                                    "declared_level": r["autonomy_level"]})
+                return None
     eff, boost = _effective_priority(r, t_dt, getattr(args, "aging_minutes", 360),
                                      getattr(args, "aging_boost", 2))
     inh = inherited.get(r["id"])
@@ -4512,7 +4650,8 @@ def main():
     p=sub.add_parser("init"); p.set_defaults(fn=lambda a: (ensure(), json_out({"ok":True,"db":str(DB)})))
     p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--due-at",default=""); p.add_argument("--not-before",dest="not_before",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.add_argument("--tag",action="append",default=[],help="capability/scope tag (repeatable)"); p.add_argument("--requires-receipt",dest="requires_receipt",action="append",default=[],help="receipt kind required before completion — the definition of done (repeatable)"); p.set_defaults(fn=create)
     p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.add_argument("--not-before",dest="not_before"); p.add_argument("--title"); p.add_argument("--description"); p.add_argument("--priority",choices=sorted(PRIORITIES)); p.add_argument("--project"); p.add_argument("--approved-by",dest="approved_by",default="",help="user approving a policy-gated readiness transition (recorded in the audit chain)"); p.add_argument("--requires-receipt",dest="requires_receipt",action="append",default=None,help="set required receipt kinds (repeatable); a single empty string clears them"); p.set_defaults(fn=update)
-    p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.add_argument("--receipt",dest="evidence_receipts",action="append",default=[],help="evidence receipt id on this task cited by the completion (repeatable)"); p.set_defaults(fn=complete)
+    p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.add_argument("--receipt",dest="evidence_receipts",action="append",default=[],help="evidence receipt id on this task cited by the completion (repeatable)"); p.add_argument("--recap",default="",help="durable where-this-leaves-off recap stamped into the completed audit event (max 2000 chars)"); p.set_defaults(fn=complete)
+    p=sub.add_parser("declare"); p.add_argument("id"); p.add_argument("--model",required=True,help="exact provider/model binding allowed to execute this task (e.g. opencode/x-preview-f-free)"); p.add_argument("--autonomy-level",dest="autonomy_level",choices=sorted(AUTONOMY_LEVELS),default="L1"); p.add_argument("--granted-by",dest="granted_by",required=True,help="the human explicitly granting this autonomy level"); p.add_argument("--grant-hours",dest="grant_hours",type=float,default=24.0,help="grant validity window in hours (>0; default 24)"); p.set_defaults(fn=declare)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
     p=sub.add_parser("fail"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.add_argument("--no-retry",dest="no_retry",action="store_true",help="skip the retry budget: fail terminally on the first attempt"); p.add_argument("--max-retries",dest="max_retries",type=int,default=3); p.add_argument("--backoff-base",dest="backoff_base",type=int,default=60); p.add_argument("--backoff-cap",dest="backoff_cap",type=int,default=3600); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=fail)
     p=sub.add_parser("block"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=block)
