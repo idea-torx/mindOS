@@ -3404,6 +3404,21 @@ def sense(args=None):
     uv = _capture_json(unverified_completions)
     for item in uv.get('items', []):
         findings.append(_make_finding(f"unverified_{item.get('kind')}", 'P2', item))
+    # Stalled activity: a running holder that declared a stall deadline but
+    # stayed silent past it. Read-only — recovery of the lease itself stays
+    # with the guarded recover sweep once it truly expires.
+    stalled = []
+    t = utc()
+    with autopilot.conn() as c:
+        for r in c.execute(
+                "SELECT h.task_id AS task_id,h.last_action AS last_action,"
+                "h.next_intent AS next_intent,h.progress_state AS progress_state,"
+                "h.stall_deadline AS stall_deadline FROM heartbeats h "
+                "JOIN tasks ta ON ta.id=h.task_id WHERE ta.status='running' "
+                "AND h.stall_deadline!='' AND h.stall_deadline<=? ORDER BY h.task_id", (t,)):
+            stalled.append(dict(r))
+    for item in stalled:
+        findings.append(_make_finding('activity_stalled', 'P2', item))
     counts = {}
     for f in findings:
         counts[f['severity']] = counts.get(f['severity'], 0) + 1

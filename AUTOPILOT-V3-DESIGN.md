@@ -441,7 +441,7 @@ open.
 ## Gates
 
 py_compile over all Python files; bridge/SQLite/gateway/context-injection
-test suites; full `verify.py` 19/19 (including `memory_semantic_recall`, which
+test suites; full `verify.py` 20/20 (including `memory_semantic_recall`, which
 pins each retired-engine defect as a named regression,
 `audit_chain_survives_concurrent_writers`,
 `memory_embedding_layer_is_optional_and_off_the_pack_path`, and
