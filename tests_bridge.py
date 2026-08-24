@@ -12,7 +12,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -57,7 +56,7 @@ with tempfile.TemporaryDirectory() as td:
     # Apply: cache + provenance + ledger.
     out = bridge("sync", "--source", "hermes-telegram", "--root", str(store),
                  "--profile", "default", "--project", "mindos",
-                 "--bank", "autopilot-shared-context", "--apply")
+                 "--channel", "shared-context", "--apply")
     assert out["applied_files"] == 1 and out["dry_run"] is False, out
 
     with sqlite3.connect(Path(td) / "mindos-home" / "state.db") as db:
@@ -68,9 +67,9 @@ with tempfile.TemporaryDirectory() as td:
         assert len(msgs) == 2, [dict(m) for m in msgs]
         assert {m["role"] for m in msgs} == {"user", "assistant"}
         assert all("tool noise" not in m["content"] and "result blob" not in m["content"] for m in msgs)
-        led = db.execute("SELECT state,bank,content_hash FROM bridge_hindsight_ledger ORDER BY seq").fetchall()
+        led = db.execute("SELECT state,channel,content_hash FROM bridge_export_ledger ORDER BY seq").fetchall()
         assert len(led) == 2 and all(r["state"] == "pending" for r in led), [dict(r) for r in led]
-        assert all(r["bank"] == "autopilot-shared-context" for r in led)
+        assert all(r["channel"] == "shared-context" for r in led)
     print("PASS ingest/provenance/roles")
 
     # Idempotence: unchanged re-run writes nothing new.
@@ -97,17 +96,17 @@ with tempfile.TemporaryDirectory() as td:
          "timestamp": "2026-08-21T17:05:00Z"}) + "\n")
     out3 = bridge("sync", "--source", "hermes-telegram", "--root", str(store),
                   "--profile", "default", "--project", "mindos",
-                  "--bank", "autopilot-shared-context", "--apply")
+                  "--channel", "shared-context", "--apply")
     assert out3["applied_files"] == 1, out3
     with sqlite3.connect(Path(td) / "mindos-home" / "state.db") as db:
         assert db.execute("SELECT COUNT(*) FROM session_messages WHERE session_row=(SELECT id FROM sessions)").fetchone()[0] == 3
-        pend = db.execute("SELECT COUNT(*) FROM bridge_hindsight_ledger WHERE state='pending'").fetchone()[0]
+        pend = db.execute("SELECT COUNT(*) FROM bridge_export_ledger WHERE state='pending'").fetchone()[0]
         assert pend == 3, pend  # file-level reindex invalidates the whole prior export set honestly
     print("PASS atomic change re-index")
 
     # Export manifest with full provenance + deterministic digest.
     exp1 = Path(td) / "export-1.jsonl"
-    r1 = bridge("export", "--out", str(exp1), "--bank", "autopilot-shared-context")
+    r1 = bridge("export", "--out", str(exp1), "--channel", "shared-context")
     assert r1["messages"] == 3, r1
     body1 = exp1.read_text()
     recs = [json.loads(x) for x in body1.splitlines()]
@@ -119,9 +118,9 @@ with tempfile.TemporaryDirectory() as td:
     live2 = store / "telegram-leo" / "session-live-2.jsonl"
     live2.write_text(live.read_text())
     bridge("sync", "--source", "hermes-telegram-b", "--root", str(store),
-           "--project", "mindos", "--bank", "autopilot-shared-context", "--apply")
+           "--project", "mindos", "--channel", "shared-context", "--apply")
     exp2 = Path(td) / "export-2.jsonl"
-    r2 = bridge("export", "--out", str(exp2), "--limit", "3", "--bank", "autopilot-shared-context")
+    r2 = bridge("export", "--out", str(exp2), "--limit", "3", "--channel", "shared-context")
     assert r2["digest"], r2
     print("PASS export provenance")
 
@@ -138,7 +137,7 @@ with tempfile.TemporaryDirectory() as td:
     with sqlite3.connect(Path(td) / "mindos-home" / "state.db") as db:
         assert db.execute("SELECT COUNT(*) FROM session_messages WHERE content LIKE '%AKIA%'").fetchone()[0] == 0
     bridge("sync", "--source", "hermes-secret", "--root", str(store),
-           "--redact", "--bank", "autopilot-shared-context", "--apply")
+           "--redact", "--channel", "shared-context", "--apply")
     exp3 = Path(td) / "export-3.jsonl"
     bridge("export", "--out", str(exp3))
     exported_all = exp1.read_text() + exp2.read_text() + exp3.read_text()
@@ -153,39 +152,32 @@ with tempfile.TemporaryDirectory() as td:
     assert "[REDACTED:aws_access_key]" in exp3.read_text()
     print("PASS secret guard (refuse default / redact explicit / no value leakage)")
 
-    # Hindsight unavailable + degraded paths are honest; local cache stays correct.
-    hs = bridge("hindsight-check", "--url", "http://127.0.0.1:9", "--bank", "autopilot-shared-context")
-    assert hs["status"] == "unavailable" and hs["semantic_sync"] == "pending", hs
-    print("ledger:", hs["ledger"])
+    # Export ledger status is purely local now: no service, no probe. And the
+    # channel filter is exact -- the retired wildcard let an export with no
+    # --bank drain and mark-exported the pending rows of every other channel.
+    st = bridge("export-status", "--channel", "shared-context")
+    assert st["channel"] == "shared-context", st
+    assert st["ledger"]["exported"] > 0 and st["export_state"] in ("current", "pending"), st
+    other = bridge("export-status", "--channel", "unrelated-channel")
+    assert other["ledger"] == {"pending": 0, "exported": 0, "failed": 0,
+                               "skipped": 0}, other
 
-    class _Degraded(BaseHTTPRequestHandler):
-        def log_message(self, *a): pass
-        def _send(self, code, body):
-            self.send_response(code); self.end_headers()
-            self.wfile.write(json.dumps(body).encode())
-        def do_GET(self):
-            if self.path == "/health":
-                self._send(200, {"status": "healthy"})
-            elif self.path == "/v1/default/banks":
-                self._send(200, {"banks": [{"bank_id": "someone-elses"}]})
-            else:
-                self._send(404, {"detail": "Not Found"})
-    try:
-        srv = HTTPServer(("127.0.0.1", 0), _Degraded)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        url = f"http://127.0.0.1:{srv.server_port}"
-    except PermissionError:
-        url = None
-    if url:
-        deg = bridge("hindsight-check", "--url", url, "--bank", "autopilot-shared-context")
-        assert deg["status"] == "degraded" and any(
-            "not present" in x for x in deg["problems"]), deg
-        assert deg["semantic_sync"] == "pending"
-        # Export still works while degraded — honest probe status recorded in audit.
-        exd = bridge("export", "--out", str(Path(td) / "export-deg.jsonl"),
-                     "--check-url", url, "--bank", "autopilot-shared-context")
-        assert exd["probe"]["status"] == "degraded", exd
-    print("PASS Hindsight unavailable/degraded honesty")
+    # Ingest into a second channel, then prove exporting one never drains the other.
+    iso_store = Path(td) / "iso-store" / "telegram-leo"
+    iso_store.mkdir(parents=True)
+    (iso_store / "iso.jsonl").write_text(json.dumps(
+        {"message": {"role": "user", "content": "channel isolation probe message"},
+         "timestamp": "2026-02-01T00:00:00+00:00"}) + "\n")
+    bridge("sync", "--source", "hermes-telegram", "--root", str(Path(td) / "iso-store"),
+           "--profile", "default", "--project", "mindos",
+           "--channel", "channel-b", "--apply")
+    before_b = bridge("export-status", "--channel", "channel-b")["ledger"]["pending"]
+    assert before_b == 1, before_b
+    bridge("export", "--out", str(Path(td) / "export-a.jsonl"),
+           "--channel", "shared-context")
+    after_b = bridge("export-status", "--channel", "channel-b")["ledger"]["pending"]
+    assert after_b == 1, ("exporting one channel drained another", after_b)
+    print("PASS local export ledger + channel isolation")
 
     # Promotion hook: explicit only, with provenance citation.
     task = subprocess.run([sys.executable, str(ROOT / "autopilot.py"), "create",
@@ -195,7 +187,7 @@ with tempfile.TemporaryDirectory() as td:
     assert task.returncode == 0, task.stderr
     with sqlite3.connect(Path(td) / "mindos-home" / "state.db") as db:
         key_row = db.execute(
-            "SELECT l.message_key,s.session_id FROM bridge_hindsight_ledger l "
+            "SELECT l.message_key,s.session_id FROM bridge_export_ledger l "
             "JOIN sessions s ON s.id=l.session_row WHERE l.seq=0 LIMIT 1").fetchone()
     key = key_row[0].rsplit(":", 1)[0] + ":0"
     pr = bridge("promote", key, "--kind", "note", "--task", "promo-1")
@@ -204,7 +196,93 @@ with tempfile.TemporaryDirectory() as td:
                            env=env, text=True, capture_output=True)
     notes = json.loads(shown.stdout)
     assert any("mindos-bridge" == n.get("source") for n in notes), notes
-    print("PASS promotion hook")
+
+    # Regression: `promote --kind task` built an INSERT with 14 columns but
+    # only 7 placeholders against 6 parameters, so every task promotion raised
+    # sqlite3.ProgrammingError -- and the inline literals were shifted a column
+    # left, which would have written owner into status and status into priority.
+    pt = bridge("promote", key, "--kind", "task", "--project", "Verify",
+                "--title", "promoted from a live session")
+    assert pt["ok"] is True and pt["type"] == "task", pt
+    shown = subprocess.run([sys.executable, str(ROOT / "autopilot.py"), "show", pt["id"]],
+                           env=env, text=True, capture_output=True)
+    assert shown.returncode == 0, shown.stderr
+    task = json.loads(shown.stdout)
+    assert task["status"] == "queued" and task["owner"] == "hermes", task
+    assert task["priority"] == "P2" and task["project"] == "Verify", task
+    assert task["title"] == "promoted from a live session", task
+    print("PASS promotion hook (note + task)")
+
+    # Regression: a re-indexed transcript that got *shorter* left ledger rows
+    # for the vanished message seqs. export inner-joins session_messages, so
+    # those rows could never be emitted and never left 'pending' -- the ledger
+    # reported outstanding work forever. Re-index prunes them.
+    shrink_root = Path(td) / "shrink-store"
+    (shrink_root / "telegram-leo").mkdir(parents=True)
+    shrink = shrink_root / "telegram-leo" / "shrink.jsonl"
+    shrink.write_text("\n".join(json.dumps(
+        {"message": {"role": "user", "content": f"shrink probe message {i}"},
+         "timestamp": f"2026-03-0{i+1}T00:00:00+00:00"}) for i in range(3)) + "\n")
+    bridge("sync", "--source", "hermes-telegram", "--root", str(shrink_root),
+           "--profile", "default", "--project", "mindos",
+           "--channel", "shrink-channel", "--apply")
+    assert bridge("export-status", "--channel", "shrink-channel")["ledger"]["pending"] == 3
+    shrink.write_text(json.dumps(
+        {"message": {"role": "user", "content": "shrink probe message 0"},
+         "timestamp": "2026-03-01T00:00:00+00:00"}) + "\n")
+    bridge("sync", "--source", "hermes-telegram", "--root", str(shrink_root),
+           "--profile", "default", "--project", "mindos",
+           "--channel", "shrink-channel", "--apply")
+    with sqlite3.connect(Path(td) / "mindos-home" / "state.db") as db:
+        orphans = db.execute(
+            "SELECT COUNT(*) FROM bridge_export_ledger l LEFT JOIN session_messages m "
+            "ON m.session_row=l.session_row AND m.seq=l.seq WHERE m.seq IS NULL").fetchone()[0]
+    assert orphans == 0, ("ledger rows outlived their messages", orphans)
+    ex_shrink = bridge("export", "--out", str(Path(td) / "export-shrink.jsonl"),
+                       "--channel", "shrink-channel")
+    assert bridge("export-status", "--channel", "shrink-channel")["ledger"]["pending"] == 0, ex_shrink
+    print("PASS ledger prunes rows whose messages vanished on re-index")
+
+    # A database written by the retired engine still opens: the Hindsight-named
+    # ledger migrates in place rather than being dropped, and a legacy row with
+    # an empty bank adopts the default channel so it stays exportable under the
+    # stricter (non-wildcard) channel filter.
+    legacy_home = Path(td) / "legacy-home"
+    lenv = {**env, "HERMES_AUTOPILOT_HOME": str(legacy_home)}
+    subprocess.run([sys.executable, str(ROOT / "autopilot.py"), "init"],
+                   env=lenv, text=True, capture_output=True, check=True)
+    with sqlite3.connect(legacy_home / "state.db") as db:
+        db.executescript(
+            "CREATE TABLE bridge_hindsight_ledger (message_key TEXT PRIMARY KEY,"
+            "session_row TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL,"
+            "at TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL, bank TEXT NOT NULL,"
+            "state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,"
+            "last_error_kind TEXT NOT NULL DEFAULT '', exported_at TEXT NOT NULL DEFAULT '',"
+            "updated_at TEXT NOT NULL);")
+        for k, bank, st in (("r:0", "", "pending"),
+                            ("r:1", "autopilot-shared-context", "exported"),
+                            ("r:2", "other-bank", "failed")):
+            db.execute("INSERT INTO bridge_hindsight_ledger VALUES(?,'r',?,'user','',?,?,?,3,'k','','')",
+                       (k, int(k.split(":")[1]), "h" + k, bank, st))
+    p_ = subprocess.run([sys.executable, str(ROOT / "mindos_bridge.py"), "export-status"],
+                        env=lenv, text=True, capture_output=True)
+    assert p_.returncode == 0, p_.stderr
+    with sqlite3.connect(legacy_home / "state.db") as db:
+        db.row_factory = sqlite3.Row
+        rows = {r["message_key"]: dict(r) for r in db.execute(
+            "SELECT message_key,channel,state,attempts,last_error_kind FROM bridge_export_ledger")}
+        assert len(rows) == 3, rows                                   # nothing dropped
+        assert rows["r:0"]["channel"] == "shared-context", rows       # empty bank -> default
+        assert rows["r:1"]["channel"] == "autopilot-shared-context"   # named bank preserved
+        assert rows["r:2"]["state"] == "failed" and rows["r:2"]["attempts"] == 3, rows
+        assert rows["r:2"]["last_error_kind"] == "k", rows
+        assert db.execute("SELECT COUNT(*) FROM sqlite_master WHERE "
+                          "name='bridge_hindsight_ledger'").fetchone()[0] == 0
+    subprocess.run([sys.executable, str(ROOT / "mindos_bridge.py"), "export-status"],
+                   env=lenv, text=True, capture_output=True, check=True)   # re-run is a no-op
+    with sqlite3.connect(legacy_home / "state.db") as db:
+        assert db.execute("SELECT COUNT(*) FROM bridge_export_ledger").fetchone()[0] == 3
+    print("PASS legacy hindsight ledger migrates in place")
 
     # Watch loop: near-real-time ingestion of a new message within one interval.
     clean_store = Path(td) / "watch-store"

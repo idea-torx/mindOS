@@ -9,12 +9,11 @@ Bridges important live Hermes conversations into the MindOS shared brain:
 2. Incremental durable cache in sessions/session_messages keyed by
    source/profile/path identity + file sha256; unchanged input is skipped and
    changed transcripts are re-indexed atomically — re-runs are idempotent.
-3. Hindsight semantic sync with full provenance. The repo's provider-neutral
-   adapter is GET-only by contract (health / banks / bank stats probes in
-   ops.py brain-inventory); no write endpoint shape exists to call, so this
-   bridge never invents one: it verifies binding health honestly and produces
-   a provenance-complete JSONL export manifest for provider-side import.
-   Sync state lives in the bridge_hindsight_ledger table and is reported as
+3. Provenance-complete export manifests for downstream consumers. The bridge
+   calls no external memory service: semantic memory is local and in-database
+   (`autopilot.py memory-retain`), and `export` simply emits a deterministic,
+   provenance-complete JSONL manifest of not-yet-exported messages. Export
+   state lives in the bridge_export_ledger table and is reported as
    pending/exported/failed — never silently "synced".
 4. Secret/PII guard before any cache or export write: refuse by default,
    --redact stores [REDACTED:<kind>] copies, audited --allow-secret override.
@@ -33,90 +32,97 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
-import urllib.parse
-import urllib.request
-from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import autopilot as ap  # noqa: E402  (shared home resolution, schema, guards)
 from mindos_sqlite_adapter import ingest_session, resolve_state_db  # noqa: E402
 
+# The export ledger. Renamed from bridge_hindsight_ledger when the external
+# Hindsight service was retired: the table never had anything to do with that
+# provider's semantics, it tracks which cached messages have been emitted into
+# an export manifest. `channel` replaces the former `bank` for the same reason.
 LEDGER_SCHEMA = """
-CREATE TABLE IF NOT EXISTS bridge_hindsight_ledger (
+CREATE TABLE IF NOT EXISTS bridge_export_ledger (
   message_key TEXT PRIMARY KEY,          -- row_id:seq of the cached message
   session_row TEXT NOT NULL,
   seq INTEGER NOT NULL,
   role TEXT NOT NULL,
   at TEXT NOT NULL DEFAULT '',
   content_hash TEXT NOT NULL,
-  bank TEXT NOT NULL,
+  channel TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL DEFAULT 'pending', -- pending|exported|failed|skipped
   attempts INTEGER NOT NULL DEFAULT 0,
   last_error_kind TEXT NOT NULL DEFAULT '',
   exported_at TEXT NOT NULL DEFAULT '',
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_bhl_bank_state ON bridge_hindsight_ledger(bank, state);
+CREATE INDEX IF NOT EXISTS idx_bel_channel_state ON bridge_export_ledger(channel, state);
+CREATE INDEX IF NOT EXISTS idx_bel_session_row ON bridge_export_ledger(session_row, seq);
 """
 
-BRIDGE_EXPORT_FORMAT = "mindos-hindsight-bridge-export-v1"
+# Every ledger row carries an explicit channel. The retired schema allowed an
+# empty bank and then treated it as a wildcard at export time, so an export
+# with no --bank drained and marked-exported the pending rows of *every* bank.
+# A single named default removes the wildcard entirely.
+DEFAULT_EXPORT_CHANNEL = "shared-context"
+
+BRIDGE_EXPORT_FORMAT = "mindos-bridge-export-v1"
 
 
 def _ensure_bridge(db) -> None:
+    """Create the export ledger, migrating the retired Hindsight-named table.
+
+    Rows carry over rather than being dropped, and legacy rows with an empty
+    bank adopt the default channel so they stay exportable under the stricter
+    (non-wildcard) channel filter.
+    """
+    def _has(name):
+        return bool(db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,)).fetchone())
+    legacy, current = _has("bridge_hindsight_ledger"), _has("bridge_export_ledger")
     db.executescript(LEDGER_SCHEMA)
+    if legacy and not current:
+        db.execute(
+            "INSERT OR IGNORE INTO bridge_export_ledger(message_key,session_row,seq,"
+            "role,at,content_hash,channel,state,attempts,last_error_kind,"
+            "exported_at,updated_at) SELECT message_key,session_row,seq,role,at,"
+            "content_hash,CASE WHEN bank='' THEN ? ELSE bank END,state,attempts,"
+            "last_error_kind,exported_at,updated_at FROM bridge_hindsight_ledger",
+            (DEFAULT_EXPORT_CHANNEL,))
+    if legacy:
+        db.execute("DROP TABLE bridge_hindsight_ledger")
+
+
+def _channel(args) -> str:
+    """The export channel for this invocation; never empty, never a wildcard."""
+    return (getattr(args, "channel", "") or "").strip() or DEFAULT_EXPORT_CHANNEL
+
+
+def _prune_ledger(db, row_id: str, kept: int) -> int:
+    """Drop ledger rows for message seqs that no longer exist in the cache.
+
+    A re-indexed transcript that got *shorter* used to leave pending rows for
+    the vanished seqs. `export` inner-joins session_messages, so those rows
+    could never be emitted and never left 'pending' — the ledger reported
+    work outstanding forever. Re-index prunes them instead.
+    """
+    return db.execute(
+        "DELETE FROM bridge_export_ledger WHERE session_row=? AND seq>=?",
+        (row_id, kept)).rowcount
 
 
 def _message_key(row_id: str, seq: int) -> str:
     return f"{row_id}:{seq}"
 
 
-def _bank_from_args(args) -> str:
-    return (getattr(args, "bank", "") or "").strip()
-
-
-def hindsight_probe(url: str, bank: str, timeout: float) -> dict:
-    """GET-only provider-neutral binding probe (mirror of ops.py semantics).
-
-    unavailable = service down / unhealthy; degraded = healthy but the shared
-    bank is not listed; ok = bound. Never writes anything.
-    """
-    base = url.rstrip("/")
-    entry = {"adapter": "provider-neutral-http-v1", "url": base, "bank": bank}
-    try:
-        req = urllib.request.Request(f"{base}/health", method="GET",
-                                     headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            code, body = resp.status, json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        return {**entry, "status": "unavailable",
-                "problems": [f"health probe failed: {type(e).__name__}"], "bound": False}
-    if code != 200 or body.get("status") != "healthy":
-        return {**entry, "status": "unavailable",
-                "problems": [f"health endpoint reported status={body.get('status')!r}"],
-                "bound": False}
-    problems, bound = [], False
-    try:
-        req = urllib.request.Request(f"{base}/v1/default/banks", method="GET",
-                                     headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status == 200:
-                listed = [b.get("bank_id") for b in json.loads(resp.read().decode("utf-8")).get("banks", [])]
-                bound = bank in listed
-                if not bound:
-                    problems.append(f"bank {bank!r} not present in service bank list")
-    except Exception as e:
-        problems.append(f"bank list failed: {type(e).__name__}")
-    return {**entry, "status": "ok" if bound else "degraded",
-            "problems": problems, "bound": bound}
-
-
 def _ingest_store(args) -> dict:
     """Run one incremental ingest pass using autopilot's plan core + guard."""
     apply_mode = bool(getattr(args, "apply", False)) or bool(getattr(args, "watch", False))
-    saved_json_out = None
     plan, files = ap._session_plan(args)
     indexable = [f for f in files if f["status"] == "indexed" and not f.get("unchanged")]
     kinds = sorted({k for f in indexable for k in f.get("secret_kinds", [])})
@@ -143,9 +149,9 @@ def _ingest_store(args) -> dict:
                     msgs = [{**m, "content": ap._redact_secrets(m["content"])} for m in msgs]
                 row_id = f["_row_id"]
                 db.execute("DELETE FROM session_messages WHERE session_row=?", (row_id,))
-                # Changed content invalidates any prior semantic-sync state.
+                # Changed content invalidates any prior export state.
                 old = {r["seq"]: r["content_hash"] for r in db.execute(
-                    "SELECT seq,content_hash FROM bridge_hindsight_ledger WHERE session_row=?",
+                    "SELECT seq,content_hash FROM bridge_export_ledger WHERE session_row=?",
                     (row_id,)).fetchall()}
                 db.execute(
                     "INSERT INTO sessions(id,source,profile,project,session_id,path,file_hash,"
@@ -168,12 +174,13 @@ def _ingest_store(args) -> dict:
                         (row_id, seq, m["role"], m["content"], ch, m["at"]))
                     if old.get(seq) != ch:
                         db.execute(
-                            "INSERT OR REPLACE INTO bridge_hindsight_ledger(message_key,"
-                            "session_row,seq,role,at,content_hash,bank,state,attempts,"
+                            "INSERT OR REPLACE INTO bridge_export_ledger(message_key,"
+                            "session_row,seq,role,at,content_hash,channel,state,attempts,"
                             "last_error_kind,exported_at,updated_at) "
-                            "VALUES(?,?,?,?,?,?,?,'pending',0,'','','')",
+                            "VALUES(?,?,?,?,?,?,?,'pending',0,'','',?)",
                             (_message_key(row_id, seq), row_id, seq, m["role"], m["at"],
-                             ch, getattr(args, "bank", "") or ""))
+                             ch, _channel(args), t))
+                _prune_ledger(db, row_id, len(msgs))
                 ap.audit(db, "session", row_id, "session_ingested",
                          {"source": plan["source"], "path": f["path"], "messages": len(msgs),
                           "tool_results_skipped": f["tool_results_skipped"],
@@ -222,41 +229,45 @@ def bridge_watch(args):
 
 
 def bridge_export(args):
-    """Provenance-complete JSONL export of pending semantic-sync messages.
+    """Provenance-complete JSONL export of not-yet-exported cached messages.
 
     Deterministic: fixed ordering (session_row, seq), bounded count, and the
-    digest covers the exact emitted lines. Marks ledger rows exported only on
-    successful manifest write; Hindsight unavailability leaves them pending
-    and is reported honestly.
+    digest covers the exact emitted lines. Ledger rows flip to exported only
+    after the manifest is durably in place, so a failed write leaves them
+    pending and the next run re-emits them.
     """
-    bank = _bank_from_args(args)
+    channel = _channel(args)
     out = Path(args.out).expanduser()
-    probe = {}
-    if getattr(args, "check_url", ""):
-        probe = hindsight_probe(args.check_url, bank, float(args.timeout))
     limit = max(1, int(args.limit))
-    rows = []
     with ap.conn() as db:
         _ensure_bridge(db)
         sql = ("SELECT l.message_key,l.session_row,l.seq,l.role,l.at,l.content_hash,s.session_id,"
-               "s.source,s.profile,s.project,m.content FROM bridge_hindsight_ledger l "
+               "s.source,s.profile,s.project,m.content FROM bridge_export_ledger l "
                "JOIN sessions s ON s.id=l.session_row JOIN session_messages m "
                "ON m.session_row=l.session_row AND m.seq=l.seq "
-               "WHERE l.state='pending' AND (?='' OR l.bank IN ('', ?)) "
+               "WHERE l.state='pending' AND l.channel=? "
                "ORDER BY l.session_row ASC, l.seq ASC LIMIT ?")
-        rows = [dict(r) for r in db.execute(sql, (bank, bank, limit)).fetchall()]
-        findings_kinds = sorted({f["kind"] for r in rows for f in ap._secret_findings(r["content"])})
-        if findings_kinds and not (getattr(args, "redact", False) or getattr(args, "allow_secret", False)):
+        rows = [dict(r) for r in db.execute(sql, (channel, limit)).fetchall()]
+        redact = bool(getattr(args, "redact", False))
+        allow = bool(getattr(args, "allow_secret", False))
+        # Findings are collected per row, so redaction touches only the rows
+        # that actually carry a finding rather than rewriting every line
+        # whenever any one line trips the guard.
+        per_row = {r["message_key"]: sorted({f["kind"] for f in
+                                             ap._secret_findings(r["content"])})
+                   for r in rows}
+        findings_kinds = sorted({k for ks in per_row.values() for k in ks})
+        if findings_kinds and not (redact or allow):
             raise SystemExit(
                 f"refusing to export credential-shaped content ({', '.join(findings_kinds)}); "
                 "re-run with --redact or --allow-secret")
         lines = []
         for r in rows:
             content = r["content"]
-            if findings_kinds and getattr(args, "redact", False):
+            if redact and per_row[r["message_key"]]:
                 content = ap._redact_secrets(content)
             rec = {
-                "format": BRIDGE_EXPORT_FORMAT, "bank": bank,
+                "format": BRIDGE_EXPORT_FORMAT, "channel": channel,
                 "provenance": {
                     "source": r["source"], "hermes_profile": r["profile"],
                     "project": r["project"], "session_id": r["session_id"],
@@ -270,42 +281,42 @@ def bridge_export(args):
         digest = hashlib.sha256("\n".join(lines).encode()).hexdigest() if lines else ""
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_suffix(out.suffix + ".tmp")
-        tmp.write_text("\n".join(lines) + ("\n" if lines else ""))
-        tmp.chmod(0o600)
+        # Opened 0o600 rather than chmod-ed after the fact: the manifest can
+        # carry conversation content, and a world-readable window between the
+        # write and the chmod is a window.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + ("\n" if lines else ""))
+            fh.flush()
+            os.fsync(fh.fileno())
         tmp.replace(out)
         t = ap.now()
         for r in rows:
             db.execute(
-                "UPDATE bridge_hindsight_ledger SET state='exported',attempts=attempts+1,"
+                "UPDATE bridge_export_ledger SET state='exported',attempts=attempts+1,"
                 "exported_at=?,updated_at=? WHERE message_key=?", (t, t, r["message_key"]))
         ap.audit(db, "session", "bridge-export",
-                 "hindsight_export_manifest_written",
-                 {"bank": bank, "messages": len(rows),
-                  "kinds": findings_kinds, "digest": digest,
-                  "probe_status": probe.get("status", "not_requested")})
-    result = {"ok": True, "out": str(out), "bank": bank, "messages": len(rows),
-              "digest": digest, "secret_kinds": findings_kinds, "probe": probe,
-              "note": ("manifest written for provider-side import; semantic memory is "
-                       "authoritative in Hindsight once imported" if rows else
-                       "nothing pending")}
-    ap.json_out(result)
+                 "bridge_export_manifest_written",
+                 {"channel": channel, "messages": len(rows),
+                  "kinds": findings_kinds, "digest": digest})
+    ap.json_out({"ok": True, "out": str(out), "channel": channel,
+                 "messages": len(rows), "digest": digest,
+                 "secret_kinds": findings_kinds,
+                 "note": ("manifest written for downstream import" if rows
+                          else "nothing pending")})
 
 
-def bridge_hindsight_check(args):
-    """Honest availability report for the configured Hindsight binding."""
-    bank = _bank_from_args(args)
-    probe = hindsight_probe(args.url, bank, float(args.timeout))
+def bridge_export_status(args):
+    """Ledger state for one export channel. Purely local; probes nothing."""
+    channel = _channel(args)
     with ap.conn() as db:
         _ensure_bridge(db)
-        counts = {}
-        for st in ("pending", "exported", "failed"):
-            counts[st] = db.execute(
-                "SELECT COUNT(*) n FROM bridge_hindsight_ledger WHERE bank=? AND state=?",
-                (bank, st)).fetchone()["n"]
-    probe["ledger"] = counts
-    probe["semantic_sync"] = ("current" if probe.get("bound") and counts["pending"] == 0
-                              else "pending")
-    ap.json_out(probe)
+        counts = {st: db.execute(
+            "SELECT COUNT(*) n FROM bridge_export_ledger WHERE channel=? AND state=?",
+            (channel, st)).fetchone()["n"]
+            for st in ("pending", "exported", "failed", "skipped")}
+    ap.json_out({"channel": channel, "ledger": counts,
+                 "export_state": "current" if counts["pending"] == 0 else "pending"})
 
 
 def bridge_promote(args):
@@ -356,7 +367,7 @@ def bridge_promote(args):
             db.execute(
                 "INSERT INTO tasks(id,project,title,description,owner,status,priority,"
                 "next_action,due_at,not_before,tags,requires_receipts,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'hermes','queued','','','','[]','[]',?,?)",
+                "VALUES(?,?,?,?,'hermes','queued','P2','','','','[]','[]',?,?)",
                 (task_id, args.project or msg["project"] or "Inbox",
                  args.title or content[:80], content, t, t))
             promoted = {"type": "task", "id": task_id}
@@ -381,7 +392,8 @@ def main():
                         type=int, default=ap.DEFAULT_SESSION_MAX_FILE_BYTES)
         if apply_flag:
             sp.add_argument("--apply", action="store_true")
-        sp.add_argument("--bank", default="", help="Hindsight bank recorded in the sync ledger")
+        sp.add_argument("--channel", default=DEFAULT_EXPORT_CHANNEL,
+                        help="export channel recorded in the ledger")
         sp.add_argument("--redact", action="store_true")
         sp.add_argument("--allow-secret", dest="allow_secret", action="store_true")
 
@@ -397,7 +409,7 @@ def main():
     sp.add_argument("--max-messages", dest="max_messages", type=int, default=5000)
     sp.add_argument("--profile", default="")
     sp.add_argument("--project", default="")
-    sp.add_argument("--bank", default="")
+    sp.add_argument("--channel", default=DEFAULT_EXPORT_CHANNEL)
     sp.add_argument("--redact", action="store_true")
     sp.add_argument("--allow-secret", dest="allow_secret", action="store_true")
     sp.set_defaults(fn=bridge_sqlite_sync)
@@ -408,21 +420,17 @@ def main():
     sp.add_argument("--for-seconds", dest="for_seconds", type=float, default=-1)
     sp.set_defaults(fn=bridge_watch)
 
-    sp = sub.add_parser("export", help="provenance JSONL export for Hindsight import")
-    sp.add_argument("--bank", default="autopilot-shared-context")
+    sp = sub.add_parser("export", help="provenance JSONL export manifest")
+    sp.add_argument("--channel", default=DEFAULT_EXPORT_CHANNEL)
     sp.add_argument("--out", required=True)
     sp.add_argument("--limit", type=int, default=1000)
     sp.add_argument("--redact", action="store_true")
     sp.add_argument("--allow-secret", dest="allow_secret", action="store_true")
-    sp.add_argument("--check-url", dest="check_url", default="")
-    sp.add_argument("--timeout", type=float, default=3.0)
     sp.set_defaults(fn=bridge_export)
 
-    sp = sub.add_parser("hindsight-check", help="GET-only Hindsight binding + ledger status")
-    sp.add_argument("--url", default="http://127.0.0.1:8888")
-    sp.add_argument("--bank", default="autopilot-shared-context")
-    sp.add_argument("--timeout", type=float, default=3.0)
-    sp.set_defaults(fn=bridge_hindsight_check)
+    sp = sub.add_parser("export-status", help="local export-ledger status for a channel")
+    sp.add_argument("--channel", default=DEFAULT_EXPORT_CHANNEL)
+    sp.set_defaults(fn=bridge_export_status)
 
     sp = sub.add_parser("promote", help="explicitly promote one message to note/task")
     sp.add_argument("message_key")

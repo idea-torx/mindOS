@@ -89,7 +89,7 @@ with tempfile.TemporaryDirectory() as td:
     # -- 3. Enabled + configured: detached worker ingests the sentinel ----------
     write_cfg({"enabled": "true", "root": str(store.parent),
                "source": "hermes-gateway", "profile": "default",
-               "project": "mindos", "bank": "autopilot-shared-context",
+               "project": "mindos", "channel": "shared-context",
                "redact": "true", "worker_seconds": "60"})
     write_sentinel()
     p = run_hook(base_env, {"session_id": "sess_abc123", "platform": "telegram"})

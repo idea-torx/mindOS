@@ -3803,53 +3803,32 @@ def _case_brain_inventory_and_home_selection():
             return h.hexdigest()
         fx_before = tree_digest_under(fx)
 
-        class _DegradedBank(BaseHTTPRequestHandler):
-            """Healthy Hindsight that lacks the shared bank: binding broken."""
-            def log_message(self, *a): pass
-            def _send(self, code, body):
-                self.send_response(code); self.end_headers()
-                self.wfile.write(json.dumps(body).encode())
-            def do_GET(self):
-                if self.path == '/health':
-                    self._send(200, {'status': 'healthy'})
-                elif self.path == '/v1/default/banks':
-                    self._send(200, {'banks': [{'bank_id': 'someone-elses-bank'}]})
-                else:
-                    self._send(404, {'detail': 'Not Found'})
-        try:
-            srv = HTTPServer(('127.0.0.1', 0), _DegradedBank)
-        except PermissionError:
-            # Some hermetic runners forbid even loopback binds. The unavailable
-            # path is still a required health result, while the degraded-bank
-            # interaction is exercised in environments that permit loopback.
-            srv = None
-        if srv:
-            threading.Thread(target=srv.serve_forever, daemon=True).start()
-        hs_url = f'http://127.0.0.1:{srv.server_port}' if srv else 'http://127.0.0.1:9'
         try:
             inv_path = Path(td) / 'brain-inventory.json'
             inv = ops('brain-inventory',
                       '--hermes-home', str(fhermes), '--claude-home', str(fx / 'claude'),
-                      '--hindsight-url', hs_url,
                       '--out', str(inv_path))
             assert inv['ok'] is True and inv['fail_closed'] is False, inv   # degraded/unavailable ≠ fatal
             assert inv_path.stat().st_mode & 0o077 == 0                     # sealed manifest 0600
             full = json.loads(inv_path.read_text())                         # sealed doc, not compact
             bkind = {s['kind']: s for s in full['sources']}
-            assert set(bkind) == {'autopilot', 'temporal', 'hindsight', 'claude_sync',
+            assert set(bkind) == {'autopilot', 'temporal', 'memories', 'claude_sync',
                                   'claude_memory', 'sessions', 'profiles', 'skills',
                                   'cron'}, sorted(bkind)                    # full brain covered
             roles = {s['kind']: s['role'] for s in inv['sources']}
-            assert roles['autopilot'] == 'execution_truth' and roles['hindsight'] == 'semantic_memory'
+            assert roles['autopilot'] == 'execution_truth' and roles['memories'] == 'semantic_memory'
             assert roles['temporal'] == 'temporal_facts' and roles['sessions'] == 'session_cache'
             assert roles['claude_sync'] == 'sync_metadata' and roles['claude_memory'] == 'human_archive'
             assert roles['profiles'] == 'profile_definitions' and roles['cron'] == 'cron_definitions'
             assert bkind['autopilot']['status'] == 'ok' and bkind['autopilot']['counts']['tasks'] >= 1
             assert bkind['temporal']['status'] == 'absent'                 # optional sidecar reported
-            assert bkind['hindsight']['status'] == ('degraded' if srv else 'unavailable')
-            if srv:
-                assert any('not present' in p for p in bkind['hindsight']['problems'])
-            assert bkind['hindsight']['adapter'] == 'provider-neutral-http-v1'
+            # Semantic memory is local and in-database: inventoried as its own
+            # epistemic source, with no service to probe and no binding to bind.
+            assert bkind['memories']['status'] == 'ok', bkind['memories']
+            assert bkind['memories']['engine'] == 'memory-fts-v1'
+            assert bkind['memories']['path'] == bkind['autopilot']['path']
+            assert 'memories' in bkind['memories']['counts']
+            assert 'url' not in bkind['memories'] and 'adapter' not in bkind['memories']
             assert bkind['claude_sync']['status'] == 'ok' and bkind['claude_sync']['counts']['entries'] == 2
             assert bkind['claude_sync']['sha256']
             assert bkind['claude_memory']['counts']['projects'] == 1
@@ -3866,8 +3845,7 @@ def _case_brain_inventory_and_home_selection():
             inv2_path = Path(td) / 'brain-inventory-2.json'
             inv2 = ops('brain-inventory', '--hermes-home', str(fhermes),
                        '--claude-home', str(fx / 'claude'),
-                       '--hindsight-url', hs_url,
-                       '--out', str(inv2_path))
+                        '--out', str(inv2_path))
             a_, b_ = json.loads(inv_path.read_text()), json.loads(inv2_path.read_text())
             assert a_.pop('created_at') and b_.pop('created_at')
             assert a_ == b_, 'unchanged sources must reproduce an identical manifest'
@@ -3882,9 +3860,10 @@ def _case_brain_inventory_and_home_selection():
             # the Autopilot database it is inspecting.
             assert tree_digest_under(fx) == fx_before, 'inventory must never mutate a scanned source'
             # Brain import: dry-run creates no target; apply copies only the
-            # supported definition/archive/cache surfaces, binds Hindsight through
-            # metadata only, quarantines the credential-shaped skill, and re-runs
-            # without replacing any destination bytes.
+            # supported definition/archive/cache surfaces, quarantines the
+            # credential-shaped skill, and re-runs without replacing any
+            # destination bytes. No service binding is written any more --
+            # semantic memory travels inside the control-plane database.
             btarget = Path(td) / 'brain-target'
             bplan = ops('brain-import', '--inventory', str(inv_path), '--target', str(btarget))
             assert bplan['dry_run'] is True and not btarget.exists(), bplan
@@ -3896,8 +3875,10 @@ def _case_brain_inventory_and_home_selection():
             assert (btarget / 'sessions/raw-store/transcript-1.jsonl').is_file()
             assert (btarget / 'archives/claude-memory/-fixtures-x/memory/MEMORY.md').is_file()
             assert not (btarget / 'skills/devops/SKILL.md').exists()
-            bind = json.loads((btarget / 'bindings/hindsight-shared-bank.json').read_text())
-            assert bind['bank'] == 'autopilot-shared-context' and bind['bound'] is False, bind
+            assert not (btarget / 'bindings').exists(), 'no service binding is written'
+            assert 'bind_hindsight' not in bapply.get('planned', {}), bapply
+            assert any(a['action'] == 'external_execution_import_required'
+                       and a['kind'] == 'memories' for a in bplan['actions']), bplan
             assert 'AKIAIOSFODNN7EXAMPLE' not in (btarget / 'provenance' /
                                                   ('brain-import-' + full['sha256'] + '.json')).read_text()
             assert Path(bapply['report']).stat().st_mode & 0o077 == 0
@@ -3912,8 +3893,7 @@ def _case_brain_inventory_and_home_selection():
             assert '[REDACTED:aws_access_key]' in rskill and 'AKIAIOSFODNN7EXAMPLE' not in rskill, redacted
             assert tree_digest_under(fx) == fx_before, 'inventory must never mutate a scanned source'
         finally:
-            if srv:
-                srv.shutdown()
+            pass
         # A valid temporal sidecar is a portable, checksummed file source. Keep
         # this separate from the prior absent-sidecar fixture so both contract
         # paths stay explicitly covered.
@@ -3929,7 +3909,7 @@ def _case_brain_inventory_and_home_selection():
         temporal_inv_path = Path(td) / 'brain-temporal-inventory.json'
         p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'brain-inventory',
                             '--hermes-home', str(fhermes), '--claude-home', str(fx / 'claude'),
-                            '--hindsight-url', 'http://127.0.0.1:9', '--out', str(temporal_inv_path)],
+                            '--out', str(temporal_inv_path)],
                            env=temporal_env, text=True, capture_output=True)
         assert p.returncode == 0, (p.stdout, p.stderr)
         temporal_inv = json.loads(temporal_inv_path.read_text())
@@ -3942,12 +3922,15 @@ def _case_brain_inventory_and_home_selection():
         assert p.returncode == 0, (p.stdout, p.stderr)
         assert hashlib.sha256((temporal_target / 'temporal.db').read_bytes()).hexdigest() == temporal_before
         assert hashlib.sha256((temporal_home / 'temporal.db').read_bytes()).hexdigest() == temporal_before
-        # Unreachable Hindsight: recorded as unavailable, everything else proceeds.
+        # brain-inventory makes no outbound call at all any more: the retired
+        # Hindsight probe was its only one, so an offline machine inventories
+        # the full brain with nothing degraded by network reachability.
         inv3 = ops('brain-inventory', '--hermes-home', str(fhermes),
-                   '--claude-home', str(fx / 'claude'), '--hindsight-url', 'http://127.0.0.1:9')
-        h3 = next(s for s in inv3['sources'] if s['kind'] == 'hindsight')
-        assert h3['status'] == 'unavailable' and inv3['fail_closed'] is False, h3
-        assert any('health probe failed' in p for p in h3['problems']), h3
+                   '--claude-home', str(fx / 'claude'))
+        assert inv3['fail_closed'] is False, inv3
+        assert not any(k in inv3 for k in ('hindsight_url', 'bank')), inv3
+        m3 = next(s for s in inv3['sources'] if s['kind'] == 'memories')
+        assert m3['status'] == 'ok' and 'url' not in m3, m3
         # Corruption elsewhere fails closed with exact blockers: a garbage cron
         # definition and a garbage temporal sidecar each block their own run.
         (fhermes / 'cron/jobs.json').write_text('{definitely not json')
@@ -4111,13 +4094,16 @@ def _case_protocol_self_description():
         assert bad_digest != d1['sha256'], 'tampering must change the digest'
 
 
-@case('hindsight_semantic_recall')
-def _case_hindsight_semantic_recall():
-    """R4 gate: fixture-bank recall, secret guard, unavailable path, staleness."""
+@case('memory_semantic_recall')
+def _case_memory_semantic_recall():
+    """Local semantic memory: recall, scope isolation, retraction, legacy import.
+
+    The engine this replaces was a JSONL bank read out-of-band plus an HTTP
+    service. Each assertion below that names a "regression" pins a defect the
+    retired engine actually had.
+    """
     with tempfile.TemporaryDirectory() as td:
         env = os.environ.copy(); env['HERMES_AUTOPILOT_HOME'] = td
-        bank_home = Path(td) / 'hindsight'
-        env['HERMES_HINDSIGHT_HOME'] = str(bank_home)
         def run(*args):
             p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args], env=env, text=True, capture_output=True)
             if p.returncode: raise AssertionError((args, p.stdout, p.stderr))
@@ -4133,90 +4119,171 @@ def _case_hindsight_semantic_recall():
         import sqlite3, hashlib
         run('create', '--project', 'Auth', '--title', 'fix login redirect bug in auth module', '--id', 'hs-t1')
         run('claim', 'hs-t1', '--owner', 'leo', '--minutes', '5')
-        # Unavailable path: no bank configured -> --related-semantic is a no-op,
-        # doctor reports hindsight as a healthy-with-note, never a problem.
+
+        # Empty store: --related-semantic is a no-op and doctor reports a
+        # healthy-with-note, never a problem.
         pack = run('context', 'hs-t1', '--related-semantic', '3')
-        assert pack.get('related_semantic') == [], pack  # no-op: zero memories
+        assert pack.get('related_semantic') == [], pack
         doc = ops('doctor')
         assert doc['ok'] is True, doc
-        note = [n for n in doc.get('notes', []) if n.get('kind') == 'hindsight_status']
-        assert note and note[0]['status'] == 'unavailable', doc
-        assert not any(p.get('kind', '').startswith('hindsight') for p in doc['problems']), doc
-        # Retain refuses to fork an accidental bank without --create.
-        err = run_fail('hindsight-retain', '--text', 'auth uses cookie sessions')
-        assert 'no Hindsight bank configured' in err, err
-        # Secret guard: credential-shaped content is refused like notes.
-        err = run_fail('hindsight-retain', '--text',
-                       'the api_key is "sk-live-abc123def456ghi789"', '--create')
+        note = [n for n in doc.get('notes', []) if n.get('kind') == 'memory_store']
+        assert note and note[0]['status'] == 'empty' and note[0]['memories'] == 0, doc
+        assert note[0]['engine'] == 'memory-fts-v1', doc
+        assert not any(p.get('kind', '').startswith('memory') for p in doc['problems']), doc
+
+        # Secret guard: credential-shaped content is refused exactly like notes,
+        # and --redact stores a tagged placeholder instead of the raw value.
+        err = run_fail('memory-retain', '--text', 'the api_key is "sk-live-abc123def456ghi789"')
         assert 'credential-shaped' in err, err
-        # --redact stores a tagged placeholder instead of the raw value.
-        red = run('hindsight-retain', '--text', 'the api_key is "sk-live-abc123def456ghi789"',
-                  '--create', '--redact', '--kind', 'decision', '--project', 'Auth')
+        red = run('memory-retain', '--text', 'the api_key is "sk-live-abc123def456ghi789"',
+                  '--redact', '--kind', 'decision', '--project', 'Auth')
         assert red['ok'] is True and red.get('secret_kinds'), red
-        # Fixture bank: write memories in the documented bank v1 JSONL format.
-        bank_home.mkdir(parents=True, exist_ok=True)
-        mems = [
-            {"id": "hs-fix-001", "text": "login redirect bug in auth module was caused by a stale cookie session",
-             "kind": "decision", "project": "Auth", "created_at": "2026-08-20T10:00:00+00:00", "tags": ["auth", "cookies"]},
-            {"id": "hs-fix-002", "text": "unrelated note about the deploy pipeline",
-             "kind": "memory", "project": "Deploy", "created_at": "2026-08-19T10:00:00+00:00", "tags": []},
-            {"id": "hs-fix-003", "text": "auth module review: redirect handling must preserve query params",
-             "kind": "fact", "project": "", "created_at": "2026-08-21T08:00:00+00:00", "tags": ["auth"]},
-            "this line is torn json and must degrade silently\n",
-        ]
-        with (bank_home / 'bank.jsonl').open('w', encoding='utf-8') as f:
-            for m in mems:
-                f.write(m if isinstance(m, str) else json.dumps(m, sort_keys=True) + '\n')
-        # Fixture-bank recall: matching memories pack with the engine tag; the
-        # torn line degrades instead of failing; ordering is deterministic.
-        pack = run('context', 'hs-t1', '--related-semantic', '3')
+
+        # Retain the corpus. Content addressing makes a repeat retain a no-op
+        # instead of forking a duplicate (regression: the retired engine keyed
+        # ids on timestamp+text, so same-second retains collided while the same
+        # fact retained a day apart duplicated).
+        m1 = run('memory-retain', '--text', 'login redirect bug in auth module was caused by a stale cookie session',
+                 '--kind', 'decision', '--project', 'Auth', '--tag', 'auth', '--tag', 'cookies')
+        m2 = run('memory-retain', '--text', 'unrelated note about the deploy pipeline',
+                 '--kind', 'memory', '--project', 'Deploy')
+        m3 = run('memory-retain', '--text', 'auth module review: redirect handling must preserve query params',
+                 '--kind', 'fact')
+        assert all(m['created'] for m in (m1, m2, m3))
+        again = run('memory-retain', '--text', 'login redirect bug in auth module was caused by a stale cookie session',
+                    '--kind', 'decision', '--project', 'Auth')
+        assert again['memory_id'] == m1['memory_id'] and again['created'] is False, again
+
+        # Recall: matching memories pack with the engine tag, newest first.
+        pack = run('context', 'hs-t1', '--related-semantic', '5')
         ids = [m['id'] for m in pack['related_semantic']]
-        assert 'hs-fix-001' in ids and 'hs-fix-003' in ids, pack
-        assert 'hs-fix-002' not in ids, pack
-        assert all(m['engine'] == 'hindsight-bank-v1' for m in pack['related_semantic']), pack
-        assert ids == sorted(ids, key=lambda i: ['hs-fix-003', 'hs-fix-001'].index(i)), pack
-        # Project scoping prefers same-project memories when available.
-        assert pack['related_semantic'][0]['id'] == 'hs-fix-003', pack
-        # Recall loop: digest seals the semantic section and verifies fresh.
-        rb = run('recall', 'hs-t1', '--agent', 'codex', '--related-semantic', '3')
+        assert m1['memory_id'] in ids and m3['memory_id'] in ids, pack
+        assert all(m['engine'] == 'memory-fts-v1' for m in pack['related_semantic']), pack
+        ats = [m['at'] for m in pack['related_semantic']]
+        assert ats == sorted(ats, reverse=True), pack
+        assert sorted(next(m for m in pack['related_semantic']
+                           if m['id'] == m1['memory_id'])['tags']) == ['auth', 'cookies'], pack
+
+        # Regression: stopword-only overlap is not a match. The retired engine
+        # OR-matched raw substrings, so a task containing "the" recalled every
+        # memory containing "the" — relevance was effectively noise.
+        assert m2['memory_id'] not in ids, ('stopword-only overlap must not match', pack)
+
+        # Regression: project scope is enforced, not merely attempted. The
+        # retired engine fell back to unscoped results whenever the project
+        # filter matched nothing — exactly how one project's context leaked
+        # into another's pack.
+        run('create', '--project', 'Billing', '--title', 'fix login redirect bug in auth module', '--id', 'hs-t2')
+        leak = run('context', 'hs-t2', '--related-semantic', '5')
+        leaked = [m['id'] for m in leak['related_semantic']]
+        assert m1['memory_id'] not in leaked, ('Auth memory leaked into Billing', leak)
+        assert m3['memory_id'] in leaked, leak          # project-less memories are fleet-wide
+        assert run('context', 'hs-t2', '--related-semantic', '5', '--related-scope', 'global'
+                   ) and m1['memory_id'] in [m['id'] for m in run(
+                       'context', 'hs-t2', '--related-semantic', '5',
+                       '--related-scope', 'global')['related_semantic']], 'explicit global still reaches'
+
+        # Recall loop: the digest seals the semantic section and verifies fresh.
+        rb = run('recall', 'hs-t1', '--agent', 'codex', '--related-semantic', '5')
         dig = rb['digest']
-        v = run('recall-verify', 'hs-t1', '--digest', dig, '--agent', 'codex', '--related-semantic', '3')
+        v = run('recall-verify', 'hs-t1', '--digest', dig, '--agent', 'codex', '--related-semantic', '5')
         assert v['fresh'] is True, v
-        # Changed bank content is real drift -> digest goes stale (own engine
-        # tag means the semantic section participates in staleness detection).
-        with (bank_home / 'bank.jsonl').open('a', encoding='utf-8') as f:
-            f.write(json.dumps({"id": "hs-fix-004", "text": "auth module followup: rotate session cookies on redirect",
-                                "kind": "memory", "project": "Auth",
-                                "created_at": "2026-08-21T09:00:00+00:00", "tags": ["auth"]}, sort_keys=True) + '\n')
-        v2 = run('recall-verify', 'hs-t1', '--digest', dig, '--agent', 'codex', '--related-semantic', '3')
+        # A new relevant memory is real drift -> the sealed digest goes stale.
+        run('memory-retain', '--text', 'auth module followup: rotate session cookies on redirect',
+            '--kind', 'memory', '--project', 'Auth')
+        v2 = run('recall-verify', 'hs-t1', '--digest', dig, '--agent', 'codex', '--related-semantic', '5')
         assert v2['fresh'] is False, v2
-        pack2 = run('context', 'hs-t1', '--related-semantic', '3')
-        assert 'hs-fix-004' in [m['id'] for m in pack2['related_semantic']], pack2
-        # recall-stale recomputes with the semantic section and flags it stale:
-        # the drift must be cited by a live handoff for the sweep to see it.
         run('handoff', 'hs-t1', '--from-agent', 'codex',
             '--objective', 'continue auth redirect fix',
             '--evidence', 'recalled with semantic memory', '--recall-digest', dig)
         stale = ops('recall-stale')
-        item = next(i for i in stale['items'] if i['task_id'] == 'hs-t1')
-        assert item['state'] == 'stale', stale
-        # Doctor now reports the bank as available with the memory count.
+        assert next(i for i in stale['items'] if i['task_id'] == 'hs-t1')['state'] == 'stale', stale
+
+        # Retraction: the memory stops packing, but the row and its audit
+        # survive so the ledger still explains why the pack changed.
+        run('memory-forget', m1['memory_id'])
+        assert m1['memory_id'] not in [
+            m['id'] for m in run('context', 'hs-t1', '--related-semantic', '5')['related_semantic']]
+        listed = run('memory-list', '--all', '--limit', '50')
+        row = next(m for m in listed if m['id'] == m1['memory_id'])
+        assert row['superseded_by'] == 'retracted', row
+        assert m1['memory_id'] not in [m['id'] for m in run('memory-list', '--limit', '50')]
+        err = run_fail('memory-forget', 'mem-does-not-exist')
+        assert 'no such memory' in err, err
+
+        # Legacy bank import: the migration path off the retired file engine.
+        bank = Path(td) / 'legacy-bank.jsonl'
+        with bank.open('w', encoding='utf-8') as f:
+            f.write(json.dumps({"id": "hs-old-1", "text": "legacy: auth module tokens rotate weekly",
+                                "kind": "fact", "project": "Auth",
+                                "created_at": "2026-01-02T03:04:05+00:00", "tags": ["auth"]}) + '\n')
+            f.write('this line is torn json and must degrade silently\n')
+            f.write(json.dumps({"id": "hs-old-2", "text": ""}) + '\n')
+            # A garbage timestamp degrades to import time and is counted, like a
+            # torn line: one bad field must not abort the whole migration.
+            f.write(json.dumps({"id": "hs-old-3", "text": "legacy: undated deploy rule",
+                                "created_at": "not-a-date"}) + '\n')
+        dry = run('memory-import', str(bank))
+        assert dry['dry_run'] is True and dry['parsed'] == 2 and dry['malformed_lines'] == 2, dry
+        assert dry['undated'] == 1, dry
+        assert run('memory-list', '--query', 'legacy', '--limit', '5') == [], 'dry run must not write'
+        imp = run('memory-import', str(bank), '--apply')
+        assert imp['imported'] == 2 and imp['malformed_lines'] == 2 and imp['undated'] == 1, imp
+        again = run('memory-import', str(bank), '--apply')
+        assert again['imported'] == 0 and again['already_present'] == 2, again   # re-run is a no-op
+        old = next(m for m in run('memory-list', '--query', 'legacy', '--limit', '5')
+                   if 'tokens rotate' in m['content'])
+        assert old['at'] == '2026-01-02T03:04:05+00:00', old   # temporal order preserved
+        assert old['source'] == 'hindsight-bank-import', old
+        assert bank.read_text().count('torn json') == 1, 'the source bank is never mutated'
+        # Import runs the same secret guard as retain.
+        sbank = Path(td) / 'secret-bank.jsonl'
+        sbank.write_text(json.dumps({"id": "s1", "text": 'the api_key is "sk-live-abc123def456ghi789"',
+                                     "created_at": "2026-01-01T00:00:00+00:00"}) + '\n')
+        err = run_fail('memory-import', str(sbank), '--apply')
+        assert 'credential-shaped' in err, err
+
+        # Doctor reports the populated store, and the memory FTS index is part
+        # of the same drift sweep as every other external-content index.
         doc = ops('doctor')
-        note = [n for n in doc.get('notes', []) if n.get('kind') == 'hindsight_status']
+        assert doc['ok'] is True, doc
+        note = [n for n in doc.get('notes', []) if n.get('kind') == 'memory_store']
         assert note and note[0]['status'] == 'available' and note[0]['memories'] >= 5, doc
-        # Retain into the existing bank works and lands in recall.
-        ret = run('hindsight-retain', '--text', 'auth module decision: sessions expire after 30 days',
-                  '--kind', 'decision', '--project', 'Auth')
-        assert ret['ok'] is True, ret
-        pack3 = run('context', 'hs-t1', '--related-semantic', '5')
-        assert any('expire after 30 days' in m['content'] for m in pack3['related_semantic']), pack3
-        # The retain was audited with the memory id.
+        assert note[0]['retracted'] >= 1 and note[0]['fts'] is True, doc
+        reb = ops('fts-rebuild', '--dry-run')
+        assert reb['drift_before'] == [], reb
+        assert 'memories_fts' not in reb['skipped_no_fts5'], reb
+
+        # Retains are transactional with the audit chain: no memory exists that
+        # the ledger cannot account for (the retired engine appended to the
+        # bank file outside the transaction, so a failed audit orphaned a line).
         with sqlite3.connect(Path(td) / 'state.db') as db:
-            n = db.execute("SELECT COUNT(*) FROM audit_events WHERE action='hindsight_retained'").fetchone()[0]
-            assert n >= 2, n
-        # Bank file was only ever appended, never rewritten: the torn line survives.
-        with (bank_home / 'bank.jsonl').open('r', encoding='utf-8') as f:
-            assert any('this line is torn json' in line for line in f)
+            db.row_factory = sqlite3.Row
+            audited = db.execute(
+                "SELECT COUNT(*) n FROM audit_events WHERE action='memory_retained'").fetchone()['n']
+            created = db.execute(
+                "SELECT COUNT(*) n FROM audit_events WHERE action='memory_retained' "
+                "AND json_extract(payload_json,'$.created')=1").fetchone()['n']
+            stored = db.execute("SELECT COUNT(*) n FROM memories").fetchone()['n']
+            imported = db.execute(
+                "SELECT COUNT(*) n FROM memories WHERE source='hindsight-bank-import'").fetchone()['n']
+            # Every retained memory has a creating audit event, and the
+            # idempotent repeat is audited too rather than passing unrecorded.
+            assert created == stored - imported, (created, stored, imported)
+            assert audited == created + 1, (audited, created)
+            assert db.execute(
+                "SELECT COUNT(*) n FROM audit_events WHERE action='memory_imported'").fetchone()['n'] == 2
+            assert db.execute(
+                "SELECT COUNT(*) n FROM audit_events WHERE action='memory_forgotten'").fetchone()['n'] == 1
+            import autopilot as _ap
+            assert _ap.audit_chain_problems(db) == [], 'retains must not break the chain'
+            # FTS and the LIKE fallback return identical rows, so a SQLite build
+            # without FTS5 degrades in ranking cost only, never in correctness.
+            fts_rows = _ap._memory_candidates(db, 'hs-t1', 'fix login redirect bug in auth module', 5, 'project')
+            db.execute('DROP TABLE memories_fts')
+            like_rows = _ap._memory_candidates(db, 'hs-t1', 'fix login redirect bug in auth module', 5, 'project')
+            assert fts_rows == like_rows, (fts_rows, like_rows)
+            db.rollback()
 
 
 @case('sense_repair_breaker_learning')
@@ -4547,6 +4614,254 @@ def _case_nanny_bounded_double_run_and_impulse_states():
         assert run('verify-chain')['ok'] is True
 
 
+@case('audit_chain_survives_concurrent_writers')
+def _case_audit_chain_survives_concurrent_writers():
+    """The hash chain is a read-modify-write: appending reads the current tail
+    and links to it. Without holding the write lock across both halves, two
+    processes observe the same tail and emit two events sharing one prev_hash
+    -- a fork no later writer can heal, and the exact defect that made the
+    bounded-nanny double-run case fail intermittently."""
+    with tempfile.TemporaryDirectory() as td:
+        env = os.environ.copy(); env['HERMES_AUTOPILOT_HOME'] = td
+        def run(*args):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args],
+                               env=env, text=True, capture_output=True)
+            if p.returncode: raise AssertionError((args, p.stdout, p.stderr))
+            return json.loads(p.stdout)
+        run('create', '--project', 'Verify', '--title', 'chain host', '--id', 'chain-1')
+        worker = Path(td) / 'append.py'
+        worker.write_text(
+            'import sys\n'
+            'sys.path.insert(0, %r)\n'
+            'import autopilot as ap\n'
+            'c = ap.conn()\n'
+            'for i in range(25):\n'
+            '    ap.audit(c, "system", "concurrency", "chain_probe",'
+            ' {"worker": sys.argv[1], "i": i})\n'
+            '    c.commit()\n' % str(ROOT))
+        procs = [subprocess.Popen([sys.executable, str(worker), str(k)], env=env, text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                 for k in range(4)]
+        results = [pr.communicate() + (pr.returncode,) for pr in procs]
+        assert all(r[2] == 0 for r in results), results
+        # Every append landed -- serialization must not silently drop writers.
+        events = run('events', '--action', 'chain_probe', '--limit', '500')
+        assert events['total_matching'] == 100, events['total_matching']
+        chain = run('verify-chain')
+        assert chain['ok'] is True, chain['problems'][:5]
+
+
+
+@case('memory_embedding_layer_is_optional_and_off_the_pack_path')
+def _case_memory_embedding_layer_is_optional_and_off_the_pack_path():
+    """The semantic layer must be additive in the strictest sense.
+
+    Three properties, each pinning a way this could quietly go wrong:
+
+    1. Absent embedder is a note, not a failure. autopilot runs on a stdlib
+       interpreter with no torch; if a missing optional model could make any
+       command exit non-zero, the core loop would inherit a dependency it
+       never agreed to.
+    2. Embedding a memory must not move a sealed context pack's core_digest.
+       Memories live inside the sealed core, so derived data that leaked into
+       that digest would stale every pack citing a memory the moment the cron
+       ran -- and `recall-stale` would start reporting phantom drift.
+    3. The monitor digest must ignore derived state. It gates the
+       consolidation session; if it moved when vectors were written, the
+       session's own side effects would re-open the gate on the next tick and
+       the job would run forever -- the always-on behaviour the retired
+       engine had.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        env = os.environ.copy(); env['HERMES_AUTOPILOT_HOME'] = td
+
+        def run(*args, expect_ok=True, extra_env=None):
+            e = dict(env, **(extra_env or {}))
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args],
+                               env=e, text=True, capture_output=True)
+            if expect_ok and p.returncode:
+                raise AssertionError((args, p.stdout, p.stderr))
+            return p
+
+        def js(*args, **kw):
+            return json.loads(run(*args, **kw).stdout)
+
+        run('create', '--project', 'demo', '--title', 'gateway lease rollout',
+            '--id', 'emb-1')
+        for text in ('the deploy broke on the gateway lease path after the rollout',
+                     'added a new tokenizer for search queries'):
+            run('memory-retain', '--text', text, '--project', 'demo')
+
+        # 1. No usable interpreter: every surface still exits 0 and says why.
+        blind = {'AUTOPILOT_EMBED_PYTHON': str(Path(td) / 'no-such-python')}
+        for args in (('memory-search', '--query', 'rollback'),
+                     ('memory-consolidate-brief',)):
+            out = js(*args, extra_env=blind)
+            assert out['ok'] is True and out['available'] is False, out
+            assert out.get('note'), out
+        out = js('memory-embed', '--apply', extra_env=blind)
+        assert out['ok'] is True and out['embedded'] == 0, out
+        # The store itself is untouched by a failed optional pass.
+        assert js('memory-status')['memories'] == 2
+
+        # A blind machine must still be able to read its own store.
+        assert len(js('memory-list', '--project', 'demo')) == 2
+
+        # 2/3. With a working embedder, digests must not move.
+        probe = js('memory-status')['semantic']
+        if not probe.get('available'):
+            return {'skipped': 'no embedding worker on this machine',
+                    'reason': probe.get('reason')}
+        pack_before = js('recall', 'emb-1', '--related-semantic', '5')['core_digest']
+        monitor_before = run('memory-status', '--digest').stdout
+
+        embedded = js('memory-embed', '--apply')
+        assert embedded['embedded'] == 2, embedded
+
+        pack_after = js('recall', 'emb-1', '--related-semantic', '5')['core_digest']
+        assert pack_after == pack_before, (pack_before, pack_after)
+        assert run('memory-status', '--digest').stdout == monitor_before
+
+        # Re-running is a no-op: vectors are never recomputed.
+        assert js('memory-embed', '--apply')['embedded'] == 0
+
+        # Semantic recall finds what keyword search cannot: the query shares no
+        # content word with the memory it should rank first.
+        hits = js('memory-search', '--query', 'rollback failure in production',
+                  '--project', 'demo', '--limit', '2')['hits']
+        assert hits and 'gateway lease path' in hits[0]['content'], hits
+        assert not js('memory-list', '--project', 'demo',
+                      '--query', 'rollback failure in production')
+
+        # Scope is enforced, never relaxed to unscoped on an empty match --
+        # regression: the retired engine leaked other projects exactly here.
+        assert js('memory-search', '--query', 'rollback failure',
+                  '--project', 'other')['hits'] == []
+
+        # Git-derived memories are events, not restatements: consolidation
+        # must never offer them as merge candidates. Two PRs merged the same
+        # afternoon with near-identical titles cluster tightly, and merging
+        # them would delete a release from the record a build log reports on.
+        # Measured on the live store, this was 63 of 122 clusters.
+        for t in ('PR #220 merged on 2026-08-17 by dev: record the production release',
+                  'PR #224 merged on 2026-08-17 by dev: record the compliance release'):
+            run('memory-retain', '--text', t, '--project', 'demo', '--kind', 'pull_request')
+        run('memory-embed', '--apply')
+        pr_texts = {'#220', '#224'}
+
+        def clusters_with_prs(*extra):
+            out = js('memory-consolidate-brief', '--project', 'demo',
+                     '--threshold', '0.80', '--max-clusters', '50', *extra)
+            return [c for c in out['clusters']
+                    if any(any(k in m['text'] for k in pr_texts) for m in c['members'])], out
+
+        hidden, out = clusters_with_prs()
+        assert out['excluded_kinds'] == ['commit', 'pull_request'], out['excluded_kinds']
+        assert hidden == [], hidden
+        # --include-git is the deliberate opt-in, and must still work: the
+        # exclusion is a default, not a capability that was removed.
+        shown, out = clusters_with_prs('--include-git')
+        assert out['excluded_kinds'] == [], out['excluded_kinds']
+        assert shown, 'the PR pair should cluster once git kinds are included'
+
+        # Retracted memories leave the semantic index too, not just FTS.
+        mid = js('memory-list', '--project', 'demo')[0]['id']
+        run('memory-forget', mid, '--superseded-by', 'retracted')
+        assert all(h['id'] != mid for h in
+                   js('memory-search', '--query', 'gateway lease rollout',
+                      '--project', 'demo', '--limit', '5')['hits'])
+
+        # The consolidation gate must settle: retraction moves the monitor
+        # line once, and the following tick is byte-identical.
+        moved = run('memory-status', '--digest').stdout
+        assert moved != monitor_before
+        assert run('memory-status', '--digest').stdout == moved
+
+        assert js('verify-chain')['ok'] is True
+    return {'model': probe.get('model'), 'dim': probe.get('dim')}
+
+
+@case('git_ingest_is_bounded_and_idempotent')
+def _case_git_ingest_is_bounded_and_idempotent():
+    """Git ingest exists to feed a writer agent, so it has to be boring.
+
+    Four properties:
+
+    1. Dry-run writes nothing. Ingest is the one memory command pointed at a
+       source the user did not author line by line; it must be inspectable
+       before it lands.
+    2. A second --apply ingests zero rows. Memories are content-addressed on
+       (project, content_hash) and the commit SHA is in the text, so re-ingest
+       is a free no-op -- there is no cursor file to corrupt or fall behind.
+       If this ever regressed, a daily cron would duplicate history forever.
+    3. --since actually bounds. Unbounded ingest lets one busy repository
+       dominate the store and skew every later recall toward it.
+    4. Enumeration is complete and ordered. A build log that silently drops
+       the boring commits is how a writer agent ends up factually wrong, so
+       memory-list --kind must return every commit, not a ranked subset.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        env = os.environ.copy(); env['HERMES_AUTOPILOT_HOME'] = td
+        repo = Path(td) / 'src'; repo.mkdir()
+
+        def git(*args, when=None):
+            e = dict(os.environ)
+            if when:
+                e['GIT_AUTHOR_DATE'] = e['GIT_COMMITTER_DATE'] = when
+            p = subprocess.run(['git', *args], cwd=repo, env=e,
+                               text=True, capture_output=True)
+            if p.returncode:
+                raise AssertionError((args, p.stdout, p.stderr))
+            return p.stdout
+
+        git('init', '-q')
+        git('config', 'user.email', 'v@example.com')
+        git('config', 'user.name', 'Verifier')
+        old, new = '2001-01-01T00:00:00', '2032-01-01T00:00:00'
+        for i, when in ((0, old), (1, new), (2, new)):
+            (repo / f'f{i}').write_text(str(i))
+            git('add', '-A')
+            git('commit', '-q', '-m', f'change number {i}', when=when)
+
+        def run(*args, expect_ok=True):
+            p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), *args],
+                               env=env, text=True, capture_output=True)
+            if expect_ok and p.returncode:
+                raise AssertionError((args, p.stdout, p.stderr))
+            return p
+
+        def js(*args, **kw):
+            return json.loads(run(*args, **kw).stdout)
+
+        base = ('memory-ingest-git', '--repo', str(repo), '--project', 'src')
+
+        # 1. Dry run reports the work without doing it.
+        wide = ('--since', '2000-01-01')
+        dry = js(*base, *wide)
+        assert dry['ok'] is True and dry['dry_run'] is True, dry
+        assert dry['found'] == 3 and dry['by_kind']['commit'] == 3, dry
+        assert js('memory-list', '--project', 'src') == []
+
+        # 3. --since drops the ancient commit rather than clamping to it.
+        bounded = js(*base, '--since', '2020-01-01', '--apply')
+        assert bounded['ingested'] == 2, bounded
+
+        # 2. Re-running the same bounded ingest is a pure no-op...
+        again = js(*base, '--since', '2020-01-01', '--apply')
+        assert again['ingested'] == 0 and again['already_present'] == 2, again
+        # ...and widening the window backfills only what was missing.
+        widened = js(*base, *wide, '--apply')
+        assert widened['ingested'] == 1 and widened['already_present'] == 2, widened
+
+        # 4. Enumeration returns every commit, newest first.
+        rows = js('memory-list', '--project', 'src', '--kind', 'commit')
+        assert len(rows) == 3, rows
+        assert all('change number' in r['content'] for r in rows), rows
+        assert js('memory-list', '--project', 'src', '--kind', 'commit',
+                  '--since', '2020-01-01') != rows
+
+        assert js('verify-chain')['ok'] is True
+    return {'commits': 3}
 
 
 if __name__ == '__main__':

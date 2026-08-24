@@ -7,10 +7,12 @@ This tool intentionally does not deploy, merge, send messages, or execute work.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import uuid
 import hashlib
@@ -201,6 +203,51 @@ CREATE TABLE IF NOT EXISTS facts (
 );
 CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject, predicate);
 CREATE INDEX IF NOT EXISTS idx_facts_object ON facts(object);
+
+-- Semantic memory (the local retrieval engine): free-text facts and decisions
+-- retained by agents, held in the control-plane database rather than an
+-- out-of-band file. Being in-DB is the point: retains are transactional with
+-- the audit hash chain, a torn write is impossible, the store is sealed and
+-- backed up with everything else, and no out-of-band edit can silently stale
+-- a sealed pack digest. Retrieval is deterministic BM25/LIKE over
+-- memories_fts -- no model, no embedding service, no network.
+-- Rows are immutable once written; retraction sets superseded_by (a
+-- non-indexed column, so no FTS UPDATE trigger is needed) exactly as
+-- handoffs do.
+CREATE TABLE IF NOT EXISTS memories (
+  id TEXT PRIMARY KEY,
+  text TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'memory',
+  project TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  tags TEXT NOT NULL DEFAULT '[]',
+  task_id TEXT NOT NULL DEFAULT '',
+  content_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  superseded_by TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_dedupe
+  ON memories(project, content_hash);
+-- Embeddings live in their own table, never as columns on `memories`, for two
+-- reasons. They are optional: the machine that computes them carries a
+-- multi-gigabyte dependency tree that autopilot itself does not require, so
+-- their absence must be a missing row rather than a NULL the whole engine has
+-- to reason about. And `memories` rows are inside the sealed core of a context
+-- pack -- widening that row shape would stale every pack that cites a memory
+-- for a change no reader can even observe. `model` is part of the key because
+-- vectors from two different models are not comparable; re-embedding under a
+-- new model adds rows instead of silently corrupting a shared space.
+CREATE TABLE IF NOT EXISTS memory_vectors (
+  memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  model TEXT NOT NULL,
+  dim INTEGER NOT NULL,
+  content_hash TEXT NOT NULL,
+  vec BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (memory_id, model)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_vectors_model ON memory_vectors(model);
 """
 # Full-text retrieval (FTS5, stdlib sqlite3): external-content indexes over
 # notes/tasks kept in sync by triggers. Applied only when the SQLite build
@@ -269,6 +316,17 @@ CREATE TRIGGER IF NOT EXISTS facts_fts_ai AFTER INSERT ON facts BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS facts_fts_ad AFTER DELETE ON facts BEGIN
   INSERT INTO facts_fts(facts_fts,rowid,subject,predicate,object,source) VALUES('delete',old.rowid,old.subject,old.predicate,old.object,old.source);
+END;
+-- Memory rows are immutable once written (retraction sets the non-indexed
+-- superseded_by column), so no UPDATE trigger is needed.
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+  text, kind, project, tags, content='memories', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+  INSERT INTO memories_fts(rowid,text,kind,project,tags) VALUES(new.rowid,new.text,new.kind,new.project,new.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts,rowid,text,kind,project,tags) VALUES('delete',old.rowid,old.text,old.kind,old.project,old.tags);
 END;
 """
 STATUSES = {"queued", "claimed", "running", "waiting_for_agent", "waiting_for_user", "waiting_for_review", "ready_to_merge", "ready_to_deploy", "blocked", "completed", "failed", "cancelled"}
@@ -382,12 +440,19 @@ def _facts_fts_ready(db) -> bool:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='facts_fts'")}
     return "facts_fts" in names
 
+def _memories_fts_ready(db) -> bool:
+    """True when the semantic-memory FTS index exists."""
+    names = {r[0] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'")}
+    return "memories_fts" in names
+
 def _ensure_fts(db) -> None:
     """Create FTS indexes when supported; rebuild once on first creation so
     pre-existing rows become searchable. Silently skips on non-FTS5 builds."""
     try:
         complete = (_fts_ready(db) and _handoffs_fts_ready(db)
-                    and _sessions_fts_ready(db) and _facts_fts_ready(db))
+                    and _sessions_fts_ready(db) and _facts_fts_ready(db)
+                    and _memories_fts_ready(db))
         db.executescript(FTS_SCHEMA)
         if not complete:
             db.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')")
@@ -395,17 +460,60 @@ def _ensure_fts(db) -> None:
             db.execute("INSERT INTO handoffs_fts(handoffs_fts) VALUES('rebuild')")
             db.execute("INSERT INTO session_messages_fts(session_messages_fts) VALUES('rebuild')")
             db.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
+            db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
     except sqlite3.OperationalError:
         pass  # FTS5 unavailable: search falls back to LIKE
 
-def _fts_query(text: str) -> str:
-    """Convert free text into a safe FTS5 query of quoted tokens ('' if none)."""
-    toks = []
+# Retrieval is one tokenizer, not five. Every text-matching collector (notes,
+# handoffs, sessions, facts, memories) funnels through _search_tokens so a fix
+# here reaches all of them; before this, four near-identical copies had drifted
+# apart on case folding and quote stripping. The legacy defaults are exactly
+# the historical behavior, so existing sections keep byte-identical results and
+# sealed pack digests stay valid; the memory engine opts into the stricter
+# filtering via min_len/drop_stopwords.
+SEARCH_STOPWORDS = frozenset((
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
+    "has", "have", "in", "into", "is", "it", "its", "of", "on", "or", "that",
+    "the", "their", "then", "there", "these", "this", "to", "was", "were",
+    "will", "with",
+))
+SEARCH_MAX_TOKENS = 32
+
+def _search_tokens(text: str, *, fold_case: bool = False, min_len: int = 1,
+                   drop_stopwords: bool = False,
+                   limit: int = SEARCH_MAX_TOKENS) -> list:
+    """Free text -> deterministic, deduplicated, bounded match tokens.
+
+    Double quotes are stripped so a token can never break out of an FTS5
+    phrase or a LIKE parameter, and a token must carry at least one
+    alphanumeric character. `limit` bounds how many tokens reach SQL: an
+    enormous task description used to expand into an unbounded OR chain,
+    which is both slow and a way to blow SQLite's expression-depth limit.
+    Order is first-appearance and duplicates collapse, so the token list --
+    and therefore any digest computed over the results -- is reproducible.
+    """
+    out, seen = [], set()
     for raw in text.split():
         tok = raw.replace('"', "")
-        if tok and any(c.isalnum() for c in tok):
-            toks.append('"%s"' % tok)
-    return " ".join(toks)
+        if not tok or not any(c.isalnum() for c in tok):
+            continue
+        if fold_case:
+            tok = tok.lower()
+        if len(tok) < min_len:
+            continue
+        if drop_stopwords and tok.lower() in SEARCH_STOPWORDS:
+            continue
+        if tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+def _fts_query(text: str) -> str:
+    """Convert free text into a safe FTS5 query of quoted tokens ('' if none)."""
+    return " ".join('"%s"' % t for t in _search_tokens(text))
 
 def _migrate(db) -> None:
     """Add hash-chain columns to pre-existing audit_events tables and backfill."""
@@ -542,6 +650,15 @@ def audit(db, entity_type: str, entity_id: str, action: str, payload=None) -> No
     """Append an immutable, hash-chained local audit event; never include credentials in payloads."""
     payload_json = json.dumps(payload or {}, sort_keys=True)
     created = now()
+    # The chain link must be read under the same write lock that appends it.
+    # sqlite3 opens a deferred transaction only at the INSERT, so a bare
+    # read-then-append lets two concurrent processes both observe the same
+    # tail and write two events carrying the same prev_hash -- a forked,
+    # permanently broken chain that no later writer can heal. Callers that
+    # already wrote in this transaction hold the lock; otherwise take it here
+    # (busy_timeout makes a competing writer wait rather than fail).
+    if not db.in_transaction:
+        db.execute("BEGIN IMMEDIATE")
     prev = db.execute("SELECT hash FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
     prev_hash = prev[0] if prev else ""
     h = _chain_hash(prev_hash, entity_type, entity_id, action, payload_json, created)
@@ -1417,8 +1534,8 @@ def _pack_spec():
                         + len(ft["object"]) + len(ft["valid_from"]) + len(ft["valid_until"])
                         + len(ft["source"]) + 16)),
         _PackSection("related_semantic", "related_semantic",
-            lambda db, ctx, n: _hindsight_candidates(db, ctx["task_id"], ctx["pack_text"],
-                                                     n, ctx["rel_scope"]),
+            lambda db, ctx, n: _memory_candidates(db, ctx["task_id"], ctx["pack_text"],
+                                                  n, ctx["rel_scope"]),
             lambda m: (len(m["id"]) + len(m["engine"]) + len(m["kind"]) + len(m["project"])
                        + len(m["at"]) + sum(len(t) for t in m["tags"]) + len(m["content"]) + 16),
             decorate=lambda r: {**r, "semantic": True}),
@@ -2687,93 +2804,236 @@ def _related_session_candidates(db, task_id: str, text: str, limit: int, scope: 
     return rows
 
 # ---------------------------------------------------------------------------
-# Hindsight semantic-memory adapter (read-only recall + guarded retain).
+# Semantic memory: the local, non-model fact-retrieval engine.
 #
-# Documented bank format ("bank v1"): a single JSONL file at
-# $HERMES_HINDSIGHT_HOME/bank.jsonl (default ~/.hermes/hindsight/bank.jsonl),
-# one memory per line: {"id","text","kind","project","created_at","tags"}.
-# The runtime never mutates a live bank except through `hindsight-retain`,
-# which appends after the same secret guard notes use. Recall is strictly
-# read-only and deterministic (created_at DESC, then id) so pack digests are
-# exactly recomputable; every packed row carries its own engine tag so
-# staleness detection covers the semantic sections independently.
+# This replaces the former Hindsight adapter (an out-of-band bank.jsonl plus a
+# provider HTTP service). Memories now live in the `memories` table of the
+# control-plane database and are retrieved by SQLite FTS5 -- deterministic
+# token matching, no embeddings, no model, no network call, nothing outside
+# this process. That removes an entire class of failure the file/service
+# design invited: cross-context bleed from a shared external bank, torn JSONL
+# lines, retains that landed on disk but not in the audit chain, and sealed
+# pack digests silently invalidated by an out-of-band file edit.
+#
+# Recall is strictly read-only and ordered (created_at DESC, id ASC) so pack
+# digests are exactly recomputable, and -- like related facts and handoffs --
+# it deliberately emits no relevance score: BM25 drifts whenever any row joins
+# the index, which would falsely stale sealed digests.
 # ---------------------------------------------------------------------------
-HINDSIGHT_ENGINE_TAG = "hindsight-bank-v1"
+MEMORY_ENGINE_TAG = "memory-fts-v1"
 
-def _hindsight_home():
-    return Path(os.environ.get("HERMES_HINDSIGHT_HOME",
-                               Path.home() / ".hermes" / "hindsight"))
+# Memory kinds that must never be consolidation candidates. Consolidation
+# merges a cluster on the premise that it is one fact restated several ways
+# and that collapsing it loses nothing. Git-derived memories break that
+# premise: two PRs merged the same afternoon with near-identical titles are
+# two events, not one fact, and merging them deletes an event that a build log
+# is supposed to report. Measured on the live store, 14 of 25 clusters at
+# threshold 0.92 were pure commit/PR groups -- e.g. PRs #220, #221 and #224,
+# three distinct releases, clustered as though they were one. Excluded by
+# default; `--include-git` opts back in for a deliberate cleanup.
+CONSOLIDATE_UNMERGEABLE_KINDS = ("commit", "pull_request")
 
-def _hindsight_bank_path():
-    return _hindsight_home() / "bank.jsonl"
+# ---------------------------------------------------------------------------
+# Optional semantic layer (embeddings)
+#
+# FTS5 above is the *retrieval* engine and stays that way: it is deterministic,
+# in-process, sub-millisecond, and digest-stable, which is what a sealed
+# context pack requires. Embeddings answer a different question -- "what is
+# about the same thing", where FTS can only answer "what shares these words" --
+# and they answer it at a cost that forbids them from the same path: loading
+# the model takes ~6 seconds, against a ~95 ms end-to-end `recall`.
+#
+# So the layer is strictly additive and strictly off the critical path.
+# `related_semantic` in a pack is still FTS5, byte-identical to before. The
+# embedding surfaces (`memory-embed`, `memory-search`) are separate commands
+# for callers that already live inside a long-running session -- the
+# consolidation cron, the writer agent -- where six seconds is free.
+#
+# Availability is a note, never a problem. On a machine with no worker,
+# `memory-search` reports `available: false` with a reason and exits clean;
+# nothing that depends on autopilot's core loop can be broken by the absence of
+# an optional model. Nothing here installs, downloads, or reaches the network:
+# the worker forces HF_HUB_OFFLINE, and a missing model cache surfaces as
+# `model_unavailable` rather than a silent multi-hundred-megabyte fetch.
+# ---------------------------------------------------------------------------
+EMBED_MODEL = os.environ.get("AUTOPILOT_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+EMBED_WORKER = Path(__file__).resolve().parent / "embed_worker.py"
+EMBED_DIM = 384
+# Model load dominates; a cold first call on a busy machine can take tens of
+# seconds, while a hung worker must never wedge a cron job forever.
+EMBED_TIMEOUT = int(os.environ.get("AUTOPILOT_EMBED_TIMEOUT", "180"))
+EMBED_BATCH = 256
 
-def _hindsight_available() -> bool:
-    return _hindsight_bank_path().is_file()
+class EmbedUnavailable(Exception):
+    """The optional embedding worker could not run. Callers degrade, not fail."""
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(reason)
+        self.reason, self.detail = reason, detail
 
-def _hindsight_candidates(db, task_id: str, text: str, limit: int, scope: str) -> list:
-    """Semantic recall from a Hindsight bank matching this task's text.
+def _embed_python() -> str:
+    """Interpreter that can import sentence-transformers, or "" if none.
+
+    Explicit override first, then the virtualenv the retired Hindsight service
+    left behind -- reusing it is deliberate: it already carries the exact torch
+    and model cache this needs, so enabling semantic memory installs nothing.
+    Last resort is the current interpreter, which covers a machine where the
+    dependency happens to be importable directly.
+    """
+    override = os.environ.get("AUTOPILOT_EMBED_PYTHON", "").strip()
+    if override:
+        return override if Path(override).exists() else ""
+    venv = Path.home() / ".hermes" / "hindsight" / ".venv" / "bin" / "python"
+    if venv.exists():
+        return str(venv)
+    try:
+        import sentence_transformers  # noqa: F401
+        return sys.executable
+    except Exception:
+        return ""
+
+def _embed_call(payload: dict) -> dict:
+    """One request/response round trip with the out-of-process worker.
+
+    Every failure mode -- no interpreter, no worker file, crash, timeout,
+    unparseable output, {"ok": false} -- converges on EmbedUnavailable with a
+    machine-readable reason, so callers have exactly one thing to handle.
+    """
+    py = _embed_python()
+    if not py:
+        raise EmbedUnavailable("no_interpreter",
+                               "set AUTOPILOT_EMBED_PYTHON to a python with "
+                               "sentence-transformers installed")
+    if not EMBED_WORKER.exists():
+        raise EmbedUnavailable("no_worker", str(EMBED_WORKER))
+    env = os.environ.copy()
+    env["HF_HUB_OFFLINE"] = "1"          # belt and braces: the worker sets these
+    env["TRANSFORMERS_OFFLINE"] = "1"    # too, but never trust one layer alone
+    try:
+        proc = subprocess.run([py, str(EMBED_WORKER)],
+                              input=json.dumps({"model": EMBED_MODEL, **payload}),
+                              text=True, capture_output=True,
+                              timeout=EMBED_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        raise EmbedUnavailable("timeout", f"worker exceeded {EMBED_TIMEOUT}s")
+    except OSError as exc:
+        raise EmbedUnavailable("spawn_failed", str(exc))
+    if proc.returncode != 0:
+        raise EmbedUnavailable("worker_failed",
+                               (proc.stderr or proc.stdout or "").strip()[:500])
+    try:
+        out = json.loads(proc.stdout or "{}")
+    except ValueError:
+        raise EmbedUnavailable("bad_output", (proc.stdout or "")[:500])
+    if not out.get("ok"):
+        raise EmbedUnavailable(out.get("reason") or "unknown",
+                               out.get("detail") or "")
+    return out
+
+def _embed_texts(texts: list) -> list:
+    """Embed texts to L2-normalised float32 blobs, in worker-sized batches.
+
+    Batching bounds the pipe payload and the worker's resident memory; the
+    model is loaded once per batch, which is why the batch is large.
+    """
+    blobs = []
+    for start in range(0, len(texts), EMBED_BATCH):
+        chunk = texts[start:start + EMBED_BATCH]
+        out = _embed_call({"mode": "embed", "texts": chunk})
+        vecs = out.get("vectors") or []
+        if len(vecs) != len(chunk):
+            raise EmbedUnavailable("short_response",
+                                   f"asked {len(chunk)}, got {len(vecs)}")
+        blobs.extend(base64.b64decode(v) for v in vecs)
+    return blobs
+
+def _embed_probe() -> dict:
+    """Availability as data: never raises, so status surfaces stay green."""
+    py = _embed_python()
+    try:
+        out = _embed_call({"mode": "probe"})
+    except EmbedUnavailable as exc:
+        return {"available": False, "reason": exc.reason, "detail": exc.detail,
+                "python": py, "model": EMBED_MODEL}
+    return {"available": True, "python": py, "model": EMBED_MODEL,
+            "dim": int(out.get("dim") or 0)}
+MEMORY_SNIPPET_CHARS = 400
+MEMORY_KINDS = ("decision", "fact", "constraint", "memory")
+
+def _memory_id(text: str, project: str) -> str:
+    """Content-addressed memory id: identical text in a project is one memory.
+
+    The former engine hashed timestamp+text, so two retains in the same second
+    collided while the same fact retained twice a day apart forked into
+    duplicates. Addressing by content makes re-retain idempotent instead.
+    """
+    return "mem-" + hashlib.sha256(
+        f"{project}\x00{text}".encode()).hexdigest()[:16]
+
+def _memory_snippet(text: str) -> str:
+    return (text[:MEMORY_SNIPPET_CHARS - 1] + "\u2026"
+            if len(text) > MEMORY_SNIPPET_CHARS else text)
+
+def _memory_tags(raw) -> list:
+    """Tags are stored as a JSON array; a malformed value degrades to []."""
+    if isinstance(raw, list):
+        return sorted(str(t) for t in raw if str(t))
+    try:
+        parsed = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    return sorted(str(t) for t in parsed if str(t)) if isinstance(parsed, list) else []
+
+def _memory_candidates(db, task_id: str, text: str, limit: int, scope: str) -> list:
+    """Semantic memories matching this task's text, newest first.
 
     Same shape discipline as the session/fact collectors: empty when the flag
-    is unset, the bank is absent/unreadable, or the task text has no usable
-    tokens (the graceful-unavailable path — never an error). Deterministic
-    ordering keeps digests stable; snippets are bounded like sessions.
+    is unset or the task text carries no usable tokens (the graceful-empty
+    path -- never an error). Superseded memories are never candidates: a pack
+    must carry what is believed *now*.
+
+    Scope is enforced, not merely attempted. The former engine fell back to
+    unscoped results whenever the project filter matched nothing, which is
+    precisely how another project's context leaked into a pack; here a
+    project-scoped recall that matches nothing returns nothing.
     """
-    if limit <= 0 or not text.strip() or not _hindsight_available():
+    if limit <= 0 or not text.strip():
         return []
-    toks = []
-    for raw in text.split():
-        tok = raw.replace('"', "")
-        low = tok.lower()
-        if tok and any(c.isalnum() for c in tok):
-            toks.append(low)
+    toks = _search_tokens(text, fold_case=True, min_len=2, drop_stopwords=True)
     if not toks:
         return []
-    mems = []
-    try:
-        with _hindsight_bank_path().open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    m = json.loads(line)
-                except ValueError:
-                    continue  # a torn/corrupt line degrades, never fails recall
-                if not isinstance(m, dict) or not m.get("text"):
-                    continue
-                mems.append(m)
-    except OSError:
-        return []
-    def matches(m):
-        hay = " ".join(str(m.get(k) or "") for k in
-                       ("text", "kind", "project")).lower() \
-              + " " + " ".join(str(t).lower() for t in (m.get("tags") or []))
-        return any(t in hay for t in toks)
-    hits = [m for m in mems if matches(m)]
+    cols = ("SELECT m.id,m.text,m.kind,m.project,m.source,m.tags,m.created_at")
+    where, vals = [], []
+    if _memories_fts_ready(db):
+        src = (" FROM memories_fts x JOIN memories m ON m.rowid=x.rowid "
+               "WHERE memories_fts MATCH ?")
+        vals.append(" OR ".join('"%s"' % t for t in toks))
+    else:
+        src = " FROM memories m WHERE (" + " OR ".join(
+            "(m.text LIKE ? OR m.kind LIKE ? OR m.project LIKE ? OR m.tags LIKE ?)"
+            for _ in toks) + ")"
+        vals.extend(v for t in toks for v in ("%" + t + "%",) * 4)
+    where.append("m.superseded_by=''")
     if scope != "global":
         try:
-            proj = db.execute("SELECT project FROM tasks WHERE id=?",
-                              (task_id,)).fetchone()
+            row = db.execute("SELECT project FROM tasks WHERE id=?",
+                             (task_id,)).fetchone()
         except sqlite3.Error:
-            proj = None
-        proj = proj["project"] if proj else ""
-        scoped = [m for m in hits if (m.get("project") or "") in ("", proj)]
-        if scoped:
-            hits = scoped
-    hits.sort(key=lambda m: (str(m.get("created_at") or ""), str(m.get("id") or "")),
-              reverse=True)
+            row = None
+        proj = row["project"] if row else ""
+        where.append("(m.project='' OR m.project=?)")
+        vals.append(proj)
+    sql = (cols + src + " AND " + " AND ".join(where)
+           + " ORDER BY m.created_at DESC, m.id ASC LIMIT ?")
+    vals.append(limit)
     out = []
-    for m in hits[:max(0, limit)]:
-        txt = str(m.get("text") or "")
-        if len(txt) > SESSION_SNIPPET_CHARS:
-            txt = txt[:SESSION_SNIPPET_CHARS - 1] + "…"
-        out.append({"id": str(m.get("id") or ""),
-                    "engine": HINDSIGHT_ENGINE_TAG,
-                    "kind": str(m.get("kind") or "memory"),
-                    "project": str(m.get("project") or ""),
-                    "at": str(m.get("created_at") or ""),
-                    "tags": sorted(str(t) for t in (m.get("tags") or [])),
-                    "content": txt})
+    for r in db.execute(sql, vals).fetchall():
+        out.append({"id": r["id"],
+                    "engine": MEMORY_ENGINE_TAG,
+                    "kind": r["kind"] or "memory",
+                    "project": r["project"] or "",
+                    "at": r["created_at"] or "",
+                    "tags": _memory_tags(r["tags"]),
+                    "content": _memory_snippet(r["text"] or "")})
     return out
 
 def release(args):
@@ -4244,45 +4504,654 @@ def protocol(args):
         sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     json_out(doc)
 
-def hindsight_retain(args):
-    """Guarded retain of facts/decisions into the Hindsight bank.
+def _memory_insert(db, *, text: str, kind: str, project: str, source: str,
+                   tags: list, task_id: str, created_at: str) -> tuple:
+    """Insert one memory idempotently; returns (memory_id, created).
+
+    Content-addressed and guarded by the (project, content_hash) unique index,
+    so retaining the same fact twice is a no-op rather than a duplicate. The
+    caller is responsible for having run the secret guard first.
+    """
+    ch = hashlib.sha256(text.encode()).hexdigest()
+    mid = _memory_id(text, project)
+    cur = db.execute(
+        "INSERT OR IGNORE INTO memories(id,text,kind,project,source,tags,task_id,"
+        "content_hash,created_at,superseded_by) VALUES(?,?,?,?,?,?,?,?,?,'')",
+        (mid, text, kind, project, source,
+         json.dumps(sorted(tags), sort_keys=True), task_id, ch, created_at))
+    return mid, cur.rowcount == 1
+
+def memory_retain(args):
+    """Retain one fact/decision into local semantic memory.
 
     Write path behind the same secret guard as notes: credential-shaped
-    content is refused unless --redact or --allow-secret. Appends one JSONL
-    line to bank.jsonl (creating the bank directory only when explicitly
-    asked via --create); refuses when no bank is configured so a typo'd
-    environment never forks an accidental new memory store. The append is
-    audited in the Autopilot ledger with the memory id.
+    content is refused unless --redact or --allow-secret. Unlike the former
+    Hindsight retain -- which appended to a JSONL file outside the
+    transaction, so a failed audit left an orphan line on disk -- the row and
+    its audit event commit together or not at all.
     """
     text = (args.text or "").strip()
     if not text:
         raise SystemExit("--text is required")
+    kind = (args.kind or "memory").strip() or "memory"
     with conn() as db:
         kinds, guarded = _secret_guard(
             {"content": text}, getattr(args, "redact", False),
-            getattr(args, "allow_secret", False), args.task_id or "hindsight")
-        t = now()
-        bank = _hindsight_bank_path()
-        if not _hindsight_available():
-            if not args.create:
-                raise SystemExit(
-                    f"no Hindsight bank configured at {bank}; "
-                    "pass --create to initialize one")
-            bank.parent.mkdir(parents=True, exist_ok=True)
-        mid = "hs-" + hashlib.sha256(
-            f"{t}|{guarded['content']}".encode()).hexdigest()[:16]
-        mem = {"id": mid, "text": guarded["content"], "kind": args.kind,
-               "project": args.project or "", "created_at": t,
-               "tags": [x for x in (args.tag or []) if x],
-               **({"secret_kinds": kinds} if kinds else {})}
-        with bank.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(mem, sort_keys=True) + "\n")
-        audit(db, "task", args.task_id or "", "hindsight_retained",
-              {"memory_id": mid, "kind": args.kind,
-               "project": mem["project"],
+            getattr(args, "allow_secret", False), args.task_id or "memory")
+        if args.task_id:
+            task_row(db, args.task_id)   # provenance must point at a real task
+        mid, created = _memory_insert(
+            db, text=guarded["content"], kind=kind, project=args.project or "",
+            source=args.source or "agent", tags=[x for x in (args.tag or []) if x],
+            task_id=args.task_id or "", created_at=now())
+        audit(db, "task", args.task_id or "", "memory_retained",
+              {"memory_id": mid, "kind": kind, "project": args.project or "",
+               "created": created,
                **({"secret_kinds": kinds} if kinds else {})})
-        json_out({"ok": True, "memory_id": mid, "bank": str(bank),
+        json_out({"ok": True, "memory_id": mid, "created": created,
+                  "engine": MEMORY_ENGINE_TAG,
                   **({"secret_kinds": kinds} if kinds else {})})
+
+def memory_forget(args):
+    """Retract a memory: it stops being a recall candidate, evidence survives.
+
+    Deletion is deliberately not offered -- retraction is recorded, so the
+    audit chain still explains why a pack that once carried this memory no
+    longer does.
+    """
+    with conn() as db:
+        row = db.execute("SELECT id,superseded_by FROM memories WHERE id=?",
+                         (args.id,)).fetchone()
+        if not row:
+            raise SystemExit(f"no such memory: {args.id}")
+        by = (args.superseded_by or "retracted").strip() or "retracted"
+        if by != "retracted" and not db.execute(
+                "SELECT 1 FROM memories WHERE id=?", (by,)).fetchone():
+            raise SystemExit(f"no such superseding memory: {by}")
+        if row["superseded_by"]:
+            json_out({"ok": True, "memory_id": args.id, "already": True,
+                      "superseded_by": row["superseded_by"]})
+            return
+        db.execute("UPDATE memories SET superseded_by=? WHERE id=? AND superseded_by=''",
+                   (by, args.id))
+        audit(db, "task", "", "memory_forgotten",
+              {"memory_id": args.id, "superseded_by": by})
+        json_out({"ok": True, "memory_id": args.id, "superseded_by": by})
+
+def memory_list(args):
+    """Read-only listing of retained memories (the store's inspection surface).
+
+    Without this the memory store would be opaque to everything except a pack
+    -- the same blind spot that let the old bank drift unnoticed.
+    """
+    with conn() as db:
+        where, vals = ["1=1"], []
+        if not getattr(args, "all", False):
+            where.append("superseded_by=''")
+        if args.project:
+            where.append("project=?")
+            vals.append(args.project)
+        # Enumeration filters, not search. A writer agent asking "what did I
+        # ship last week" wants every commit in a date range, in order --
+        # ranking it by relevance would silently drop the boring commits,
+        # which is exactly how a build log ends up factually incomplete.
+        if getattr(args, "kind", ""):
+            where.append("kind=?")
+            vals.append(args.kind)
+        if getattr(args, "since", ""):
+            where.append("created_at>=?")
+            vals.append(_normalize_iso(args.since, "--since"))
+        toks = _search_tokens(args.query or "", fold_case=True, min_len=2,
+                              drop_stopwords=True)
+        if toks:
+            where.append("(" + " OR ".join("text LIKE ?" for _ in toks) + ")")
+            vals.extend("%" + t + "%" for t in toks)
+        vals.append(max(1, int(args.limit)))
+        rows = db.execute(
+            "SELECT id,text,kind,project,source,tags,task_id,created_at,superseded_by "
+            "FROM memories WHERE " + " AND ".join(where)
+            + " ORDER BY created_at DESC, id ASC LIMIT ?", vals).fetchall()
+        json_out([{"id": r["id"], "kind": r["kind"], "project": r["project"],
+                   "source": r["source"], "task_id": r["task_id"],
+                   "at": r["created_at"], "tags": _memory_tags(r["tags"]),
+                   "superseded_by": r["superseded_by"],
+                   "content": _memory_snippet(r["text"])} for r in rows])
+
+def memory_import(args):
+    """One-shot import of a legacy Hindsight bank.jsonl into local memory.
+
+    The migration path off the retired file-backed engine. The source file is
+    opened read-only and never mutated; malformed lines are counted and
+    skipped rather than failing the import (a torn line was always possible in
+    the append-only bank format); `created_at` is preserved so imported
+    memories keep their place in temporal order. Content-addressing makes a
+    re-run a no-op, so an interrupted import is simply re-run.
+
+    Dry-run by default -- pass --apply to write.
+    """
+    src = Path(args.source_path).expanduser()
+    if not src.is_file():
+        raise SystemExit(f"no such bank file: {src}")
+    parsed, malformed = [], 0
+    with src.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                m = json.loads(line)
+            except ValueError:
+                malformed += 1
+                continue
+            if not isinstance(m, dict) or not str(m.get("text") or "").strip():
+                malformed += 1
+                continue
+            parsed.append(m)
+    findings = sorted({f["kind"] for m in parsed
+                       for f in _secret_findings(str(m.get("text") or ""))})
+    redact = bool(getattr(args, "redact", False))
+    allow = bool(getattr(args, "allow_secret", False))
+    if findings and not (redact or allow):
+        raise SystemExit(
+            f"refusing to import credential-shaped memories ({', '.join(findings)}); "
+            "re-run with --redact or --allow-secret")
+    project_override = args.project or ""
+    prepared, undated = [], 0
+    t_now = now()
+    for m in parsed:
+        text = str(m.get("text") or "").strip()
+        if redact:
+            text = _redact_secrets(text)
+        # A garbage timestamp degrades to import time and is counted, exactly
+        # like a torn line: one bad field in a legacy bank must not abort the
+        # migration of every other memory in it.
+        try:
+            created = _normalize_iso(str(m.get("created_at") or ""), "created-at")
+        except SystemExit:
+            created = ""
+        if not created:
+            undated += 1
+            created = t_now
+        prepared.append({
+            "text": text,
+            "kind": str(m.get("kind") or "memory"),
+            "project": project_override or str(m.get("project") or ""),
+            "tags": [str(t) for t in (m.get("tags") or []) if str(t)],
+            "created_at": created,
+        })
+    if not getattr(args, "apply", False):
+        json_out({"ok": True, "dry_run": True, "source": str(src),
+                  "parsed": len(prepared), "malformed_lines": malformed,
+                  "undated": undated, "secret_kinds": findings,
+                  "note": "pass --apply to import"})
+        return
+    imported = skipped = 0
+    with conn() as db:
+        for m in prepared:
+            _, created = _memory_insert(
+                db, text=m["text"], kind=m["kind"], project=m["project"],
+                source="hindsight-bank-import", tags=m["tags"], task_id="",
+                created_at=m["created_at"])
+            if created:
+                imported += 1
+            else:
+                skipped += 1
+        audit(db, "task", "", "memory_imported",
+              {"source": str(src), "imported": imported,
+               "already_present": skipped, "malformed_lines": malformed,
+               "undated": undated, "secret_kinds": findings, "redacted": redact})
+    json_out({"ok": True, "dry_run": False, "source": str(src),
+              "imported": imported, "already_present": skipped,
+              "malformed_lines": malformed, "undated": undated,
+              "secret_kinds": findings, "engine": MEMORY_ENGINE_TAG})
+
+def _git(repo: Path, *args, timeout: int = 60):
+    """Run one read-only git command. Returns stdout, or None if git is unusable.
+
+    Never a write, never a fetch: this reads history that is already on disk,
+    so an ingest cannot alter the repository it is describing and cannot block
+    on the network in the middle of a cron tick.
+    """
+    try:
+        proc = subprocess.run(["git", "-C", str(repo), *args],
+                              text=True, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+# Commit subjects in this repository run to 2,170 characters. A memory is
+# something an agent reads *many* of to answer one question, so an unbounded
+# commit body would let a single verbose commit crowd out a week of real work.
+GIT_TEXT_LIMIT = 240
+
+def _git_commit_memories(repo: Path, since: str, limit: int) -> list:
+    """Commits on the current branch as bounded, self-describing memories.
+
+    The commit hash is inside the text on purpose. Memories are addressed by
+    the hash of their content, so embedding an identifier that is stable and
+    unique per commit makes re-ingesting permanently idempotent -- the same
+    commit produces the same memory id forever, and the existing uniqueness
+    constraint absorbs it with no bookkeeping of "where did I get to last
+    time". That is why this needs no cursor, no state file, and no lock.
+    """
+    sep, rec = "\x1f", "\x1e"
+    fmt = f"{rec}%H{sep}%h{sep}%aI{sep}%an{sep}%s"
+    out = _git(repo, "log", f"--format={fmt}", "--shortstat",
+               f"--since={since}", f"--max-count={max(1, limit)}", "--no-merges")
+    if out is None:
+        return []
+    memories = []
+    for chunk in out.split(rec):
+        if not chunk.strip():
+            continue
+        head, _, tail = chunk.partition("\n")
+        parts = head.split(sep)
+        if len(parts) < 5:
+            continue
+        full, short, when, author, subject = parts[:5]
+        subject = " ".join(subject.split())
+        if len(subject) > GIT_TEXT_LIMIT:
+            subject = subject[:GIT_TEXT_LIMIT - 1].rstrip() + "\u2026"
+        stat = ""
+        m = re.search(r"(\d+) files? changed(?:, (\d+) insertions?\(\+\))?"
+                      r"(?:, (\d+) deletions?\(-\))?", tail)
+        if m:
+            stat = (f" [{m.group(1)} files +{m.group(2) or 0}"
+                    f"/-{m.group(3) or 0}]")
+        try:
+            created = _normalize_iso(when, "commit-date")
+        except SystemExit:
+            continue
+        memories.append({
+            "text": f"Commit {short} on {created[:10]} by {author}: {subject}{stat}",
+            "kind": "commit", "created_at": created,
+            "tags": ["git", "commit"], "ref": full})
+    return memories
+
+def _git_since_epoch(repo: Path, since: str):
+    """Resolve a git-style date expression ("30 days ago") to a unix epoch.
+
+    Delegated to git rather than reimplemented: `--since` accepts a whole
+    grammar of relative and absolute forms, and a second parser here would
+    inevitably disagree with the one bounding the commit query -- so commits
+    and pull requests would silently cover different windows.
+    """
+    out = _git(repo, "rev-parse", f"--since={since}")
+    m = re.search(r"--max-age=(\d+)", out or "")
+    return int(m.group(1)) if m else None
+
+def _git_pr_memories(repo: Path, since: str, limit: int) -> tuple:
+    """Merged pull requests via the `gh` CLI, or ([], reason) when unavailable.
+
+    Optional by design and reported as a note rather than a failure: a repo
+    with no GitHub remote, no `gh`, or no auth must still ingest its commits.
+
+    `--since` is enforced here as well as on commits. `gh pr list` has no date
+    bound of its own, so without this one repository's entire merged history
+    lands in the store in a single pass -- 213 pull requests from one project,
+    against 285 commits from five -- and the volume alone would bias every
+    later recall toward whichever repo happened to use PRs most.
+    """
+    if not _git(repo, "remote"):
+        return [], "no git remote"
+    cutoff = _git_since_epoch(repo, since)
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "list", "--state", "merged", "--limit", str(max(1, limit)),
+             "--json", "number,title,mergedAt,author,url"],
+            cwd=str(repo), text=True, capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [], f"gh unavailable: {type(exc).__name__}"
+    if proc.returncode != 0:
+        return [], (proc.stderr or "gh failed").strip().splitlines()[0][:200]
+    try:
+        rows = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return [], "gh returned unparseable JSON"
+    memories, dropped = [], 0
+    for r in rows:
+        title = " ".join(str(r.get("title") or "").split())
+        if len(title) > GIT_TEXT_LIMIT:
+            title = title[:GIT_TEXT_LIMIT - 1].rstrip() + "\u2026"
+        try:
+            created = _normalize_iso(str(r.get("mergedAt") or ""), "merged-at")
+        except SystemExit:
+            continue
+        if cutoff is not None:
+            try:
+                if datetime.fromisoformat(created).timestamp() < cutoff:
+                    dropped += 1
+                    continue
+            except ValueError:
+                pass
+        who = (r.get("author") or {}).get("login") or "unknown"
+        num = r.get("number")
+        memories.append({
+            "text": f"PR #{num} merged on {created[:10]} by {who}: {title} "
+                    f"({r.get('url') or ''})".strip(),
+            "kind": "pull_request", "created_at": created,
+            "tags": ["git", "pull-request"], "ref": str(num)})
+    # Reported, never silent: a caller must be able to tell "no PRs in this
+    # window" apart from "the window quietly discarded most of them".
+    return memories, (f"{dropped} merged PRs older than --since were skipped"
+                      if dropped else "")
+
+def memory_ingest_git(args):
+    """Record commits and merged PRs as memories, so sessions can see the work.
+
+    The gap this closes: an agent asked to write about "what I shipped this
+    week" had no source for it. Autopilot knew about tasks, and the audit
+    chain knew about completions, but the actual commits and pull requests
+    lived only in git -- invisible to anything reading memory.
+
+    Deliberately a pull, not a hook. A post-commit hook would put a write to
+    the audit chain on the critical path of every `git commit`, so a locked
+    database or a slow disk would start failing commits; and it would only
+    ever see commits made on this machine, after installation. Reading history
+    that already exists has neither problem, and it backfills.
+
+    Bounded on purpose. `--since` and `--limit` both apply, and text is capped,
+    because memory is read in bulk: one repository with a decade of history
+    must not be able to drown every other thing the store knows.
+
+    Dry-run by default -- pass --apply to write.
+    """
+    repo = Path(getattr(args, "repo", "") or ".").expanduser().resolve()
+    if _git(repo, "rev-parse", "--git-dir") is None:
+        raise SystemExit(f"not a git repository (or git unavailable): {repo}")
+    project = args.project or repo.name
+    limit = max(1, int(args.limit))
+    items = _git_commit_memories(repo, args.since, limit)
+    pr_note = ""
+    if getattr(args, "prs", False):
+        prs, pr_note = _git_pr_memories(repo, args.since, limit)
+        items.extend(prs)
+
+    findings = sorted({f["kind"] for it in items
+                       for f in _secret_findings(it["text"])})
+    redact = bool(getattr(args, "redact", False))
+    allow = bool(getattr(args, "allow_secret", False))
+    if findings and not (redact or allow):
+        # Commit messages are written by hand and do leak keys; the same guard
+        # that protects notes protects this path.
+        raise SystemExit(
+            f"refusing to ingest credential-shaped content ({', '.join(findings)}); "
+            "re-run with --redact or --allow-secret")
+    if redact:
+        for it in items:
+            it["text"] = _redact_secrets(it["text"])
+
+    counts = {"commit": sum(1 for i in items if i["kind"] == "commit"),
+              "pull_request": sum(1 for i in items if i["kind"] == "pull_request")}
+    if not getattr(args, "apply", False):
+        json_out({"ok": True, "dry_run": True, "repo": str(repo),
+                  "project": project, "since": args.since,
+                  "found": len(items), "by_kind": counts,
+                  "secret_kinds": findings,
+                  **({"note": pr_note} if pr_note else {}),
+                  "sample": [i["text"] for i in items[:3]],
+                  "hint": "pass --apply to ingest"})
+        return
+    ingested = already = 0
+    with conn() as db:
+        for it in items:
+            _, created = _memory_insert(
+                db, text=it["text"], kind=it["kind"], project=project,
+                source="git-ingest", tags=it["tags"], task_id="",
+                created_at=it["created_at"])
+            ingested += 1 if created else 0
+            already += 0 if created else 1
+        audit(db, "system", "memory", "memory_git_ingested",
+              {"repo": str(repo), "project": project, "since": args.since,
+               "ingested": ingested, "already_present": already,
+               "by_kind": counts,
+               **({"secret_kinds": findings} if findings else {})})
+    json_out({"ok": True, "dry_run": False, "repo": str(repo),
+              "project": project, "ingested": ingested,
+              "already_present": already, "by_kind": counts,
+              "secret_kinds": findings,
+              **({"note": pr_note} if pr_note else {}),
+              "engine": MEMORY_ENGINE_TAG})
+
+def _memory_embed_backlog(db) -> list:
+    """Live memories with no vector under the current model, oldest first.
+
+    Oldest-first matters for a bounded run: a `--limit`ed pass must make
+    monotonic progress through the backlog rather than re-chewing whichever
+    rows happen to sort first.
+    """
+    return db.execute(
+        "SELECT m.id, m.text, m.content_hash FROM memories m "
+        "LEFT JOIN memory_vectors v ON v.memory_id = m.id AND v.model = ? "
+        "WHERE m.superseded_by = '' AND v.memory_id IS NULL "
+        "ORDER BY m.created_at ASC, m.id ASC", (EMBED_MODEL,)).fetchall()
+
+def memory_embed(args):
+    """Compute embeddings for memories that do not have one yet.
+
+    Dry-run first, like every other write surface here: without --apply it
+    reports the backlog and the worker's availability and touches nothing.
+
+    Vectors are derived data, so this is safe to interrupt and safe to re-run:
+    the backlog query is the state, each batch commits with its own audit
+    event, and a crash halfway simply leaves a smaller backlog. Nothing is
+    ever recomputed for a row that already has a vector under this model.
+    """
+    limit = max(0, int(getattr(args, "limit", 0) or 0))
+    with conn() as db:
+        backlog = _memory_embed_backlog(db)
+        total_backlog = len(backlog)
+        if limit:
+            backlog = backlog[:limit]
+        if not getattr(args, "apply", False):
+            probe = _embed_probe()
+            json_out({"ok": True, "dry_run": True, "model": EMBED_MODEL,
+                      "backlog": total_backlog, "would_embed": len(backlog),
+                      "embedder": probe,
+                      "note": None if probe["available"] else
+                              "semantic search unavailable; FTS recall is unaffected"})
+            return
+        if not backlog:
+            json_out({"ok": True, "dry_run": False, "model": EMBED_MODEL,
+                      "backlog": 0, "embedded": 0})
+            return
+        try:
+            blobs = _embed_texts([r["text"] for r in backlog])
+        except EmbedUnavailable as exc:
+            # Unavailable is a note, not a failure: the caller (a cron tick)
+            # must not go red because an optional model is missing.
+            json_out({"ok": True, "dry_run": False, "model": EMBED_MODEL,
+                      "backlog": total_backlog, "embedded": 0,
+                      "embedder": {"available": False, "reason": exc.reason,
+                                   "detail": exc.detail},
+                      "note": "embedding worker unavailable; nothing written"})
+            return
+        stamp = now()
+        db.execute("BEGIN IMMEDIATE")
+        for row, blob in zip(backlog, blobs):
+            db.execute(
+                "INSERT OR REPLACE INTO memory_vectors"
+                "(memory_id,model,dim,content_hash,vec,created_at) VALUES(?,?,?,?,?,?)",
+                (row["id"], EMBED_MODEL, len(blob) // 4, row["content_hash"],
+                 blob, stamp))
+        # One event per run, not per row: the chain records that derived data
+        # was regenerated, which is all an auditor needs -- the vectors
+        # themselves are reproducible from the memories they came from.
+        audit(db, "system", "memory", "memory_embedded",
+              {"model": EMBED_MODEL, "count": len(backlog),
+               "backlog_remaining": total_backlog - len(backlog)})
+        json_out({"ok": True, "dry_run": False, "model": EMBED_MODEL,
+                  "embedded": len(backlog),
+                  "backlog_remaining": total_backlog - len(backlog)})
+
+def memory_search(args):
+    """Semantic search over retained memories (optional; read-only).
+
+    Deliberately a separate command from `recall`. `recall` is on the pack
+    path, must stay deterministic and sub-100ms, and therefore stays FTS5;
+    this loads a model and is for callers already inside a long session.
+
+    Scope is enforced rather than attempted: --project matching nothing
+    returns nothing. Relaxing an empty project filter to an unscoped result is
+    exactly how the retired engine leaked another project's context.
+    """
+    query = (args.query or "").strip()
+    if not query:
+        raise SystemExit("--query is required")
+    ensure()
+    try:
+        out = _embed_call({"mode": "search", "db": str(DB), "query": query,
+                           "limit": max(1, int(args.limit)),
+                           "project": args.project or None,
+                           "min_score": float(args.min_score),
+                           "include_superseded": bool(getattr(args, "all", False))})
+    except EmbedUnavailable as exc:
+        json_out({"ok": True, "available": False, "reason": exc.reason,
+                  "detail": exc.detail, "hits": [],
+                  "note": "semantic search unavailable; "
+                          "`memory-list --query` offers keyword search instead"})
+        return
+    hits = out.get("hits") or []
+    with conn() as db:
+        rows = {}
+        for h in hits:
+            r = db.execute(
+                "SELECT id,text,kind,project,source,tags,task_id,created_at,"
+                "superseded_by FROM memories WHERE id=?", (h["memory_id"],)).fetchone()
+            if r:
+                rows[h["memory_id"]] = r
+    json_out({"ok": True, "available": True, "model": EMBED_MODEL,
+              "query": query, "searched": out.get("searched", 0),
+              "hits": [{"id": h["memory_id"], "score": h["score"],
+                        "kind": rows[h["memory_id"]]["kind"],
+                        "project": rows[h["memory_id"]]["project"],
+                        "source": rows[h["memory_id"]]["source"],
+                        "task_id": rows[h["memory_id"]]["task_id"],
+                        "at": rows[h["memory_id"]]["created_at"],
+                        "tags": _memory_tags(rows[h["memory_id"]]["tags"]),
+                        "content": _memory_snippet(rows[h["memory_id"]]["text"])}
+                       for h in hits if h["memory_id"] in rows]})
+
+def memory_status(args):
+    """Coverage and health of the memory store, including the optional layer.
+
+    Doubles as the monitor surface for the consolidation cron: --digest emits
+    one stable line whose bytes change only when the store meaningfully
+    changes, so an unchanged store suppresses the agent run entirely and costs
+    zero model calls.
+    """
+    with conn() as db:
+        live = db.execute("SELECT COUNT(*) FROM memories WHERE superseded_by=''").fetchone()[0]
+        retracted = db.execute("SELECT COUNT(*) FROM memories WHERE superseded_by<>''").fetchone()[0]
+        vectors = db.execute("SELECT COUNT(*) FROM memory_vectors WHERE model=?",
+                             (EMBED_MODEL,)).fetchone()[0]
+        backlog = len(_memory_embed_backlog(db))
+        newest = db.execute(
+            "SELECT created_at FROM memories WHERE superseded_by='' "
+            "ORDER BY created_at DESC, id ASC LIMIT 1").fetchone()
+        projects = [{"project": r[0], "memories": r[1]} for r in db.execute(
+            "SELECT project, COUNT(*) FROM memories WHERE superseded_by='' "
+            "GROUP BY project ORDER BY 2 DESC, 1 ASC")]
+    if getattr(args, "digest", False):
+        # Exact-bytes monitor line: the cron compares these bytes and skips the
+        # agent run entirely when they are unchanged, so an idle store costs
+        # zero model calls.
+        #
+        # It carries only *content* state. Vector counts and embedding backlog
+        # are deliberately excluded even though they are printed in the JSON
+        # below: they are derived data that the session itself changes, so
+        # including them would make every run's own side effects wake the next
+        # run -- a gate that re-triggers on its own output is not a gate. It
+        # also carries no score or probe result, since those drift on their own.
+        #
+        # Retraction is included, so a consolidation that merges three
+        # memories into one moves the line, the next tick opens once, finds
+        # nothing left to merge, and the gate closes again.
+        print(f"memories={live} retracted={retracted} "
+              f"newest={newest[0] if newest else '-'}")
+        return
+    json_out({"ok": True, "engine": MEMORY_ENGINE_TAG,
+              "memories": live, "retracted": retracted,
+              "newest": newest[0] if newest else None,
+              "projects": projects,
+              "semantic": {"model": EMBED_MODEL, "vectors": vectors,
+                           "backlog": backlog,
+                           "coverage": round(vectors / live, 4) if live else 0.0,
+                           **_embed_probe()}})
+
+def memory_consolidate_brief(args):
+    """Emit the work item for a consolidation session; writes nothing.
+
+    This is the deterministic half of consolidation, and keeping the two
+    halves apart is the whole design. Finding which memories are plausibly the
+    same fact is arithmetic -- cosine over stored vectors -- and doing it here
+    means the partner model never has to read the store to discover
+    redundancy. It receives candidate groups and spends its tokens on the only
+    part that needs judgement: whether two similar-looking facts are one fact,
+    and what the merged wording should be.
+
+    The retired engine got this backwards. It ran an always-on private worker
+    that called a model on ingest, continuously, and in five days logged three
+    retrieval events against hundreds of consolidation calls -- it paid for
+    curation nothing ever read, and paid for it at a cadence that produced
+    1,638 service restarts and 212 billing failures. Here the model is called
+    only when this brief is non-empty, from a session that is gated on the
+    store having actually changed.
+
+    Writes go back through `memory-retain` and `memory-forget`, never by
+    editing rows: a merge must land in the audit chain as a retain plus a
+    retraction that names its successor, so a pack that once cited the old
+    memory can still explain what replaced it.
+    """
+    ensure()
+    try:
+        excluded = ([] if getattr(args, "include_git", False)
+                    else list(CONSOLIDATE_UNMERGEABLE_KINDS))
+        out = _embed_call({"mode": "cluster", "db": str(DB),
+                           "threshold": float(args.threshold),
+                           "project": args.project or None,
+                           "exclude_kinds": excluded,
+                           "max_clusters": max(1, int(args.max_clusters))})
+    except EmbedUnavailable as exc:
+        json_out({"ok": True, "available": False, "reason": exc.reason,
+                  "detail": exc.detail, "clusters": [],
+                  "note": "consolidation needs the embedding layer; "
+                          "run `memory-embed --apply` on a machine that has it"})
+        return
+    clusters = out.get("clusters") or []
+    with conn() as db:
+        rendered = []
+        for group in clusters:
+            members = []
+            for mid in group:
+                r = db.execute(
+                    "SELECT id,text,kind,project,source,tags,task_id,created_at "
+                    "FROM memories WHERE id=?", (mid,)).fetchone()
+                if r:
+                    members.append({"id": r["id"], "kind": r["kind"],
+                                    "project": r["project"], "source": r["source"],
+                                    "task_id": r["task_id"], "at": r["created_at"],
+                                    "tags": _memory_tags(r["tags"]),
+                                    "text": r["text"]})
+            if len(members) > 1:
+                # Oldest first so the model reads a group as a history: the
+                # later entries are usually the refinement of the earlier.
+                members.sort(key=lambda m: (m["at"], m["id"]))
+                rendered.append({"size": len(members), "members": members})
+    json_out({"ok": True, "available": True, "model": EMBED_MODEL,
+              "threshold": float(args.threshold),
+              "project": args.project or None,
+              "excluded_kinds": excluded,
+              "scored": out.get("scored", 0),
+              "cluster_total": out.get("cluster_total", 0),
+              "clusters": rendered,
+              "write_back": {
+                  "merge": "autopilot.py memory-retain --text '<merged fact>' "
+                           "--project <project> --kind <kind> --source consolidation",
+                  "retract": "autopilot.py memory-forget <old-id> "
+                             "--superseded-by <new-id>",
+                  "rule": "never retract a memory without naming its successor; "
+                          "evidence and packs must stay explainable"}})
 
 def heartbeat(args):
     with conn() as db:
@@ -4672,19 +5541,27 @@ def main():
     p=sub.add_parser("metrics"); p.set_defaults(fn=metrics)
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
     p=sub.add_parser("protocol"); p.set_defaults(fn=protocol)
-    p=sub.add_parser("hindsight-retain"); p.add_argument("--text",required=True); p.add_argument("--kind",default="decision"); p.add_argument("--project",default=""); p.add_argument("--tag",action="append",default=[]); p.add_argument("--task-id",dest="task_id",default=""); p.add_argument("--redact",action="store_true"); p.add_argument("--allow-secret",action="store_true"); p.add_argument("--create",action="store_true"); p.set_defaults(fn=hindsight_retain)
+    p=sub.add_parser("memory-retain",help="retain one fact/decision into local semantic memory"); p.add_argument("--text",required=True); p.add_argument("--kind",default="decision"); p.add_argument("--project",default=""); p.add_argument("--source",default="agent"); p.add_argument("--tag",action="append",default=[]); p.add_argument("--task-id",dest="task_id",default=""); p.add_argument("--redact",action="store_true"); p.add_argument("--allow-secret",dest="allow_secret",action="store_true"); p.set_defaults(fn=memory_retain)
+    p=sub.add_parser("memory-forget",help="retract a memory from recall (evidence survives)"); p.add_argument("id"); p.add_argument("--superseded-by",dest="superseded_by",default=""); p.set_defaults(fn=memory_forget)
+    p=sub.add_parser("memory-list",help="read-only listing of retained memories"); p.add_argument("--project",default=""); p.add_argument("--query",default=""); p.add_argument("--limit",type=int,default=20); p.add_argument("--kind",default="",help="filter by kind, e.g. commit / pull_request / decision"); p.add_argument("--since",default="",help="ISO date/time lower bound on created_at"); p.add_argument("--all",action="store_true",help="include retracted memories"); p.set_defaults(fn=memory_list)
+    p=sub.add_parser("memory-import",help="one-shot import of a legacy Hindsight bank.jsonl"); p.add_argument("source_path",metavar="BANK_JSONL"); p.add_argument("--project",default="",help="override the project on every imported memory"); p.add_argument("--apply",action="store_true"); p.add_argument("--redact",action="store_true"); p.add_argument("--allow-secret",dest="allow_secret",action="store_true"); p.set_defaults(fn=memory_import)
+    p=sub.add_parser("memory-embed",help="compute embeddings for memories lacking one (optional layer)"); p.add_argument("--limit",type=int,default=0,help="bound one run; 0 = whole backlog"); p.add_argument("--apply",action="store_true"); p.set_defaults(fn=memory_embed)
+    p=sub.add_parser("memory-search",help="semantic search over memories (optional; off the pack path)"); p.add_argument("--query",required=True); p.add_argument("--project",default=""); p.add_argument("--limit",type=int,default=10); p.add_argument("--min-score",dest="min_score",type=float,default=0.3); p.add_argument("--all",action="store_true",help="include retracted memories"); p.set_defaults(fn=memory_search)
+    p=sub.add_parser("memory-status",help="memory store coverage/health; --digest is the cron monitor line"); p.add_argument("--digest",action="store_true"); p.set_defaults(fn=memory_status)
+    p=sub.add_parser("memory-consolidate-brief",help="candidate near-duplicate clusters for a consolidation session (read-only)"); p.add_argument("--project",default=""); p.add_argument("--threshold",type=float,default=0.85); p.add_argument("--max-clusters",dest="max_clusters",type=int,default=25); p.add_argument("--include-git",dest="include_git",action="store_true",help="also cluster commit/PR memories (default: excluded -- they are events, not restatements)"); p.set_defaults(fn=memory_consolidate_brief)
+    p=sub.add_parser("memory-ingest-git",help="record commits and merged PRs as memories (read-only pull)"); p.add_argument("--repo",default="."); p.add_argument("--project",default="",help="defaults to the repo directory name"); p.add_argument("--since",default="30 days ago"); p.add_argument("--limit",type=int,default=500); p.add_argument("--prs",action="store_true",help="also ingest merged pull requests via the gh CLI"); p.add_argument("--apply",action="store_true"); p.add_argument("--redact",action="store_true"); p.add_argument("--allow-secret",dest="allow_secret",action="store_true"); p.set_defaults(fn=memory_ingest_git)
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
     p=sub.add_parser("tag"); p.add_argument("id"); p.add_argument("--tag",action="append",required=True,help="capability/scope tag (repeatable)"); p.set_defaults(fn=tag_task)
     p=sub.add_parser("untag"); p.add_argument("id"); p.add_argument("--tag",required=True); p.set_defaults(fn=untag_task)
     p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
-    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N Hindsight semantic memories matching this task (no-op when no bank is configured)"); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); p.add_argument("--prefer-unblocking",dest="prefer_unblocking",action="store_true",help="tie-break equal-priority candidates by queued dependents freed (critical-path scheduling)"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N locally-retained semantic memories matching this task"); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); p.add_argument("--prefer-unblocking",dest="prefer_unblocking",action="store_true",help="tie-break equal-priority candidates by queued dependents freed (critical-path scheduling)"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.add_argument("--tag",default=""); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=supersede_note)
-    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N Hindsight semantic memories matching this task (no-op when no bank is configured)"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
-    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N Hindsight semantic memories matching this task (no-op when no bank is configured)"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
-    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N Hindsight semantic memories matching this task (no-op when no bank is configured)"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
+    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N locally-retained semantic memories matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
+    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N locally-retained semantic memories matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
+    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N locally-retained semantic memories matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
     p=sub.add_parser("recall-diff"); p.add_argument("task_id"); p.add_argument("--digest",required=True); _add_rerank_flags(p); p.set_defaults(fn=recall_diff)
     p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--include-expired",dest="include_expired",action="store_true"); _add_rerank_flags(p); p.set_defaults(fn=search_notes)
     p=sub.add_parser("search-handoffs"); p.add_argument("query"); p.add_argument("--task",default=""); p.add_argument("--from-agent",dest="from_agent",default=""); p.add_argument("--to-agent",dest="to_agent",default=""); p.add_argument("--project",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=search_handoffs)
@@ -4706,7 +5583,7 @@ def main():
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)
     p=sub.add_parser("renew"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=renew)
     p=sub.add_parser("transfer"); p.add_argument("id"); p.add_argument("--from-owner",required=True,dest="from_owner"); p.add_argument("--to-owner",required=True,dest="to_owner"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=transfer)
-    p=sub.add_parser("resume"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N Hindsight semantic memories matching this task (no-op when no bank is configured)"); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=resume)
+    p=sub.add_parser("resume"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N locally-retained semantic memories matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=resume)
     p=sub.add_parser("leases"); p.add_argument("--owner"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=leases)
     args=ap.parse_args(); args.fn(args)
 
