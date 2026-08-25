@@ -12,6 +12,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 
+class _ClosingConn:
+    """Drop-in for ``with _ClosingConn(...)`` that also CLOSES on exit.
+    A raw connection used as a context manager only commits/rolls back the
+    transaction — it never closes, so on Windows the open handle makes
+    TemporaryDirectory cleanup fail with WinError 32."""
+    def __init__(self, *a, **k):
+        import sqlite3
+        self._c = sqlite3.connect(*a, **k)
+    def __enter__(self):
+        return self._c
+    def __exit__(self, et, ev, tb):
+        try:
+            (self._c.commit() if et is None else self._c.rollback())
+        finally:
+            self._c.close()
+        return False
+
+
 CASES = []
 def case(name):
     def deco(fn):
@@ -102,7 +120,7 @@ def _case_core_lifecycle_and_recall():
         assert len(rec['sha256']) == 64 and (Path(td) / 'receipts' / (rec['receipt_id'] + '.json')).stat().st_mode & 0o077 == 0
         rows = run('list'); assert rows[0]['last_receipt'] == rec['receipt_id']
         import sqlite3
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             assert db.execute('select count(*) from audit_events').fetchone()[0] >= 4
         # Concurrency: exactly one of N simultaneous claimers wins the lease.
         run('create','--project','Verify','--title','race','--id','race-1')
@@ -352,7 +370,7 @@ def _case_core_lifecycle_and_recall():
         dup_pin = run('note','mem-2','--kind','constraint','--content','MUST NOT exceed 120/min','--source','hermes')
         assert dup_pin['deduplicated'] is True and dup_pin['id'] == pin['id']
         import sqlite3
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             assert db.execute("SELECT pinned FROM notes WHERE id=?", (pin['id'],)).fetchone()[0] == 1
         # Context pack v2: task summary + deps header, pinned-first packing under budget.
         ctx = run('context','mem-2','--budget','200')
@@ -838,7 +856,7 @@ def _case_core_lifecycle_and_recall():
         run('note','rr-old','--kind','fact','--content','rerank probe ancient wisdom','--source','verify')
         run('note','rr-new','--kind','fact','--content','rerank probe fresh insight','--source','verify')
         def sq(*stmts):
-            with sqlite3.connect(Path(td) / 'state.db') as db:
+            with _ClosingConn(Path(td) / 'state.db') as db:
                 for s in stmts: db.execute(s)
         sq("UPDATE notes SET created_at='2026-07-01T00:00:00+00:00' WHERE content LIKE 'rerank probe ancient%'")
         plain = run('context','rr-1','--budget','100000','--related','5')
@@ -1088,7 +1106,7 @@ def _case_handoff_protocol_and_recovery():
         sfile = Path(td) / 'receipts' / (sr['receipt_id'] + '.json')
         sdigest = hashlib.sha256(sfile.read_bytes()).hexdigest()
         assert sr['sha256'] == sdigest, 'printed sha256 must match the sealed file bytes'
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             stored = db.execute("SELECT file_hash FROM receipts WHERE id=?", (sr['receipt_id'],)).fetchone()[0]
         assert stored == sdigest, 'receipt row must carry the file hash'
         # Doctor detects silent receipt corruption or tampering...
@@ -1229,7 +1247,7 @@ def _case_handoff_protocol_and_recovery():
         assert 'invalid --until timestamp' in err
         # Dispatch aging: an old task waiting far beyond the window is dispatched at
         # a virtually promoted priority without mutating stored priority.
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             db.execute("UPDATE tasks SET created_at='2020-01-01T00:00:00+00:00' WHERE id='def-2'")
             db.commit()
         row = next(r for r in run('list') if r['id'] == 'def-2')
@@ -1598,7 +1616,7 @@ def _case_integrity_scheduling_and_policy():
         assert ho['secret_kinds'] == ['bearer_header'], ho
         # Fleet sweep finds secrets already sitting in shared memory (seeded raw,
         # bypassing the write path, as legacy rows would be).
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             db.execute("INSERT INTO notes(id,task_id,kind,content,source,content_hash,created_at,pinned,expires_at)"
                        " VALUES('leak-1','sec-1','fact','slack ' || CAST(x'786f78622d313233343536373839303162636465' AS TEXT),'','legacy','2026-01-01T00:00:00+00:00',0,'')")
         scan = ops('secret-scan')
@@ -1662,7 +1680,7 @@ def _case_integrity_scheduling_and_policy():
         assert doc['ok'] is True and doc['problems'] == [], doc
         # Tail truncation: deleting the pinned head (and everything after it) leaves
         # every remaining link valid — only the checkpoint exposes the loss.
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             db.execute('DELETE FROM audit_events WHERE id>=?', (cp['last_event_id'],))
         vc_plain = run('verify-chain')
         assert vc_plain['ok'] is True, 'the bare chain must stay internally valid under truncation'
@@ -1689,7 +1707,7 @@ def _case_integrity_scheduling_and_policy():
         rec = run('receipt','wo-1','--kind','verification','--payload','{"stage":"pre-export"}')
         run('update','wo-dep','--status','completed')
         run('claim','wo-1','--owner','traveler','--minutes','5')     # active status
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             db.execute("INSERT INTO task_deps(task_id,depends_on,created_at)"
                        " VALUES('wo-1','ghost-task','2026-01-01T00:00:00+00:00')")
         wo_path = Path(td) / 'wo-1.json'
@@ -1900,7 +1918,7 @@ def _case_integrity_scheduling_and_policy():
         # the path once it anchors the deepest branch (completed prereqs leave the
         # graph entirely).
         import sqlite3 as _sq
-        with _sq.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             db.execute("INSERT INTO task_deps(task_id,depends_on,created_at) VALUES('cp-c','cp-g1',datetime('now'))")
             db.execute("INSERT INTO task_deps(task_id,depends_on,created_at) VALUES('cp-g1','cp-g2',datetime('now'))")
             db.commit()
@@ -2014,7 +2032,7 @@ def _case_integrity_scheduling_and_policy():
         assert m['completions_without_receipt'] >= 1, m
         # Cited evidence that later vanishes (deleted rows / partial restore) is observable.
         import sqlite3 as _sq
-        with _sq.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             db.execute('DELETE FROM receipts WHERE id=?', (rec2['receipt_id'],))
         uv = ops('unverified-completions')
         # Losing the receipt makes the completion both unbacked and broken-cited.
@@ -2459,7 +2477,7 @@ def _case_migration_and_onboarding():
         assert dry['ok'] is True and [s['stage'] for s in dry['stages']] == \
             ['preflight', 'init_control_plane', 'select_source', 'import_plan', 'doctor'], dry
         assert ob_rep.stat().st_mode & 0o077 == 0                          # sealed report is 0600
-        with sqlite3.connect(ob_home / 'state.db') as db:                   # init ran...
+        with _ClosingConn(ob_home / 'state.db') as db:                   # init ran...
             assert db.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0   # ...but nothing imported
         err = oops('onboard', '--inventory', str(ob_inv), '--probe', fail=True)
         assert '--probe requires --apply' in err, err                       # probe mutates by design
@@ -2477,7 +2495,7 @@ def _case_migration_and_onboarding():
         # seal convention: created_at outside
         body = {k: v for k, v in rdoc.items() if k not in ('created_at', 'sha256')}
         assert hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest() == rdoc['sha256']
-        with sqlite3.connect(ob_home / 'state.db') as db:
+        with _ClosingConn(ob_home / 'state.db') as db:
             assert db.execute("SELECT status FROM tasks WHERE id='mig-1'").fetchone()[0] == 'completed'
             assert db.execute("SELECT status FROM tasks WHERE id='mig-2'").fetchone()[0] == 'queued'  # lease sanitized
             assert db.execute("SELECT status FROM tasks WHERE id='onboard-probe'").fetchone()[0] == 'completed'
@@ -2696,7 +2714,7 @@ def _case_hardening_regression_race_guards():
         ap = ops2('approval', 'approve', 'ap-1', '--by', 'leo', '--reason', 'ship it')
         ap_file = Path(td) / 'clean-home' / 'receipts' / (ap['receipt_id'] + '.json')
         assert ap_file.exists(), ap
-        with sqlite3.connect(Path(td) / 'clean-home' / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'clean-home' / 'state.db') as db:
             fh = db.execute('SELECT file_hash FROM receipts WHERE id=?', (ap['receipt_id'],)).fetchone()[0]
         assert fh and hashlib.sha256(ap_file.read_bytes()).hexdigest() == fh, (fh, ap_file)
         doc = ops2('doctor')
@@ -2903,7 +2921,7 @@ def _case_session_ingest_and_retention():
         # Dry-run ingest touches nothing.
         plan = run('session-ingest', '--source', 'claude-code', '--root', str(sess_root), '--project', 'Auth')
         assert plan['dry_run'] is True and 'applied_files' not in plan
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             assert db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0] == 0
         # Fail closed on credential-shaped content.
         err = run_fail('session-ingest', '--source', 'claude-code', '--root', str(sess_root), '--apply')
@@ -2913,7 +2931,7 @@ def _case_session_ingest_and_retention():
         assert ing['dry_run'] is False and ing['applied_files'] == 2, ing
         assert ing['totals']['unsupported'] == 1 and ing['totals']['duplicates_collapsed'] == 1
         assert ing['totals']['malformed_lines'] == 3 and ing['totals']['tool_results_skipped'] == 3
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             db.row_factory = sqlite3.Row
             vals = [r[0] for r in db.execute("SELECT content FROM session_messages")]
             assert not any('sk-live' in v or 'API_KEY' in v for v in vals), 'raw secret reached the cache'
@@ -2971,7 +2989,7 @@ def _case_session_ingest_and_retention():
         err = run_fail('sessions-prune', '--older-than', '12x')
         assert 'invalid --older-than' in err, err
         # Deterministic ages: make sess-clean ancient, everything else far-future.
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             db.execute("UPDATE sessions SET last_at='2020-01-01T00:00:00+00:00', ingested_at='2020-01-01T00:00:00+00:00' WHERE session_id='sess-clean'")
             db.execute("UPDATE sessions SET last_at='2099-01-01T00:00:00+00:00', ingested_at='2099-01-01T00:00:00+00:00' WHERE session_id!='sess-clean'")
             pre_events = db.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0]
@@ -2985,7 +3003,7 @@ def _case_session_ingest_and_retention():
         assert run('sessions-prune', '--older-than', '30d', '--project', 'Nowhere')['totals']['sessions'] == 0
         prof = run('sessions-prune', '--older-than', '2021-01-01T00:00:00+00:00')   # absolute ISO form
         assert len(prof['candidates']) == 1 and prof['candidates'][0]['session_id'] == 'sess-clean'
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             assert db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0] == 3   # dry-run touched nothing
             assert db.execute("SELECT COUNT(*) FROM audit_events WHERE action='session_pruned'").fetchone()[0] == 0
         # Apply: one transaction, exact counts, audited per source, index stays synced.
@@ -2993,7 +3011,7 @@ def _case_session_ingest_and_retention():
         assert pruned['dry_run'] is False and pruned['pruned']['sessions'] == 1 and pruned['pruned']['messages'] == 4
         assert pruned['remaining'] == {'sessions': 2, 'messages': 2}
         assert run('search-sessions', 'redirect cookie') == [], 'FTS kept deleted rows searchable'
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             row = db.execute("SELECT entity_id,payload_json FROM audit_events WHERE action='session_pruned'").fetchone()
             ev = {'entity_id': row[0], 'payload_json': row[1]}
             assert ev['entity_id'] == 'claude-code'
@@ -3007,7 +3025,7 @@ def _case_session_ingest_and_retention():
         # Zero-candidate apply audits nothing: empty runs leave no ledger noise.
         again = run('sessions-prune', '--older-than', '30d', '--apply')
         assert again['pruned']['sessions'] == 0 and 'remaining' in again
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             assert db.execute("SELECT COUNT(*) FROM audit_events WHERE action='session_pruned'").fetchone()[0] == 1
         m = run('metrics')
         assert m['sessions_pruned_total'] == 1 and m['sessions_indexed'] == 2, m
@@ -3115,7 +3133,7 @@ def _case_fact_graph_and_archival():
         acts = {e['action'] for e in ev['events']}
         assert {'fact_asserted','fact_deduplicated','fact_retracted'} <= acts, acts
         # Doctor flags dangling task provenance as out-of-band surgery.
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             db.execute("UPDATE facts SET task_id='ghost-task' WHERE id=?", (f_a2['id'],))
         doc = ops('doctor')
         assert any(p['kind'] == 'fact_task_missing' and p['fact_id'] == f_a2['id']
@@ -3129,7 +3147,7 @@ def _case_fact_graph_and_archival():
         assert 'still depend' in err, err
         # Long-lived fixture leases from earlier stages would refuse cancellation;
         # this is our own scratch home, so drop them as test setup.
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             db.execute("UPDATE tasks SET lease_owner='', lease_expires_at='' WHERE lease_owner!=''")
         for _ in range(12):
             pr = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'archive',
@@ -3156,7 +3174,7 @@ def _case_fact_graph_and_archival():
 
         # Tamper evidence (last): mutating a historical audit event breaks the chain.
         import sqlite3
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             db.execute("UPDATE audit_events SET action='tampered' WHERE id=(SELECT MIN(id) FROM audit_events)")
         chain = run('verify-chain')
         assert chain['ok'] is False
@@ -3516,7 +3534,7 @@ def _case_migration_inventory_import_rollback_onboarding():
         # imports, sweeps doctor, and (--probe) exercises the cross-agent protocol
         # end-to-end through the real CLI; re-runs are idempotent; ambiguous or
         # fail-closed inventories refuse before anything moves.
-        with sqlite3.connect(ob_home / 'state.db') as db:                   # init ran...
+        with _ClosingConn(ob_home / 'state.db') as db:                   # init ran...
             assert db.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 0   # ...but nothing imported
         err = oops('onboard', '--inventory', str(ob_inv), '--probe', fail=True)
         assert '--probe requires --apply' in err, err                       # probe mutates by design
@@ -3534,7 +3552,7 @@ def _case_migration_inventory_import_rollback_onboarding():
         # seal convention: created_at outside
         body = {k: v for k, v in rdoc.items() if k not in ('created_at', 'sha256')}
         assert hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest() == rdoc['sha256']
-        with sqlite3.connect(ob_home / 'state.db') as db:
+        with _ClosingConn(ob_home / 'state.db') as db:
             assert db.execute("SELECT status FROM tasks WHERE id='mig-1'").fetchone()[0] == 'completed'
             assert db.execute("SELECT status FROM tasks WHERE id='mig-2'").fetchone()[0] == 'queued'  # lease sanitized
             assert db.execute("SELECT status FROM tasks WHERE id='onboard-probe'").fetchone()[0] == 'completed'
@@ -3610,7 +3628,7 @@ def _case_audit_hardening_regression_round():
         ap = ops2('approval', 'approve', 'ap-1', '--by', 'leo', '--reason', 'ship it')
         ap_file = Path(td) / 'clean-home' / 'receipts' / (ap['receipt_id'] + '.json')
         assert ap_file.exists(), ap
-        with sqlite3.connect(Path(td) / 'clean-home' / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'clean-home' / 'state.db') as db:
             fh = db.execute('SELECT file_hash FROM receipts WHERE id=?', (ap['receipt_id'],)).fetchone()[0]
         assert fh and hashlib.sha256(ap_file.read_bytes()).hexdigest() == fh, (fh, ap_file)
         doc = ops2('doctor')
@@ -3809,7 +3827,8 @@ def _case_brain_inventory_and_home_selection():
                       '--hermes-home', str(fhermes), '--claude-home', str(fx / 'claude'),
                       '--out', str(inv_path))
             assert inv['ok'] is True and inv['fail_closed'] is False, inv   # degraded/unavailable ≠ fatal
-            assert inv_path.stat().st_mode & 0o077 == 0                     # sealed manifest 0600
+            if os.name == 'posix':
+                assert inv_path.stat().st_mode & 0o077 == 0                  # sealed manifest 0600
             full = json.loads(inv_path.read_text())                         # sealed doc, not compact
             bkind = {s['kind']: s for s in full['sources']}
             assert set(bkind) == {'autopilot', 'temporal', 'memories', 'claude_sync',
@@ -3881,7 +3900,8 @@ def _case_brain_inventory_and_home_selection():
                        and a['kind'] == 'memories' for a in bplan['actions']), bplan
             assert 'AKIAIOSFODNN7EXAMPLE' not in (btarget / 'provenance' /
                                                   ('brain-import-' + full['sha256'] + '.json')).read_text()
-            assert Path(bapply['report']).stat().st_mode & 0o077 == 0
+            if os.name == 'posix':
+                assert Path(bapply['report']).stat().st_mode & 0o077 == 0
             brepeat = ops('brain-import', '--inventory', str(inv_path), '--target', str(btarget), '--apply')
             assert brepeat['ok'] is True and brepeat['written'] == [], brepeat
             # --redact turns a safe text secret into a redacted derivative rather
@@ -3902,9 +3922,13 @@ def _case_brain_inventory_and_home_selection():
         p = subprocess.run([sys.executable, str(ROOT / 'autopilot.py'), 'init'], env=temporal_env,
                            text=True, capture_output=True)
         assert p.returncode == 0, p.stderr
-        with sqlite3.connect(temporal_home / 'temporal.db') as tc:
+        tc = sqlite3.connect(temporal_home / 'temporal.db')  # explicit close: `with` never closes, and Windows cannot clean up an open handle
+        try:
             tc.executescript('CREATE TABLE entities(id TEXT); CREATE TABLE relations(id TEXT); '
                              'CREATE TABLE ingested_events(id TEXT); INSERT INTO entities VALUES("e1");')
+            tc.commit()
+        finally:
+            tc.close()
         temporal_before = hashlib.sha256((temporal_home / 'temporal.db').read_bytes()).hexdigest()
         temporal_inv_path = Path(td) / 'brain-temporal-inventory.json'
         p = subprocess.run([sys.executable, str(ROOT / 'ops.py'), 'brain-inventory',
@@ -4003,10 +4027,27 @@ def _case_brain_inventory_and_home_selection():
                 if p.is_file() and not p.is_symlink() and not p.name.endswith(('-wal', '-shm')):
                     h.update(str(p.relative_to(root_)).encode()); h.update(p.read_bytes())
             return h.hexdigest()
+        def settle(home_):
+            # Fold any pending WAL frames into the main db so byte-hash
+            # comparisons are stable: a subsequent connection's clean close
+            # checkpoints WAL into state.db, which is byte movement, not a
+            # logical mutation. Hashing before settling made the read-only
+            # assert below flaky (CI failure 'doctor must be read-only').
+            sc = _sq.connect(home_ / 'state.db')
+            try:
+                sc.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            finally:
+                sc.close()
+        settle(good_home)
         good_before = tree_d(good_home)
         assert sops('home-doctor', '--home', str(good_home))['ok'] is True
-        with _sq.connect(bad_home / 'state.db') as bdb:
+        bdb = _sq.connect(bad_home / 'state.db')
+        try:
             bdb.execute("UPDATE audit_events SET action='tampered' WHERE id=(SELECT MIN(id) FROM audit_events)")
+            bdb.commit()
+        finally:
+            bdb.close()
+        settle(bad_home)
         bad_before = tree_d(bad_home)
         dres = sops('home-doctor', '--home', str(bad_home))
         assert dres['ok'] is False and any(p['kind'] == 'hash_mismatch' for p in dres['problems']), dres
@@ -4020,7 +4061,8 @@ def _case_brain_inventory_and_home_selection():
         # A healthy home selects cleanly: selector written 0600 and honored.
         selres = sops('home-select', '--home', str(good_home), '--selector', str(sel_path))
         assert selres['ok'] is True and selres['health'] == 'pass', selres
-        assert sel_path.stat().st_mode & 0o077 == 0
+        if os.name == 'posix':
+            assert sel_path.stat().st_mode & 0o077 == 0
         body = json.loads(sel_path.read_text())
         assert body['format'] == 'mindos-home-selector-v1' and body['home'] == str(good_home.resolve()), body
         # An explicit env override still outranks the selector…
@@ -4040,7 +4082,7 @@ def _case_brain_inventory_and_home_selection():
 
         # Tamper evidence (last): mutating a historical audit event breaks the chain.
         import sqlite3
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             db.execute("UPDATE audit_events SET action='tampered' WHERE id=(SELECT MIN(id) FROM audit_events)")
         chain = run('verify-chain')
         assert chain['ok'] is False
@@ -4257,7 +4299,7 @@ def _case_memory_semantic_recall():
         # Retains are transactional with the audit chain: no memory exists that
         # the ledger cannot account for (the retired engine appended to the
         # bank file outside the transaction, so a failed audit orphaned a line).
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             db.row_factory = sqlite3.Row
             audited = db.execute(
                 "SELECT COUNT(*) n FROM audit_events WHERE action='memory_retained'").fetchone()['n']
@@ -4377,7 +4419,7 @@ def _case_sense_repair_breaker_learning():
         doc = ops('doctor')
         assert not [p for p in doc['problems'] if p['kind'] == 'fts_index_drift'], doc
         # Learning triple was audited as part of the repair.
-        with sqlite3.connect(Path(td) / 'state.db') as db:
+        with _ClosingConn(Path(td) / 'state.db') as db:
             n = db.execute("SELECT COUNT(*) FROM audit_events WHERE action='repair_completed'").fetchone()[0]
             assert n == 1, n
 
