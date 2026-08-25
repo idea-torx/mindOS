@@ -1,5 +1,12 @@
 # MindOS
 
+[![License: FSL-1.1-MIT → MIT](https://img.shields.io/badge/license-FSL--1.1--MIT%20%E2%86%92%20MIT-blue)](LICENSE)
+[![Dependencies: none](https://img.shields.io/badge/dependencies-0-brightgreen)](INSTALL.md)
+[![Python: 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)](INSTALL.md)
+[![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](INSTALL.md)
+[![Engine: SQLite](https://img.shields.io/badge/engine-SQLite-003B57?logo=sqlite&logoColor=white)](ARCHITECTURE.md)
+[![Verify CI](https://github.com/idea-torx/mindOS/actions/workflows/verify.yml/badge.svg)](https://github.com/idea-torx/mindOS/actions/workflows/verify.yml)
+
 **A local-first memory and autopilot enhancer for AI agents.**
 
 AI agents forget everything between sessions, lose the thread of work they
