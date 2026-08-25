@@ -5070,22 +5070,33 @@ def memory_ingest_git(args):
                   "hint": "pass --apply to ingest"})
         return
     ingested = already = 0
+    # On the apply path by_kind must break down what was *newly* ingested, not
+    # what was found: re-ingest is a content-hash no-op, so a run that inserts
+    # 6 of 81 candidates would otherwise report "+6 (80 commit, 1 pull_request)"
+    # in the cron notification and in the audit event. Found totals stay
+    # available under found_by_kind.
+    ingested_counts = {"commit": 0, "pull_request": 0}
     with conn() as db:
         for it in items:
             _, created = _memory_insert(
                 db, text=it["text"], kind=it["kind"], project=project,
                 source="git-ingest", tags=it["tags"], task_id="",
                 created_at=it["created_at"])
-            ingested += 1 if created else 0
-            already += 0 if created else 1
+            if created:
+                ingested += 1
+                ingested_counts[it["kind"]] = ingested_counts.get(it["kind"], 0) + 1
+            else:
+                already += 1
         audit(db, "system", "memory", "memory_git_ingested",
               {"repo": str(repo), "project": project, "since": args.since,
                "ingested": ingested, "already_present": already,
-               "by_kind": counts,
+               "by_kind": ingested_counts, "found_by_kind": counts,
+               "found": len(items),
                **({"secret_kinds": findings} if findings else {})})
     json_out({"ok": True, "dry_run": False, "repo": str(repo),
               "project": project, "ingested": ingested,
-              "already_present": already, "by_kind": counts,
+              "already_present": already, "by_kind": ingested_counts,
+              "found": len(items), "found_by_kind": counts,
               "secret_kinds": findings,
               **({"note": pr_note} if pr_note else {}),
               "engine": MEMORY_ENGINE_TAG})

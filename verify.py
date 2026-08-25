@@ -4856,6 +4856,11 @@ def _case_git_ingest_is_bounded_and_idempotent():
         # ...and widening the window backfills only what was missing.
         widened = js(*base, *wide, '--apply')
         assert widened['ingested'] == 1 and widened['already_present'] == 2, widened
+        # by_kind on the apply path breaks down what was newly ingested, not
+        # what was found -- the cron notification prints "+N (by_kind)" and the
+        # two must agree. Found totals stay available under found_by_kind.
+        assert widened['by_kind'] == {'commit': 1, 'pull_request': 0}, widened
+        assert widened['found'] == 3 and widened['found_by_kind']['commit'] == 3, widened
 
         # 4. Enumeration returns every commit, newest first.
         rows = js('memory-list', '--project', 'src', '--kind', 'commit')

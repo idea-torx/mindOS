@@ -302,11 +302,18 @@ def main() -> int:
            "deadline_s": max(10, int(cfg.get("worker_seconds", 120))),
            "session_id": str(data.get("session_id", "")) if isinstance(data, dict) else ""}
     try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [sys.executable, __file__, "--worker"],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True,
-        ).stdin.write(json.dumps(job).encode())  # type: ignore[union-attr]
+        )
+        # The worker blocks on sys.stdin.read() until EOF, so the pipe must be
+        # closed explicitly. Letting the Popen fall out of scope only works by
+        # CPython refcount finalization; inside a long-lived gateway process on
+        # any other runtime the worker would hang holding an open pipe.
+        assert proc.stdin is not None
+        with proc.stdin as w:
+            w.write(json.dumps(job).encode())
     except Exception:
         # Last-resort synchronous fallback with a tiny bound; still non-fatal.
         try:

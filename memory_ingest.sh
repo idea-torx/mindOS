@@ -50,7 +50,14 @@ report=""
 failures=""
 total=0
 
+# The list is newline-separated by construction, so split on newlines only:
+# the default IFS would also split on spaces and silently truncate any
+# repository path that contains one.
+OLDIFS=$IFS
+IFS='
+'
 for repo in $REPOS; do
+  IFS=$OLDIFS
   [ -n "$repo" ] || continue
   name=$(basename "$repo")
   if [ ! -d "$repo" ]; then
@@ -89,6 +96,7 @@ print(f"  {proj}: +{n} ({bits})")
 "
   fi
 done
+IFS=$OLDIFS
 
 # Empty stdout = silent run. Only speak when there is new work or a failure.
 if [ -n "$report" ]; then

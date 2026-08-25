@@ -3590,8 +3590,18 @@ def repair(args):
     # its own connection(s) and must see the claimed state.
     autopilot.claim(SimpleNamespace(id=task_id, owner='ops-repair', minutes=30,
                                     max_active=None, force=False))
-    proc = subprocess.run([sys.executable, str(Path(__file__).parent / 'ops.py'), *cmd],
-                          text=True, capture_output=True, timeout=120)
+    try:
+        proc = subprocess.run([sys.executable, str(Path(__file__).parent / 'ops.py'), *cmd],
+                              text=True, capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        # A hung playbook must not leave the repair task leased and silent: the
+        # lease would expire into the stale-task path minutes later with no
+        # record of why. Fail it here the same way a non-zero exit is failed.
+        autopilot.fail(SimpleNamespace(id=task_id, owner='ops-repair',
+                                       reason='playbook command timed out after 120s',
+                                       no_retry=True, max_retries=0, backoff_base=60,
+                                       backoff_cap=3600, epoch=None))
+        raise SystemExit('repair command timed out after 120s')
     if proc.returncode != 0:
         autopilot.fail(SimpleNamespace(id=task_id, owner='ops-repair',
                                        reason=f'playbook command failed: {proc.stderr[:400]}',
