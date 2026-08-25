@@ -3275,10 +3275,14 @@ def home_select(args=None):
     if not target.is_absolute():
         raise SystemExit('--home must be an explicit absolute MindOS home')
     target = target.resolve()
-    if not target.is_dir():
-        raise SystemExit(f'home does not exist: {target}')
+    # Refuse the rollback default FIRST and unconditionally: its existence
+    # must not change the contract, and a fresh machine has never run init
+    # on it (existence-first ordering made this fail with 'home does not
+    # exist' there instead of the documented refusal).
     if target == autopilot.DEFAULT_HOME.resolve():
         raise SystemExit('refusing to select the rollback default home; deselect instead')
+    if not target.is_dir():
+        raise SystemExit(f'home does not exist: {target}')
     problems = _home_doctor_problems(target)
     if problems:
         raise SystemExit(f'{target} failed health verification:\n  ' +
