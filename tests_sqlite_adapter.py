@@ -101,14 +101,14 @@ with tempfile.TemporaryDirectory() as td:
             s = db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
             m = db.execute("SELECT COUNT(*) FROM session_messages").fetchone()[0]
             pend = db.execute(
-                "SELECT COUNT(*) FROM bridge_hindsight_ledger WHERE state='pending'"
+                "SELECT COUNT(*) FROM bridge_export_ledger WHERE state='pending'"
             ).fetchone()[0]
             return s, m, pend
 
     # -- 1. sentinel ingest end-to-end ----------------------------------------
     r = bridge(env, "sqlite-sync", "--sqlite-session-id", "sess_sentinel_1",
                "--profile", "default", "--project", "mindos",
-               "--bank", "autopilot-shared-context", "--redact")
+               "--channel", "shared-context", "--redact")
     assert r["status"] == "indexed" and r["messages"] == 2, r
     assert r["adapter"] == "hermes-sqlite" and r["applied"] is True
     s, m, pend = counts()
@@ -129,7 +129,7 @@ with tempfile.TemporaryDirectory() as td:
     # -- 2. idempotent re-run --------------------------------------------------
     r2 = bridge(env, "sqlite-sync", "--sqlite-session-id", "sess_sentinel_1",
                 "--profile", "default", "--project", "mindos",
-                "--bank", "autopilot-shared-context", "--redact")
+                "--channel", "shared-context", "--redact")
     assert r2.get("unchanged") is True and r2.get("messages") == 2, r2
     assert counts() == (1, 2, 2), "idempotent re-run must not add rows"
     print("PASS re-run idempotent (unchanged stream skipped)")
@@ -142,7 +142,7 @@ with tempfile.TemporaryDirectory() as td:
     db.commit(); db.close()
     r3 = bridge(env, "sqlite-sync", "--sqlite-session-id", "sess_sentinel_1",
                 "--profile", "default", "--project", "mindos",
-                "--bank", "autopilot-shared-context", "--redact")
+                "--channel", "shared-context", "--redact")
     assert r3["applied"] is True and r3["messages"] == 3, r3
     s, m, pend = counts()
     assert (s, m, pend) == (1, 3, 3), (s, m, pend)
@@ -150,8 +150,7 @@ with tempfile.TemporaryDirectory() as td:
 
     # Export manifest honors pending rows (honest pending/export semantics).
     out = mindos_home / "bridge-exports" / "latest.jsonl"
-    ex = bridge(env, "export", "--out", str(out), "--bank",
-                "autopilot-shared-context")
+    ex = bridge(env, "export", "--out", str(out), "--channel", "shared-context")
     assert ex["messages"] == 3, ex
     recs = [json.loads(l) for l in out.read_text().splitlines()]
     assert recs[0]["provenance"]["source"] == "hermes-sqlite"
@@ -184,7 +183,7 @@ with tempfile.TemporaryDirectory() as td:
             "SELECT content FROM session_messages WHERE session_row=?",
             (r4["row_id"],)))
     assert SECRET_VALUE not in cached and "[REDACTED:" in cached
-    bridge(env, "export", "--out", str(out), "--bank", "autopilot-shared-context")
+    bridge(env, "export", "--out", str(out), "--channel", "shared-context")
     exp = out.read_text()
     assert SECRET_VALUE not in cached + exp, "raw secret leaked"
     print("PASS secret guard: refuse by default, redact stores [REDACTED:*], no leakage")
@@ -225,7 +224,7 @@ with tempfile.TemporaryDirectory() as td:
     cfg_home = Path(hook_env["HERMES_HOME"])
     (cfg_home / "config.yaml").write_text(
         "mindos_bridge:\n  enabled: true\n  profile: default\n"
-        "  bank: autopilot-shared-context\n  redact: true\n")
+        "  channel: shared-context\n  redact: true\n")
     p = subprocess.run(
         [sys.executable, str(HOOK)],
         input=json.dumps({"session_id": "sess_sentinel_1"}), env=hook_env,

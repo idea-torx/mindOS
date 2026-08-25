@@ -200,14 +200,14 @@ def ingest_session(args) -> dict:
     t = ap.now()
     applied = False
     with ap.conn() as db:
-        from mindos_bridge import _ensure_bridge, _message_key
+        from mindos_bridge import _channel, _ensure_bridge, _message_key, _prune_ledger
         _ensure_bridge(db)
         row = db.execute("SELECT file_hash FROM sessions WHERE id=?", (row_id,)).fetchone()
         if row and row["file_hash"] == fh:
             result.update(unchanged=True, row_id=row_id)
             return result
         old = {r["seq"]: r["content_hash"] for r in db.execute(
-            "SELECT seq,content_hash FROM bridge_hindsight_ledger WHERE session_row=?",
+            "SELECT seq,content_hash FROM bridge_export_ledger WHERE session_row=?",
             (row_id,)).fetchall()}
         db.execute("DELETE FROM session_messages WHERE session_row=?", (row_id,))
         db.execute(
@@ -226,7 +226,7 @@ def ingest_session(args) -> dict:
              getattr(args, "project", ""), session_id,
              f"sqlite:{store.path}", fh, len(msgs), len(msgs),
              parsed["tool_results_skipped"], parsed["first_at"], parsed["last_at"], t))
-        bank = getattr(args, "bank", "") or ""
+        channel = _channel(args)
         for seq, m in enumerate(msgs):
             ch = hashlib.sha256((m["role"] + "\x00" + m["content"]).encode()).hexdigest()
             db.execute(
@@ -235,12 +235,13 @@ def ingest_session(args) -> dict:
                 (row_id, seq, m["role"], m["content"], ch, m["at"]))
             if old.get(seq) != ch:
                 db.execute(
-                    "INSERT OR REPLACE INTO bridge_hindsight_ledger(message_key,"
-                    "session_row,seq,role,at,content_hash,bank,state,attempts,"
+                    "INSERT OR REPLACE INTO bridge_export_ledger(message_key,"
+                    "session_row,seq,role,at,content_hash,channel,state,attempts,"
                     "last_error_kind,exported_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,'pending',0,'','','')",
+                    "VALUES(?,?,?,?,?,?,?,'pending',0,'','',?)",
                     (_message_key(row_id, seq), row_id, seq, m["role"], m["at"],
-                     ch, bank))
+                     ch, channel, t))
+        _prune_ledger(db, row_id, len(msgs))
         ap.audit(db, "session", row_id, "session_ingested_sqlite",
                  {"adapter": ADAPTER_SOURCE, "session_id": session_id,
                   "state_db_identity": store.identity, "messages": len(msgs),

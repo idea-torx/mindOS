@@ -3,7 +3,7 @@
 
 Produces a sealed, bounded JSON context pack for NEW Hermes session starts
 from MindOS shared state: temporal facts, live handoffs, latest receipts,
-profile-scoped ingested session snippets, and Hindsight semantic recall.
+profile-scoped ingested session snippets, and local semantic memory.
 Never synthetic per-turn messages, never system-prompt rewriting; the host
 injects the pack once at session start so prompt caching is preserved.
 
@@ -197,27 +197,42 @@ def _bot_candidates(db, profile: str, query: str,
         return [], f"unavailable ({type(e).__name__})"
 
 
-def _semantic_candidates(query: str, limit: int) -> tuple[list, str]:
-    if limit <= 0 or not ap._hindsight_available():
-        return [], ("empty" if limit <= 0 else "unavailable (no bank configured)")
+def _semantic_candidates(db, query: str, project: str,
+                         limit: int) -> tuple[list, str]:
+    """Locally-retained semantic memories matching the focus query.
+
+    Reads the in-database `memories` store through the same deterministic
+    FTS/LIKE engine the task context-pack uses -- no model, no embedding
+    service, no external bank. Project scope is enforced (a scoped pack never
+    falls back to unscoped memories), and retracted memories never pack.
+    """
+    if limit <= 0:
+        return [], "empty"
     try:
-        mems = []
-        low_toks = [t.lower() for t in _tokens(query)]
-        with ap._hindsight_bank_path().open(encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                m = json.loads(line)
-                text = str(m.get("text", ""))
-                if low_toks and not any(t in text.lower() for t in low_toks):
-                    continue
-                mems.append({"id": str(m.get("id", "")), "engine": ap.HINDSIGHT_ENGINE_TAG,
-                             "kind": str(m.get("kind", "")), "project": str(m.get("project", "")),
-                             "at": str(m.get("created_at", "")), "tags": sorted(m.get("tags", [])),
-                             "content": _snippet(text)})
-        mems.sort(key=lambda m: (m["at"], m["id"]), reverse=True)
-        mems = mems[:max(0, limit)]
+        toks = ap._search_tokens(query, fold_case=True, min_len=2,
+                                 drop_stopwords=True)
+        conds, vals = ["m.superseded_by=''"], []
+        if ap._memories_fts_ready(db) and toks:
+            src = (" FROM memories_fts f JOIN memories m ON m.rowid=f.rowid "
+                   "WHERE memories_fts MATCH ?")
+            vals.append(" OR ".join('"%s"' % t for t in toks))
+        else:
+            src = " FROM memories m WHERE 1=1"
+            if toks:
+                conds.append("(" + " OR ".join("m.text LIKE ?" for _ in toks) + ")")
+                vals.extend("%" + t + "%" for t in toks)
+        if project:
+            conds.append("(m.project='' OR m.project=?)")
+            vals.append(project)
+        vals.append(max(0, limit))
+        rows = db.execute(
+            "SELECT m.id,m.text,m.kind,m.project,m.tags,m.created_at" + src
+            + " AND " + " AND ".join(conds)
+            + " ORDER BY m.created_at DESC, m.id ASC LIMIT ?", vals).fetchall()
+        mems = [{"id": r["id"], "engine": ap.MEMORY_ENGINE_TAG,
+                 "kind": r["kind"] or "", "project": r["project"] or "",
+                 "at": r["created_at"] or "", "tags": ap._memory_tags(r["tags"]),
+                 "content": _snippet(r["text"] or "")} for r in rows]
         return mems, ("ok" if mems else "empty")
     except Exception as e:  # noqa: BLE001
         return [], f"unavailable ({type(e).__name__})"
@@ -301,17 +316,16 @@ def build_pack(profile: str = "", project: str = "", query: str = "",
             sections["bot_chat"] = []
             fit("bot_chat", bots, bots_limit, st,
                 {"profile_scope": profile or "*"})
+            sem, st = _semantic_candidates(db, query, project, semantic_limit)
+            sections["semantic"] = []
+            fit("semantic", sem, semantic_limit, st)
     except Exception as e:  # noqa: BLE001 — no MindOS home/DB at all: honest degradation
         enabled_db = False
         for s in ("temporal_facts", "handoffs", "receipts", "session_context",
-                  "bot_chat"):
+                  "bot_chat", "semantic"):
             sources[s] = {"status": f"unavailable ({type(e).__name__})",
                           "requested_items": 0, "matched_items": 0, "packed_items": 0}
             sections[s] = []
-
-    sem, st = _semantic_candidates(query, semantic_limit)
-    sections["semantic"] = []
-    fit("semantic", sem, semantic_limit, st)
 
     envelope = {
         "format": PACK_FORMAT,
@@ -428,7 +442,7 @@ def cmd_sentinel(args):
     """End-to-end proof in a fully disposable fixture world (never live).
 
     Builds a temp MindOS home + synthetic Hermes store with two profiles and
-    a Hindsight bank, ingests through the real bridge, then proves: pack
+    local semantic memory, ingests through the real bridge, then proves: pack
     delivery for a new session, digest idempotence, profile isolation,
     secret refusal/redaction, the disable path, and unavailable-source
     degradation. Zero writes outside the temp dir.
@@ -441,7 +455,6 @@ def cmd_sentinel(args):
         tdp = Path(td)
         env = os.environ.copy()
         env["HERMES_AUTOPILOT_HOME"] = str(tdp / "mindos-home")
-        env["HERMES_HINDSIGHT_HOME"] = str(tdp / "hindsight")
         env.pop("HERMES_MINDOS_CONTEXT", None)
         store_root = tdp / "store"
         store_a = store_root / "telegram-leo"
@@ -534,9 +547,8 @@ def cmd_sentinel(args):
         assert off == {"enabled": False, "format": PACK_FORMAT}, off
         checks.append("opt-out-disable-path")
 
-        # 7. Unavailable sources degrade honestly (empty MindOS home + no bank).
-        empty_env = {**env, "HERMES_AUTOPILOT_HOME": str(tdp / "no-home"),
-                     "HERMES_HINDSIGHT_HOME": str(tdp / "no-bank")}
+        # 7. Unavailable sources degrade honestly (empty MindOS home).
+        empty_env = {**env, "HERMES_AUTOPILOT_HOME": str(tdp / "no-home")}
         ep = subprocess.run(
             [sys.executable, str(root / "mindos_context_pack.py"),
              "session-pack", "--max-bytes", "2048"],

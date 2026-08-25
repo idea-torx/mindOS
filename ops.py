@@ -888,10 +888,12 @@ def doctor(args=None):
             "WHERE f.task_id!='' AND t.id IS NULL"):
             problems.append({'kind': 'fact_task_missing', 'fact_id': r['id'], 'task_id': r['task_id']})
         for table, fts in (('notes', 'notes_fts'), ('tasks', 'tasks_fts'), ('handoffs', 'handoffs_fts'),
-                           ('session_messages', 'session_messages_fts'), ('facts', 'facts_fts')):
+                           ('session_messages', 'session_messages_fts'), ('facts', 'facts_fts'),
+                           ('memories', 'memories_fts')):
             ready = (autopilot._handoffs_fts_ready(c) if fts == 'handoffs_fts'
                      else autopilot._sessions_fts_ready(c) if fts == 'session_messages_fts'
                      else autopilot._facts_fts_ready(c) if fts == 'facts_fts'
+                     else autopilot._memories_fts_ready(c) if fts == 'memories_fts'
                      else autopilot._fts_ready(c))
             if not ready:
                 continue
@@ -911,24 +913,24 @@ def doctor(args=None):
                                  'rows': len(src), 'indexed': len(idx),
                                  'missing_from_index': sorted(src - idx)[:20],
                                  'stale_in_index': sorted(idx - src)[:20]})
-        # Hindsight semantic recall: reported as a healthy-with-note when no
-        # bank is configured — an absent bank degrades --related-semantic to a
-        # no-op and must never fail the doctor sweep, so it lands in `notes`,
-        # never in `problems`.
-        if autopilot._hindsight_available():
-            n = 0
-            try:
-                with autopilot._hindsight_bank_path().open("r", encoding="utf-8") as f:
-                    n = sum(1 for line in f if line.strip())
-                notes.append({'kind': 'hindsight_status', 'status': 'available',
-                              'memories': n})
-            except OSError as e:
-                notes.append({'kind': 'hindsight_unreadable', 'error': str(e),
-                              'note': '--related-semantic degrades to a no-op'})
-        else:
-            notes.append({'kind': 'hindsight_status', 'status': 'unavailable',
-                          'path': str(autopilot._hindsight_bank_path()),
-                          'note': 'no bank configured; --related-semantic is a no-op (healthy-with-note)'})
+        # Semantic memory: a healthy-with-note report on the local store. An
+        # empty store degrades --related-semantic to a no-op and must never
+        # fail the doctor sweep, so it lands in `notes`, never in `problems`.
+        try:
+            live = c.execute(
+                "SELECT COUNT(*) FROM memories WHERE superseded_by=''").fetchone()[0]
+            retracted = c.execute(
+                "SELECT COUNT(*) FROM memories WHERE superseded_by<>''").fetchone()[0]
+            notes.append({'kind': 'memory_store',
+                          'status': 'available' if live else 'empty',
+                          'engine': autopilot.MEMORY_ENGINE_TAG,
+                          'memories': live, 'retracted': retracted,
+                          'fts': autopilot._memories_fts_ready(c),
+                          **({} if live else
+                             {'note': 'no memories retained; --related-semantic is a no-op'})})
+        except sqlite3.Error as e:
+            notes.append({'kind': 'memory_store_unreadable', 'error': str(e),
+                          'note': '--related-semantic degrades to a no-op'})
     print(json.dumps({'ok': not problems, 'problems': problems, 'count': len(problems),
                       'notes': notes}, sort_keys=True))
 
@@ -1428,8 +1430,9 @@ _MIGRATION_PLAN_STEPS = (
      'back up the source database (snapshot semantics), verify its seal, then '
      'restore or per-task import-task into the target Autopilot home'),
     ('hindsight_bank', 1,
-     'import semantic memories as provenance-tagged notes with temporal '
-     'validity preserved; deduplicate and supersede on merge'),
+     'legacy semantic-memory bank: import with `autopilot.py memory-import '
+     '<bank.jsonl> --apply` into the local in-database memory store '
+     '(content-addressed, so a partial import is simply re-run)'),
     ('hermes_home', 2,
      'register profiles, skills, cron definitions, and ownership contracts '
      'after control-plane initialization'),
@@ -2597,7 +2600,7 @@ BRAIN_INVENTORY_FORMAT = 'mindos-brain-inventory-v1'
 # definitions differently instead of flattening them into one authority.
 _BRAIN_ROLES = {
     'autopilot': 'execution_truth',
-    'hindsight': 'semantic_memory',
+    'memories': 'semantic_memory',
     'temporal': 'temporal_facts',
     'claude_sync': 'sync_metadata',
     'claude_memory': 'human_archive',
@@ -2606,66 +2609,6 @@ _BRAIN_ROLES = {
     'skills': 'skill_definitions',
     'cron': 'cron_definitions',
 }
-# Hindsight stats fields safe to seal: counts only — every timestamp and
-# latency figure is volatile and would break manifest reproducibility.
-_HINDSIGHT_STATS_FIELDS = ('total_nodes', 'total_links', 'total_documents',
-                           'pending_operations', 'failed_operations')
-
-def _brain_http_json(url: str, timeout: float):
-    """GET a JSON document; returns (status_code, parsed) or raises OSError."""
-    req = urllib.request.Request(url, method='GET',
-                                 headers={'Accept': 'application/json'})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.status, json.loads(resp.read().decode('utf-8'))
-
-def _brain_hindsight(url: str, bank: str, timeout: float):
-    """Provider-neutral binding probe: health + shared-bank accessibility.
-
-    Read-only by construction (two GETs); the live bank is never duplicated,
-    written, or consolidated — only its count-shaped stats are recorded. A
-    service that is down is `unavailable` (reported, not fatal) so an offline
-    machine can still inventory everything else; a healthy service missing
-    the shared bank is `degraded` because the binding itself is broken.
-    """
-    entry = {'id': 'brain-' + hashlib.sha256(f'hindsight:{bank}'.encode()).hexdigest()[:12],
-             'kind': 'hindsight', 'role': _BRAIN_ROLES['hindsight'],
-             'adapter': 'provider-neutral-http-v1', 'url': url, 'bank': bank,
-             'path': f'{url}/v1/default/banks/{bank}',
-             'files': [], 'secret_kinds': []}
-    try:
-        code, health = _brain_http_json(f'{url}/health', timeout)
-    except Exception as e:
-        return {**entry, 'status': 'unavailable',
-                'problems': [f'health probe failed: {type(e).__name__}: {e}'],
-                'counts': {}, 'bound': False}
-    if code != 200 or health.get('status') != 'healthy':
-        return {**entry, 'status': 'unavailable',
-                'problems': [f"health endpoint reported status={health.get('status')!r}"],
-                'counts': {}, 'bound': False}
-    problems, bound = [], False
-    try:
-        code, banks = _brain_http_json(f'{url}/v1/default/banks', timeout)
-        if code == 200:
-            listed = [b.get('bank_id') for b in banks.get('banks', [])]
-            bound = bank in listed
-            if not bound:
-                problems.append(f'bank {bank!r} not present in service bank list')
-    except Exception as e:
-        problems.append(f'bank list failed: {type(e).__name__}: {e}')
-    stats = {}
-    try:
-        code, doc = _brain_http_json(
-            f'{url}/v1/default/banks/{urllib.parse.quote(bank)}/stats', timeout)
-        if code == 200:
-            stats = {k: doc[k] for k in _HINDSIGHT_STATS_FIELDS if k in doc}
-            fact_count = doc.get('fact_count')
-            if fact_count is not None:
-                stats['fact_count'] = fact_count
-    except Exception as e:
-        problems.append(f'bank stats failed: {type(e).__name__}: {e}')
-    return {**entry, 'status': 'ok' if bound else 'degraded',
-            'problems': problems, 'counts': stats, 'bound': bound}
-
 def _brain_classify_temporal(path: Path):
     """Classify the temporal sidecar strictly read-only (mirror of
     _classify_sqlite for the sidecar's own schema)."""
@@ -2771,8 +2714,7 @@ def brain_inventory(args=None):
     """Dry-run-first end-to-end brain inventory across every durable source.
 
     Strictly read-only: Autopilot execution state, the temporal sidecar, the
-    Hindsight shared-bank binding (health + accessibility via GETs only), the
-    Claude memory-sync metadata, Claude project memory archives, raw session
+    local semantic-memory store, the Claude memory-sync metadata, Claude project memory archives, raw session
     cache, and profile/skill/cron definitions are counted, checksummed, and
     classified without a single byte of mutation. Values never enter the
     manifest — only redacted counts, sha256 checksums, integrity/health
@@ -2783,14 +2725,12 @@ def brain_inventory(args=None):
     digest-only audit event recording that an inventory was taken.
 
     Fail-closed: corrupted or ambiguous local sources block with exact
-    blockers; absent optional sources (temporal sidecar, sync file) and an
-    unreachable Hindsight service are recorded honestly without blocking.
+    blockers; absent optional sources (temporal sidecar, sync file) are
+    recorded honestly without blocking.
     """
     t = utc()
     hermes = Path(getattr(args, 'hermes_home', '') or Path.home() / '.hermes').expanduser()
     claude = Path(getattr(args, 'claude_home', '') or Path.home() / '.claude').expanduser()
-    hs_url = (getattr(args, 'hindsight_url', '') or 'http://127.0.0.1:8888').rstrip('/')
-    bank = getattr(args, 'bank', '') or 'autopilot-shared-context'
     timeout = float(getattr(args, 'timeout', 3) or 3)
     sources, fail_closed = [], False
 
@@ -2808,7 +2748,7 @@ def brain_inventory(args=None):
     # audit_events deliberately re-counted through _brain_ro_counts so the
     # command's own seal events stay outside the sealed manifest (reproducibility).
     counts.update(_brain_ro_counts(adb, ('sessions', 'session_messages', 'facts',
-                                         'audit_events')))
+                                         'memories', 'audit_events')))
     receipts = autopilot.RECEIPTS
     rec_files = sorted(p for p in receipts.glob('*.json') if p.is_file()) if receipts.is_dir() else []
     counts['receipt_files'] = len(rec_files)
@@ -2831,10 +2771,34 @@ def brain_inventory(args=None):
              'kind': 'temporal', 'role': _BRAIN_ROLES['temporal'], 'path': str(tdb),
              'status': 'absent', 'problems': ['temporal sidecar not present'],
              'counts': {}, 'sha256': '', 'files': [], 'secret_kinds': []})
-    # Semantic memory: a shared service, not a file store — verify the binding,
-    # never pretend a local copy exists or copy semantics into SQLite.
-    add(_brain_hindsight(hs_url, bank, timeout))
-    # Claude memory-sync metadata: sync state keyed by memory-file paths.
+    # Semantic memory: local and in-database since the external Hindsight
+    # service was retired. It is inventoried as its own epistemic source even
+    # though it shares the control-plane file, because a migration must still
+    # be able to treat semantic memory differently from execution truth.
+    mem_counts, mem_problems, mem_status = {}, [], 'absent'
+    if adb.is_file():
+        try:
+            mc = _open_source_sqlite(adb)
+            try:
+                mem_counts = {
+                    'memories': mc.execute(
+                        "SELECT COUNT(*) FROM memories WHERE superseded_by=''").fetchone()[0],
+                    'retracted': mc.execute(
+                        "SELECT COUNT(*) FROM memories WHERE superseded_by<>''").fetchone()[0]}
+                mem_status = 'ok'
+            finally:
+                mc.close()
+        except sqlite3.Error as e:
+            mem_status, mem_problems = 'degraded', [f'{type(e).__name__}: {e}']
+    else:
+        mem_problems = ['no control-plane database; memory store not initialized']
+    add({'id': 'brain-' + hashlib.sha256(f'memories:{adb}'.encode()).hexdigest()[:12],
+         'kind': 'memories', 'role': _BRAIN_ROLES['memories'],
+         'engine': autopilot.MEMORY_ENGINE_TAG, 'path': str(adb),
+         'status': mem_status, 'problems': mem_problems, 'counts': mem_counts,
+         'sha256': '', 'files': [], 'secret_kinds': []})
+    # Claude memory-sync metadata: sync state keyed by memory-file paths. The
+    # directory name is a legacy on-disk location, not a live service binding.
     sync_path = hermes / 'hindsight' / 'claude-memory-sync.json'
     doc, problem = _brain_json_doc(sync_path)
     sync_counts = {} if doc is None else (
@@ -2901,7 +2865,7 @@ def brain_inventory(args=None):
     sources.sort(key=lambda s: (rank.get(s['kind'], 99), s['path']))
     body = {'format': BRAIN_INVENTORY_FORMAT, 'created_at': t,
             'hermes_home': str(hermes), 'claude_home': str(claude),
-            'hindsight_url': hs_url, 'bank': bank, 'sources': sources,
+            'sources': sources,
             'fail_closed': fail_closed,
             'summary': {
                 'sources': len(sources),
@@ -2961,7 +2925,6 @@ def brain_inventory_check(args):
         raise SystemExit('manifest integrity check failed; refusing a tampered manifest')
     print(json.dumps({'ok': True, 'path': str(path), 'created_at': body.get('created_at'),
                       'hermes_home': body.get('hermes_home'),
-                      'hindsight_url': body.get('hindsight_url'), 'bank': body.get('bank'),
                       'summary': body.get('summary'),
                       'fail_closed': body.get('fail_closed', False),
                       'sources': [{'kind': s.get('kind'), 'role': s.get('role'),
@@ -3055,11 +3018,11 @@ def _brain_import_plan(inv):
     actions, blockers = [], []
     for src in inv.get('sources', []):
         kind, status = src.get('kind'), src.get('status')
-        if kind == 'hindsight':
-            actions.append({'action': 'bind_hindsight', 'source_id': src.get('id'),
-                            'kind': kind, 'target_rel': 'bindings/hindsight-shared-bank.json',
-                            'status': status, 'bound': bool(src.get('bound')),
-                            'reason': 'GET-only shared-bank binding; bank content is never copied'})
+        if kind == 'memories':
+            actions.append({'action': 'external_execution_import_required',
+                            'source_id': src.get('id'), 'kind': kind, 'status': status,
+                            'reason': 'semantic memory lives in the control-plane '
+                                      'database and moves with the execution-truth import'})
             continue
         if kind == 'autopilot':
             actions.append({'action': 'external_execution_import_required', 'source_id': src.get('id'),
@@ -3108,23 +3071,13 @@ def _brain_import_plan(inv):
             actions.append({'action': 'copy', **row})
     return actions, blockers
 
-def _brain_binding_bytes(inv, src):
-    """Safe binding metadata; deliberately no Hindsight values or export."""
-    body = {'format': 'mindos-hindsight-binding-v1', 'inventory_sha256': inv['sha256'],
-            'adapter': src.get('adapter', 'provider-neutral-http-v1'), 'url': src.get('url', ''),
-            'bank': src.get('bank', ''), 'path': src.get('path', ''),
-            'status': src.get('status'), 'bound': bool(src.get('bound')),
-            'counts': src.get('counts', {}), 'problems': src.get('problems', [])}
-    body['sha256'] = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
-    return json.dumps(body, sort_keys=True).encode()
-
 def brain_import(args=None):
     """Apply a sealed brain inventory into an explicit new MindOS home.
 
     Dry-run is the default. Sources are re-hashed immediately before copying;
     changed sources, incomplete inventories, and pre-existing different target
-    bytes fail closed. Hindsight is represented only by a provider-neutral,
-    GET-probed binding record — never by semantic-memory rows in SQLite.
+    bytes fail closed. Semantic memory is not copied here: it lives in the
+    control-plane database and moves with the execution-truth import.
     Credential-shaped source files are quarantined by default, or copied as a
     redacted text derivative with --redact. Every applied run writes a sealed
     report and source-to-target provenance records; re-running verifies those
@@ -3174,15 +3127,7 @@ def brain_import(args=None):
     for action in actions:
         if action['action'] == 'quarantine_unsupported_file':
             quarantine.append(action)
-    binding = next((s for s in inv.get('sources', []) if s.get('kind') == 'hindsight'), None)
-    binding_data = _brain_binding_bytes(inv, binding) if binding else None
-    binding_target = target / 'bindings/hindsight-shared-bank.json'
-    if binding_data and (binding_target.exists() or binding_target.is_symlink()):
-        if not binding_target.is_file() or binding_target.is_symlink() or \
-                _scan_sha256(binding_target) != hashlib.sha256(binding_data).hexdigest():
-            raise SystemExit(f'target conflict at {binding_target}; refusing to overwrite local binding')
     planned = {'copy': len(materialized), 'quarantine': len(quarantine),
-               'bind_hindsight': bool(binding_data),
                'execution_import_required': any(a['action'] == 'external_execution_import_required'
                                                 for a in actions)}
     if not getattr(args, 'apply', False):
@@ -3219,14 +3164,6 @@ def brain_import(args=None):
                         'target_path': str(destination.relative_to(target)),
                         'target_sha256': hashlib.sha256(data).hexdigest(),
                         'redacted': bool(action.get('redacted')), 'secret_kinds': action.get('secret_kinds', [])})
-    if binding_data:
-        created = _brain_target_write(binding_target, binding_data)
-        (written if created else existing).append(str(binding_target))
-        records.append({'source_id': binding['id'], 'kind': 'hindsight_binding',
-                        'source_path': binding.get('path', ''), 'source_sha256': '',
-                        'target_path': str(binding_target.relative_to(target)),
-                        'target_sha256': hashlib.sha256(binding_data).hexdigest(),
-                        'redacted': False, 'secret_kinds': []})
     provenance = {'format': 'mindos-brain-provenance-v1', 'inventory_sha256': inv['sha256'],
                   'records': records, 'quarantine': [{k: v for k, v in a.items()
                                                        if k not in ('source',)} for a in quarantine]}
@@ -3706,7 +3643,8 @@ def repair_fts_rebuild(args=None):
               ('tasks', 'tasks_fts', autopilot._fts_ready),
               ('handoffs', 'handoffs_fts', autopilot._handoffs_fts_ready),
               ('session_messages', 'session_messages_fts', autopilot._sessions_fts_ready),
-              ('facts', 'facts_fts', autopilot._facts_fts_ready))
+              ('facts', 'facts_fts', autopilot._facts_fts_ready),
+              ('memories', 'memories_fts', autopilot._memories_fts_ready))
     rebuilt, skipped, drifted = [], [], []
     with db() as c:
         for table, fts, ready in tables:
@@ -3936,7 +3874,7 @@ x=s.add_parser('migrate-inventory'); x.add_argument('--root',required=True); x.a
 x=s.add_parser('migrate-inventory-check'); x.add_argument('path'); x.set_defaults(fn=migrate_inventory_check)
 x=s.add_parser('migrate-import'); x.add_argument('--inventory',required=True); x.add_argument('--source-id',dest='source_id',required=True); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--out',default=None,help='write a sealed autopilot-migration-result-v1 document'); x.add_argument('--redact',action='store_true'); x.add_argument('--allow-secret',action='store_true'); x.add_argument('--relink-audit',dest='relink_audit',action='store_true',help='merge into a non-empty audit ledger and relink the combined chain'); x.set_defaults(fn=migrate_import)
 x=s.add_parser('migrate-rollback'); x.add_argument('result'); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--force',action='store_true',help='cascade away drifted rows and local dependents of imported tasks'); x.set_defaults(fn=migrate_rollback)
-x=s.add_parser('brain-inventory'); x.add_argument('--hermes-home',dest='hermes_home',default='',help='Hermes home to inventory (default ~/.hermes; read-only)'); x.add_argument('--claude-home',dest='claude_home',default='',help='Claude home to inventory (default ~/.claude; read-only)'); x.add_argument('--hindsight-url',dest='hindsight_url',default='http://127.0.0.1:8888',help='Hindsight service base URL for the read-only binding probe'); x.add_argument('--bank',default='autopilot-shared-context',help='shared-context bank the binding must expose'); x.add_argument('--timeout',type=float,default=3.0,help='per-request HTTP timeout in seconds'); x.add_argument('--out',default=None,help='write a sealed mindos-brain-inventory-v1 manifest'); x.set_defaults(fn=brain_inventory)
+x=s.add_parser('brain-inventory'); x.add_argument('--hermes-home',dest='hermes_home',default='',help='Hermes home to inventory (default ~/.hermes; read-only)'); x.add_argument('--claude-home',dest='claude_home',default='',help='Claude home to inventory (default ~/.claude; read-only)'); x.add_argument('--timeout',type=float,default=3.0,help='per-request HTTP timeout in seconds'); x.add_argument('--out',default=None,help='write a sealed mindos-brain-inventory-v1 manifest'); x.set_defaults(fn=brain_inventory)
 x=s.add_parser('brain-inventory-check'); x.add_argument('path'); x.set_defaults(fn=brain_inventory_check)
 x=s.add_parser('brain-import'); x.add_argument('--inventory',required=True,help='sealed mindos-brain-inventory-v1 manifest'); x.add_argument('--target',required=True,help='explicit absolute new MindOS home; never the inventoried source home'); x.add_argument('--apply',action='store_true',help='without this flag emit a dry-run plan only'); x.add_argument('--redact',action='store_true',help='copy credential-shaped text only as redacted derivatives; otherwise quarantine'); x.add_argument('--out',default='',help='sealed import report path (default <target>/migrations/)'); x.set_defaults(fn=brain_import)
 x=s.add_parser('onboard'); x.add_argument('--inventory',required=True,help='sealed autopilot-migration-inventory-v1 manifest from migrate-inventory'); x.add_argument('--source-id',dest='source_id',default='',help='autopilot_sqlite source to import; auto-selected when exactly one is healthy'); x.add_argument('--apply',action='store_true',help='without this flag onboarding plans and verifies but does not import'); x.add_argument('--out',default=None,help='write a sealed autopilot-onboarding-v1 report document'); x.add_argument('--redact',action='store_true'); x.add_argument('--allow-secret',action='store_true'); x.add_argument('--relink-audit',dest='relink_audit',action='store_true',help='merge into a non-empty audit ledger and relink the combined chain (forwarded to migrate-import)'); x.add_argument('--probe',action='store_true',help='run the end-to-end cross-agent handoff/recall/ack/complete probe (requires --apply)'); x.set_defaults(fn=onboard)

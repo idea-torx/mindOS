@@ -9,7 +9,7 @@ One new tool, `mindos_context_pack.py`, in the same shape as the existing
 bridge tools (`mindos_bridge.py`, `mindos_sqlite_adapter.py`): a standalone
 CLI that reuses `autopilot.py` for home resolution (`HERMES_AUTOPILOT_HOME`
 env > reversible selector > default), schema/conn, secret guard
-(`_secret_findings` / `_redact_secrets`) and the Hindsight bank adapter. No
+(`_secret_findings` / `_redact_secrets`) and the local memory engine. No
 runtime logic moves out of `autopilot.py`/`ops.py`; nothing is installed or
 deployed.
 
@@ -24,7 +24,7 @@ Hermes session start
         │  (profile, project, optional focus query)
         ▼
 mindos_context_pack.py session-pack
-        │  reads-only from MindOS home state.db + Hindsight bank file
+        │  reads-only from MindOS home state.db
         ▼
 sealed pack JSON (provenance, generated_at, freshness, digest)
         → stdout and/or --out file; verify-pack recomputes freshness later
@@ -42,15 +42,18 @@ Sources reuse what already exists; nothing new is invented:
    retrieval discipline as `_related_session_candidates` (FTS5 with LIKE
    fallback), restricted to the requested Hermes **profile** when one is
    given; cross-profile content can never be packed.
-5. `semantic` — Hindsight bank recall (read-only, deterministic ordering,
-   graceful no-op when no bank exists) via `autopilot._hindsight_candidates`-style
-   matching over the pack query text.
+5. `semantic` — local semantic-memory recall over the in-database `memories`
+   table (read-only, deterministic ordering, graceful no-op when nothing is
+   retained), using the same FTS5-with-LIKE-fallback engine as the task
+   context pack. Project scope is enforced, not preferred: a scoped pack sees
+   that project's memories plus project-less fleet-wide ones and nothing else.
+   No model, no embeddings, no network call.
 
 Every item carries its own provenance block (source table/engine, ids,
 timestamps, profile where applicable). Every section reports
 `status: ok | empty | unavailable | refused-secret` so degradation is honest:
-a missing DB or absent bank yields an explicitly `unavailable` empty section —
-never fabricated context.
+a missing DB yields an explicitly `unavailable` empty section, and an empty
+store yields `empty` — never fabricated context.
 
 ## Boundedness, safety, determinism
 
@@ -123,8 +126,8 @@ Focused proof: `tests_context_integration.py`.
 
 `mindos_context_pack.py sentinel` builds an entirely disposable fixture
 world under a temp dir (MindOS home via `HERMES_AUTOPILOT_HOME`, synthetic
-JSONL store, two profiles, Hindsight bank via `HERMES_HINDSIGHT_HOME`),
-ingests through the real bridge, then proves:
+JSONL store, two profiles, local semantic memory), ingests through the real
+bridge, then proves:
 
 1. a new-session pack contains the injected context with provenance;
 2. regeneration on unchanged state is byte-stable (same digest);
@@ -132,6 +135,6 @@ ingests through the real bridge, then proves:
 4. credential-shaped content is excluded by default and redacted under
    `--redact`, with no raw value anywhere;
 5. the disable env yields `{"enabled": false}`;
-6. unavailable DB/bank degrade to honest `unavailable` statuses.
+6. an unavailable DB and an empty store degrade to honest statuses.
 
 Zero writes outside the temp dir; live homes stay read-only by construction.

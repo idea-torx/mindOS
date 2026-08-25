@@ -20,7 +20,6 @@ ROOT = Path(__file__).parent
 with tempfile.TemporaryDirectory() as td:
     env = os.environ.copy()
     env["HERMES_AUTOPILOT_HOME"] = str(Path(td) / "mindos-home")
-    env["HERMES_HINDSIGHT_HOME"] = str(Path(td) / "hindsight")
     env.pop("HERMES_MINDOS_CONTEXT", None)
 
     def ap_cli(*a, expect_fail=False):
@@ -91,7 +90,7 @@ with tempfile.TemporaryDirectory() as td:
     assert all(s["profile"] == "telegram-leo"
                for s in pk["sections"]["session_context"])
     assert "orchid" not in json.dumps(pk), "cross-profile leakage"
-    assert pk["sources"]["semantic"]["status"] == "unavailable (no bank configured)"
+    assert pk["sources"]["semantic"]["status"] == "empty"
     assert not pk["budget"]["truncated"] and pk["digest"]
     print("PASS full-sections+provenance+statuses")
 

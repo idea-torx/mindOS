@@ -13,9 +13,9 @@ Wired from config.yaml (ACTIVE Hermes home, honors HERMES_HOME)::
       root: ""                  # JSONL store root (fallback when no session_id)
       profile: ""               # Hermes profile label recorded as provenance
       project: ""
-      bank: autopilot-shared-context
+      channel: shared-context   # export channel (legacy key `bank` still read)
       redact: true              # store [REDACTED:<kind>] copies of credential-shaped text
-      export_on_sync: true      # also write the pending-export manifest (GET-only honesty)
+      export_on_sync: true      # also write the pending-export manifest
       export_out: ""            # manifest path (default <mindos home>/bridge-exports/latest.jsonl)
       worker_seconds: 120       # hard wall-clock cap for the detached worker
       context_pack: false       # opt-in: answer pre_llm_call first-turn with a
@@ -124,11 +124,11 @@ def _build_commands(cfg: dict) -> tuple[list[str] | None, list[str] | None]:
         return None, None
 
     def _common(cmd):
-        for flag, key in (("--profile", "profile"), ("--project", "project"),
-                          ("--bank", "bank")):
+        for flag, key in (("--profile", "profile"), ("--project", "project")):
             val = str(cfg.get(key, "") or "").strip()
             if val:
                 cmd += [flag, val]
+        cmd += ["--channel", _channel(cfg)]
         if _as_bool(cfg.get("redact"), True):
             cmd.append("--redact")
         return cmd
@@ -160,10 +160,17 @@ def _build_command(cfg: dict) -> list[str] | None:
     return _build_commands(cfg)[0]
 
 
+def _channel(cfg: dict) -> str:
+    """Export channel from config; `bank` is still read so a config written
+    for the retired Hindsight naming keeps working unchanged."""
+    return (str(cfg.get("channel", "") or "").strip()
+            or str(cfg.get("bank", "") or "").strip()
+            or "shared-context")
+
+
 def _export_command(cfg: dict) -> list[str] | None:
     if not _as_bool(cfg.get("export_on_sync"), True):
         return None
-    bank = str(cfg.get("bank", "") or "autopilot-shared-context").strip()
     out = str(cfg.get("export_out", "") or "").strip()
     if not out:
         try:
@@ -172,11 +179,9 @@ def _export_command(cfg: dict) -> list[str] | None:
             out = str(Path(ap.ROOT) / "bridge-exports" / "latest.jsonl")
         except Exception:
             return None  # cannot resolve home honestly -> skip export this pass
-    cmd = [sys.executable, str(HOOK_DIR / "mindos_bridge.py"),
-           "export", "--out", out, "--limit", "500"]
-    if bank:
-        cmd += ["--bank", bank]
-    return cmd
+    return [sys.executable, str(HOOK_DIR / "mindos_bridge.py"),
+            "export", "--out", out, "--limit", "500",
+            "--channel", _channel(cfg)]
 
 
 def _render_context_markdown(pack: dict) -> str:
