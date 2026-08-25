@@ -7,18 +7,49 @@ This tool intentionally does not deploy, merge, send messages, or execute work.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import uuid
 import hashlib
 import tempfile
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 from pathlib import Path
 
-ROOT = Path(os.environ.get("HERMES_AUTOPILOT_HOME", Path.home() / ".hermes" / "autopilot"))
+# Runtime home selection: HERMES_AUTOPILOT_HOME (explicit env override) wins;
+# otherwise an explicit, reversible selector file may point the runtime at a
+# new MindOS home; absent both, the immutable rollback default
+# ~/.hermes/autopilot applies. The selector is a plain JSON document written
+# atomically by `ops.py home-select` and removed by `home-deselect`; nothing
+# here ever writes it implicitly, and a deleted/unreadable selector degrades
+# to the default rather than failing the runtime.
+SELECTOR_PATH = Path(os.environ.get(
+    "AUTOPILOT_HOME_SELECTOR",
+    Path.home() / ".hermes" / "autopilot-home-selector.json"))
+DEFAULT_HOME = Path.home() / ".hermes" / "autopilot"
+
+def _resolve_home():
+    """Return (root_path, selection_source) honoring env > selector > default."""
+    env_home = os.environ.get("HERMES_AUTOPILOT_HOME", "").strip()
+    if env_home:
+        return Path(env_home).expanduser(), "env"
+    try:
+        sel = json.loads(SELECTOR_PATH.read_text())
+        home = str(sel.get("home", "")).strip()
+        if home and sel.get("source") == "mindos":
+            p = Path(home).expanduser()
+            if p.is_dir():
+                return p, "selector"
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_HOME, "default"
+
+ROOT, HOME_SOURCE = _resolve_home()
 DB = ROOT / "state.db"
 RECEIPTS = ROOT / "receipts"
 POLICIES = ROOT / "policies"
@@ -43,12 +74,16 @@ CREATE TABLE IF NOT EXISTS tasks (
    retry_count INTEGER NOT NULL DEFAULT 0,
    recover_after TEXT NOT NULL DEFAULT '',
    due_at TEXT NOT NULL DEFAULT '',
-   not_before TEXT NOT NULL DEFAULT '',
+    not_before TEXT NOT NULL DEFAULT '',
    tags TEXT NOT NULL DEFAULT '[]',
    requires_receipts TEXT NOT NULL DEFAULT '[]',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  last_receipt TEXT NOT NULL DEFAULT ''
+   autonomy_level TEXT NOT NULL DEFAULT '',
+   model_binding TEXT NOT NULL DEFAULT '',
+   recap TEXT NOT NULL DEFAULT '',
+   failure_cause TEXT NOT NULL DEFAULT '',
+   created_at TEXT NOT NULL,
+   updated_at TEXT NOT NULL,
+   last_receipt TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project);
@@ -57,7 +92,12 @@ CREATE TABLE IF NOT EXISTS heartbeats (
   owner TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'alive',
   at TEXT NOT NULL,
-  note TEXT NOT NULL DEFAULT ''
+  note TEXT NOT NULL DEFAULT '',
+  last_action TEXT NOT NULL DEFAULT '',
+  next_intent TEXT NOT NULL DEFAULT '',
+  progress_state TEXT NOT NULL DEFAULT '',
+  stall_deadline TEXT NOT NULL DEFAULT '',
+  evidence TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS receipts (
   id TEXT PRIMARY KEY,
@@ -169,6 +209,51 @@ CREATE TABLE IF NOT EXISTS facts (
 );
 CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject, predicate);
 CREATE INDEX IF NOT EXISTS idx_facts_object ON facts(object);
+
+-- Semantic memory (the local retrieval engine): free-text facts and decisions
+-- retained by agents, held in the control-plane database rather than an
+-- out-of-band file. Being in-DB is the point: retains are transactional with
+-- the audit hash chain, a torn write is impossible, the store is sealed and
+-- backed up with everything else, and no out-of-band edit can silently stale
+-- a sealed pack digest. Retrieval is deterministic BM25/LIKE over
+-- memories_fts -- no model, no embedding service, no network.
+-- Rows are immutable once written; retraction sets superseded_by (a
+-- non-indexed column, so no FTS UPDATE trigger is needed) exactly as
+-- handoffs do.
+CREATE TABLE IF NOT EXISTS memories (
+  id TEXT PRIMARY KEY,
+  text TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'memory',
+  project TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT '',
+  tags TEXT NOT NULL DEFAULT '[]',
+  task_id TEXT NOT NULL DEFAULT '',
+  content_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  superseded_by TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_dedupe
+  ON memories(project, content_hash);
+-- Embeddings live in their own table, never as columns on `memories`, for two
+-- reasons. They are optional: the machine that computes them carries a
+-- multi-gigabyte dependency tree that autopilot itself does not require, so
+-- their absence must be a missing row rather than a NULL the whole engine has
+-- to reason about. And `memories` rows are inside the sealed core of a context
+-- pack -- widening that row shape would stale every pack that cites a memory
+-- for a change no reader can even observe. `model` is part of the key because
+-- vectors from two different models are not comparable; re-embedding under a
+-- new model adds rows instead of silently corrupting a shared space.
+CREATE TABLE IF NOT EXISTS memory_vectors (
+  memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+  model TEXT NOT NULL,
+  dim INTEGER NOT NULL,
+  content_hash TEXT NOT NULL,
+  vec BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (memory_id, model)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_vectors_model ON memory_vectors(model);
 """
 # Full-text retrieval (FTS5, stdlib sqlite3): external-content indexes over
 # notes/tasks kept in sync by triggers. Applied only when the SQLite build
@@ -237,6 +322,17 @@ CREATE TRIGGER IF NOT EXISTS facts_fts_ai AFTER INSERT ON facts BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS facts_fts_ad AFTER DELETE ON facts BEGIN
   INSERT INTO facts_fts(facts_fts,rowid,subject,predicate,object,source) VALUES('delete',old.rowid,old.subject,old.predicate,old.object,old.source);
+END;
+-- Memory rows are immutable once written (retraction sets the non-indexed
+-- superseded_by column), so no UPDATE trigger is needed.
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+  text, kind, project, tags, content='memories', content_rowid='rowid'
+);
+CREATE TRIGGER IF NOT EXISTS memories_fts_ai AFTER INSERT ON memories BEGIN
+  INSERT INTO memories_fts(rowid,text,kind,project,tags) VALUES(new.rowid,new.text,new.kind,new.project,new.tags);
+END;
+CREATE TRIGGER IF NOT EXISTS memories_fts_ad AFTER DELETE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts,rowid,text,kind,project,tags) VALUES('delete',old.rowid,old.text,old.kind,old.project,old.tags);
 END;
 """
 STATUSES = {"queued", "claimed", "running", "waiting_for_agent", "waiting_for_user", "waiting_for_review", "ready_to_merge", "ready_to_deploy", "blocked", "completed", "failed", "cancelled"}
@@ -350,12 +446,19 @@ def _facts_fts_ready(db) -> bool:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='facts_fts'")}
     return "facts_fts" in names
 
+def _memories_fts_ready(db) -> bool:
+    """True when the semantic-memory FTS index exists."""
+    names = {r[0] for r in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'")}
+    return "memories_fts" in names
+
 def _ensure_fts(db) -> None:
     """Create FTS indexes when supported; rebuild once on first creation so
     pre-existing rows become searchable. Silently skips on non-FTS5 builds."""
     try:
         complete = (_fts_ready(db) and _handoffs_fts_ready(db)
-                    and _sessions_fts_ready(db) and _facts_fts_ready(db))
+                    and _sessions_fts_ready(db) and _facts_fts_ready(db)
+                    and _memories_fts_ready(db))
         db.executescript(FTS_SCHEMA)
         if not complete:
             db.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')")
@@ -363,17 +466,60 @@ def _ensure_fts(db) -> None:
             db.execute("INSERT INTO handoffs_fts(handoffs_fts) VALUES('rebuild')")
             db.execute("INSERT INTO session_messages_fts(session_messages_fts) VALUES('rebuild')")
             db.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
+            db.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
     except sqlite3.OperationalError:
         pass  # FTS5 unavailable: search falls back to LIKE
 
-def _fts_query(text: str) -> str:
-    """Convert free text into a safe FTS5 query of quoted tokens ('' if none)."""
-    toks = []
+# Retrieval is one tokenizer, not five. Every text-matching collector (notes,
+# handoffs, sessions, facts, memories) funnels through _search_tokens so a fix
+# here reaches all of them; before this, four near-identical copies had drifted
+# apart on case folding and quote stripping. The legacy defaults are exactly
+# the historical behavior, so existing sections keep byte-identical results and
+# sealed pack digests stay valid; the memory engine opts into the stricter
+# filtering via min_len/drop_stopwords.
+SEARCH_STOPWORDS = frozenset((
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
+    "has", "have", "in", "into", "is", "it", "its", "of", "on", "or", "that",
+    "the", "their", "then", "there", "these", "this", "to", "was", "were",
+    "will", "with",
+))
+SEARCH_MAX_TOKENS = 32
+
+def _search_tokens(text: str, *, fold_case: bool = False, min_len: int = 1,
+                   drop_stopwords: bool = False,
+                   limit: int = SEARCH_MAX_TOKENS) -> list:
+    """Free text -> deterministic, deduplicated, bounded match tokens.
+
+    Double quotes are stripped so a token can never break out of an FTS5
+    phrase or a LIKE parameter, and a token must carry at least one
+    alphanumeric character. `limit` bounds how many tokens reach SQL: an
+    enormous task description used to expand into an unbounded OR chain,
+    which is both slow and a way to blow SQLite's expression-depth limit.
+    Order is first-appearance and duplicates collapse, so the token list --
+    and therefore any digest computed over the results -- is reproducible.
+    """
+    out, seen = [], set()
     for raw in text.split():
         tok = raw.replace('"', "")
-        if tok and any(c.isalnum() for c in tok):
-            toks.append('"%s"' % tok)
-    return " ".join(toks)
+        if not tok or not any(c.isalnum() for c in tok):
+            continue
+        if fold_case:
+            tok = tok.lower()
+        if len(tok) < min_len:
+            continue
+        if drop_stopwords and tok.lower() in SEARCH_STOPWORDS:
+            continue
+        if tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+def _fts_query(text: str) -> str:
+    """Convert free text into a safe FTS5 query of quoted tokens ('' if none)."""
+    return " ".join('"%s"' % t for t in _search_tokens(text))
 
 def _migrate(db) -> None:
     """Add hash-chain columns to pre-existing audit_events tables and backfill."""
@@ -400,6 +546,15 @@ def _migrate(db) -> None:
         db.execute("ALTER TABLE tasks ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
     if "requires_receipts" not in task_cols:
         db.execute("ALTER TABLE tasks ADD COLUMN requires_receipts TEXT NOT NULL DEFAULT '[]'")
+    for col in ("autonomy_level", "model_binding", "recap", "failure_cause"):
+        if col not in task_cols:
+            db.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    hb_cols = {r[1] for r in db.execute("PRAGMA table_info(heartbeats)")}
+    for col in ("last_action", "next_intent", "progress_state",
+                "stall_deadline", "evidence"):
+        if col not in hb_cols:
+            default = "'[]'" if col == "evidence" else "''"
+            db.execute(f"ALTER TABLE heartbeats ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
     handoff_cols = {r[1] for r in db.execute("PRAGMA table_info(handoffs)")}
     if "recall_digest" not in handoff_cols:
         db.execute("ALTER TABLE handoffs ADD COLUMN recall_digest TEXT NOT NULL DEFAULT ''")
@@ -507,6 +662,15 @@ def audit(db, entity_type: str, entity_id: str, action: str, payload=None) -> No
     """Append an immutable, hash-chained local audit event; never include credentials in payloads."""
     payload_json = json.dumps(payload or {}, sort_keys=True)
     created = now()
+    # Serializing concurrent appenders: the tail read below must not race the
+    # insert, or two writers can both observe the same prev hash and fork the
+    # chain (broken_link + hash_mismatch on every later doctor/sense sweep).
+    # A plain SELECT takes no write lock, so take one up front: BEGIN IMMEDIATE
+    # when no transaction is open yet; otherwise the open transaction already
+    # holds the write lock since its first DML and the read-modify-write is
+    # serialized there.
+    if not db.in_transaction:
+        db.execute("BEGIN IMMEDIATE")
     prev = db.execute("SELECT hash FROM audit_events ORDER BY id DESC LIMIT 1").fetchone()
     prev_hash = prev[0] if prev else ""
     h = _chain_hash(prev_hash, entity_type, entity_id, action, payload_json, created)
@@ -1307,37 +1471,100 @@ def _dep_context_cost(entry: dict) -> int:
             + len(r["id"]) + len(r["kind"]) + len(r["created_at"]) + 8
     return c
 
-def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
-                rerank: bool = False, recency_half_life_hours: float = 168.0,
-                pinned_boost: float = 0.5, rel_handoffs: int = 0,
-                dep_context: int = 0, rel_sessions: int = 0, rel_facts: int = 0) -> dict:
-    """Assemble the prompt-ready context bundle for a task within a char budget.
+@dataclass
+class _PackSection:
+    """One flag-gated context-pack section in the pack spec.
 
-    Shared by `context` and `recall`: task summary header + unsatisfied
-    dependencies, then the live handoff, then live notes pinned-first
-    (oldest→newest within each group), then cross-task related notes.
-    With rerank=True the related-note candidates are temporally re-scored
-    (see `_rerank_notes`) and the pack reports the rerank parameters so
-    recall digests stay exactly recomputable. With rel_handoffs > 0, up to
-    that many cross-task related handoffs (live resume points of neighboring
-    work) pack after related notes within the same budget; every related-
-    handoff output key is present only when the flag is used, so packs built
-    without it stay byte-identical (and digest-compatible) to the legacy shape.
-    With dep_context > 0, up to that many completed direct prerequisites
-    contribute their verified evidence (live handoff + latest sealed receipt)
-    after related handoffs within the same budget; the same flag-gated key
-    rule keeps legacy packs byte-identical.
-    With rel_sessions > 0, up to that many ingested session-message snippets
-    (matching this task's text) pack after dep context under the same rules —
-    raw conversation is the freshest record of what agents actually tried.
-    With rel_facts > 0, up to that many currently-valid temporal facts from
-    the sidecar graph (matching this task's text) pack last under the same
-    flag-gated rules; every related-fact output key is present only when the
-    flag is used, so legacy packs stay byte-identical and digest-compatible.
+    `collect(db, ctx)` returns the candidate rows (possibly empty); a section
+    is active only when its flag count is > 0, so packs built without the
+    flag keep the legacy byte-identical shape. `keys`/`prefix` name the
+    output keys (`<prefix>_requested/_matched/_packed` + `keys`), `cost`
+    prices one row against the remaining budget, and `decorate` may tag a
+    row before packing (e.g. related=True).
+    """
+    prefix: str
+    keys: str
+    collect: object          # (db, ctx, limit) -> [rows]
+    cost: object             # (row) -> int
+    decorate: object = None  # (row) -> row
+
+def _pack_section_rows(section, db, ctx, limit):
+    return section.collect(db, ctx, max(0, limit)) if limit > 0 else []
+
+def _pack_fit(rows, used, budget, truncated, section):
+    """Greedy in-order fit of candidate rows into the remaining budget.
+
+    Shared by every section (and by notes): rows that do not fit mark the
+    pack truncated and are skipped, not fatal.
+    """
+    packed = []
+    for r in rows:
+        if section.decorate is not None:
+            r = section.decorate(r)
+        c = section.cost(r)
+        if used + c > budget:
+            truncated = True
+            continue
+        packed.append(r)
+        used += c
+    return packed, used, truncated
+
+def _pack_spec():
+    """The context-pack specification: every flag-gated cross-task section.
+
+    Adding a flag-gated section is one registration here rather than
+    threading kwargs through five signatures; ordering below is the pack
+    order (related notes -> handoffs -> dep context -> sessions -> facts).
+    """
+    rel_note_cost = lambda r: (len(r["content"]) + len(r["kind"]) + len(r["source"])
+                               + len(r["created_at"]) + len(r["task_id"])
+                               + len(r["via_task_title"]) + 16)
+    return [
+        _PackSection("related", "notes",
+            lambda db, ctx, n: _related_note_candidates(
+                db, ctx["task_id"], ctx["pack_text"], n, ctx["rel_scope"],
+                rerank=ctx["rerank"],
+                recency_half_life_hours=ctx["recency_half_life_hours"],
+                pinned_boost=ctx["pinned_boost"]),
+            rel_note_cost,
+            decorate=lambda r: {**r, "related": True}),
+        _PackSection("related_handoffs", "related_handoffs",
+            lambda db, ctx, n: _related_handoff_candidates(db, ctx["task_id"], ctx["pack_text"], n, ctx["rel_scope"]),
+            lambda h: (len(h["objective"]) + len(h["status"]) + len(h["from_agent"])
+                       + len(h["to_agent"]) + len(h["commit_ref"]) + len(h["created_at"])
+                       + len(h["task_id"]) + len(h["via_task_title"]) + 16)),
+        _PackSection("dep_context", "dep_context",
+            lambda db, ctx, n: _dep_context_candidates(db, ctx["task_id"], n),
+            _dep_context_cost),
+        _PackSection("related_sessions", "related_sessions",
+            lambda db, ctx, n: _related_session_candidates(db, ctx["task_id"], ctx["pack_text"], n, ctx["rel_scope"]),
+            lambda m: (len(m["content"]) + len(m["role"]) + len(m["at"])
+                       + len(m["source"]) + len(m["session_id"]) + 16)),
+        _PackSection("related_facts", "related_facts",
+            lambda db, ctx, n: _related_fact_candidates(db, ctx["task_id"], ctx["pack_text"], n),
+            lambda ft: (len(ft["id"]) + len(ft["subject"]) + len(ft["predicate"])
+                        + len(ft["object"]) + len(ft["valid_from"]) + len(ft["valid_until"])
+                        + len(ft["source"]) + 16)),
+        _PackSection("related_semantic", "related_semantic",
+            lambda db, ctx, n: _memory_candidates(db, ctx["task_id"], ctx["pack_text"],
+                                                  n, ctx["rel_scope"]),
+            lambda m: (len(m["id"]) + len(m["engine"]) + len(m["kind"]) + len(m["project"])
+                       + len(m["at"]) + sum(len(t) for t in m["tags"]) + len(m["content"]) + 16),
+            decorate=lambda r: {**r, "semantic": True}),
+    ]
+
+def _assemble_pack(db, task_id, budget, rel_limit, rel_scope, rerank=False,
+                   recency_half_life_hours=168.0, pinned_boost=0.5,
+                   section_limits=None):
+    """Spec-driven pack assembly shared by `_build_pack` and `_build_recall_pack`.
+
+    Sections come from `_pack_spec()`; each contributes at most
+    `section_limits[prefix]` candidates (default 0 = inactive = legacy shape).
     """
     budget = max(0, budget)
     rel_limit = max(0, rel_limit)
     rel_scope = rel_scope or "project"
+    section_limits = dict(section_limits or {})
     row = task_row(db, task_id)
     summary = {k: row[k] for k in ("id", "project", "title", "status", "priority", "next_action", "blocked_reason", "due_at")}
     pending = unsatisfied_deps(db, task_id)
@@ -1352,19 +1579,7 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
     retired = [r for r in rows if _note_retired(r, t)]
     if retired:
         rows = [r for r in rows if not _note_retired(r, t)]
-    related = _related_note_candidates(
-        db, task_id,
-        " ".join(filter(None, (row["title"], row["description"], row["next_action"]))),
-        rel_limit, rel_scope, rerank=rerank,
-        recency_half_life_hours=recency_half_life_hours, pinned_boost=pinned_boost)
     pack_text = " ".join(filter(None, (row["title"], row["description"], row["next_action"])))
-    related_handoffs = _related_handoff_candidates(
-        db, task_id, pack_text, max(0, rel_handoffs), rel_scope) if rel_handoffs > 0 else []
-    dep_ctx = _dep_context_candidates(db, task_id, max(0, dep_context)) if dep_context > 0 else []
-    rel_sessions_list = (_related_session_candidates(db, task_id, pack_text,
-                          max(0, rel_sessions), rel_scope) if rel_sessions > 0 else [])
-    rel_facts_list = (_related_fact_candidates(db, task_id, pack_text,
-                      max(0, rel_facts)) if rel_facts > 0 else [])
     hrow = _live_handoff(db, task_id)
     # Stable sort: pinned notes first, original (oldest→newest) order within groups.
     ordered = sorted(rows, key=lambda r: not r["pinned"])
@@ -1393,86 +1608,76 @@ def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
         packed.append(r); used += cost
         if r["pinned"]:
             pinned_packed += 1
-    related_packed = 0
-    for r in related:
-        r["related"] = True
-        cost = (len(r["content"]) + len(r["kind"]) + len(r["source"]) + len(r["created_at"])
-                + len(r["task_id"]) + len(r["via_task_title"]) + 16)
-        if used + cost > budget:
-            truncated = True
-            continue
-        packed.append(r); used += cost; related_packed += 1
-    rh_packed = []
-    for h in related_handoffs:
-        cost = (len(h["objective"]) + len(h["status"]) + len(h["from_agent"])
-                + len(h["to_agent"]) + len(h["commit_ref"]) + len(h["created_at"])
-                + len(h["task_id"]) + len(h["via_task_title"]) + 16)
-        if used + cost > budget:
-            truncated = True
-            continue
-        rh_packed.append(h); used += cost
-    dc_packed = []
-    for e in dep_ctx:
-        cost = _dep_context_cost(e)
-        if used + cost > budget:
-            truncated = True
-            continue
-        dc_packed.append(e); used += cost
-    rs_packed = []
-    for m in rel_sessions_list:
-        cost = (len(m["content"]) + len(m["role"]) + len(m["at"])
-                + len(m["source"]) + len(m["session_id"]) + 16)
-        if used + cost > budget:
-            truncated = True
-            continue
-        rs_packed.append(m); used += cost
-    rf_packed = []
-    for ft in rel_facts_list:
-        cost = (len(ft["id"]) + len(ft["subject"]) + len(ft["predicate"])
-                + len(ft["object"]) + len(ft["valid_from"]) + len(ft["valid_until"])
-                + len(ft["source"]) + 16)
-        if used + cost > budget:
-            truncated = True
-            continue
-        rf_packed.append(ft); used += cost
+    ctx = {"task_id": task_id, "pack_text": pack_text, "rel_scope": rel_scope,
+           "rerank": rerank, "recency_half_life_hours": recency_half_life_hours,
+           "pinned_boost": pinned_boost}
     out = {"task_id": task_id, "budget": budget, "used_chars": used,
             "truncated": truncated, "task": summary,
             "unsatisfied_dependencies": pending,
             "handoff": handoff if handoff_packed else None,
             "handoff_packed": handoff_packed,
-            "notes_total": len(rows), "notes_packed": len(packed) - related_packed,
+            "notes_total": len(rows), "notes_packed": len(packed),
             "notes_pinned_packed": pinned_packed,
-            "related_requested": rel_limit, "related_matched": len(related),
-            "related_packed": related_packed,
+            "related_requested": rel_limit, "related_matched": 0,
+            "related_packed": 0,
             "notes": packed}
+    for section in _pack_spec():
+        limit = section_limits.get(section.prefix, 0)
+        cand = _pack_section_rows(section, db, ctx, limit)
+        got, used, truncated = _pack_fit(cand, used, budget, truncated, section)
+        out["used_chars"] = used; out["truncated"] = truncated
+        if limit <= 0:
+            continue  # inactive section: legacy shape keeps no keys at all
+        key = section.keys
+        out[key] = got
+        out[f"{section.prefix}_requested"] = limit
+        out[f"{section.prefix}_matched"] = len(cand)
+        out[f"{section.prefix}_packed"] = len(got)
+        if key != "notes":
+            out[key] = got
+        else:
+            packed.extend(got)
+            out["notes"] = packed
+            out["related_matched"] = len(cand)
+            out["related_packed"] = len(got)
+            out["notes_packed"] = len(packed) - len(got)
     if retired:
         out["notes_expired_excluded"] = len(retired)
-    if rel_handoffs > 0:
-        out["related_handoffs_requested"] = max(0, rel_handoffs)
-        out["related_handoffs_matched"] = len(related_handoffs)
-        out["related_handoffs_packed"] = len(rh_packed)
-        out["related_handoffs"] = rh_packed
-    if dep_context > 0:
-        out["dep_context_requested"] = max(0, dep_context)
-        out["dep_context_matched"] = len(dep_ctx)
-        out["dep_context_packed"] = len(dc_packed)
-        out["dep_context"] = dc_packed
-    if rel_sessions > 0:
-        out["related_sessions_requested"] = max(0, rel_sessions)
-        out["related_sessions_matched"] = len(rel_sessions_list)
-        out["related_sessions_packed"] = len(rs_packed)
-        out["related_sessions"] = rs_packed
-    if rel_facts > 0:
-        out["related_facts_requested"] = max(0, rel_facts)
-        out["related_facts_matched"] = len(rel_facts_list)
-        out["related_facts_packed"] = len(rf_packed)
-        out["related_facts"] = rf_packed
     if rerank:
         # Reported only when enabled so packs built without rerank stay
         # byte-identical to the legacy shape (and digest-compatible).
         out["rerank"] = {"recency_half_life_hours": recency_half_life_hours,
                          "pinned_boost": pinned_boost}
     return out
+
+def _build_pack(db, task_id: str, budget: int, rel_limit: int, rel_scope: str,
+                rerank: bool = False, recency_half_life_hours: float = 168.0,
+                pinned_boost: float = 0.5, rel_handoffs: int = 0,
+                dep_context: int = 0, rel_sessions: int = 0, rel_facts: int = 0,
+                rel_semantic: int = 0) -> dict:
+    """Assemble the prompt-ready context bundle for a task within a char budget.
+
+    Thin wrapper over the spec-driven `_assemble_pack`: task summary header +
+    unsatisfied dependencies, then the live handoff, then live notes
+    pinned-first (oldest→newest within each group), then flag-gated sections
+    from `_pack_spec()` (related notes, handoffs, dep evidence, sessions,
+    facts). With rerank=True the related-note candidates are temporally
+    re-scored (see `_rerank_notes`) and the pack reports the rerank parameters
+    so recall digests stay exactly recomputable. Every flag-gated output key
+    is present only when that flag is used, so packs built without them stay
+    byte-identical (and digest-compatible) to the legacy shape.
+    """
+    return _assemble_pack(db, task_id, budget, rel_limit, rel_scope,
+                          rerank=rerank,
+                          recency_half_life_hours=recency_half_life_hours,
+                          pinned_boost=pinned_boost,
+                          section_limits={
+                              "related": rel_limit,
+                              "related_handoffs": rel_handoffs,
+                              "dep_context": dep_context,
+                              "related_sessions": rel_sessions,
+                              "related_facts": rel_facts,
+                              "related_semantic": rel_semantic})
 
 def task_context(args):
     """Pack a prompt-ready context bundle within a character budget.
@@ -1494,13 +1699,15 @@ def task_context(args):
                              pinned_boost=getattr(args, "pinned_boost", 0.5),
                              rel_handoffs=getattr(args, "related_handoffs", 0),
                              dep_context=getattr(args, "dep_context", 0),
-                                      rel_sessions=getattr(args, "related_sessions", 0),
-                             rel_facts=getattr(args, "related_facts", 0)))
+                             rel_sessions=getattr(args, "related_sessions", 0),
+                             rel_facts=getattr(args, "related_facts", 0),
+                             rel_semantic=getattr(args, "related_semantic", 0)))
 
 def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: int, rel_scope: str,
                          rerank: bool = False, recency_half_life_hours: float = 168.0,
                          pinned_boost: float = 0.5, rel_handoffs: int = 0,
-                         dep_context: int = 0, rel_sessions: int = 0, rel_facts: int = 0) -> dict:
+                         dep_context: int = 0, rel_sessions: int = 0, rel_facts: int = 0,
+                         rel_semantic: int = 0) -> dict:
     """Assemble the recall bundle and its deterministic digest (no audit write).
 
     Shared by `recall` (which audits the digest) and `recall-verify` (which
@@ -1513,7 +1720,7 @@ def _build_recall_bundle(db, task_id: str, agent: str, budget: int, rel_limit: i
                        rerank=rerank, recency_half_life_hours=recency_half_life_hours,
                        pinned_boost=pinned_boost, rel_handoffs=rel_handoffs,
                        dep_context=dep_context, rel_sessions=rel_sessions,
-                       rel_facts=rel_facts)
+                       rel_facts=rel_facts, rel_semantic=rel_semantic)
     lease_live = bool(row["lease_owner"]) and row["lease_expires_at"] > t
     bundle = {
         **pack,
@@ -1587,6 +1794,8 @@ def _bundle_sections(bundle: dict) -> dict:
             f"{x['session_id']}:{x['seq']}" for x in bundle["related_sessions"]]
     if "related_facts" in bundle:
         sections["related_facts"] = [x["id"] for x in bundle["related_facts"]]
+    if "related_semantic" in bundle:
+        sections["related_semantic"] = [x["id"] for x in bundle["related_semantic"]]
     return sections
 
 def _diff_sections(old: dict, new: dict) -> dict:
@@ -1634,6 +1843,9 @@ def _diff_sections(old: dict, new: dict) -> dict:
     orf, nrf = set(old.get("related_facts") or []), set(new.get("related_facts") or [])
     if orf != nrf:
         changes["related_facts"] = {"added": sorted(nrf - orf), "removed": sorted(orf - nrf)}
+    osem, nsem = set(old.get("related_semantic") or []), set(new.get("related_semantic") or [])
+    if osem != nsem:
+        changes["related_semantic"] = {"added": sorted(nsem - osem), "removed": sorted(osem - nsem)}
     if old["lease"] != new["lease"]:
         changes["lease"] = {"from": old["lease"], "to": new["lease"]}
     orec, nrec = set(old["receipts"]), set(new["receipts"])
@@ -1663,7 +1875,8 @@ def recall(args):
                                       rel_handoffs=getattr(args, "related_handoffs", 0),
                                       dep_context=getattr(args, "dep_context", 0),
                                       rel_sessions=getattr(args, "related_sessions", 0),
-                                      rel_facts=getattr(args, "related_facts", 0))
+                                      rel_facts=getattr(args, "related_facts", 0),
+                                      rel_semantic=getattr(args, "related_semantic", 0))
         # Record the bundle parameters alongside the digest so fleet sweeps
         # (ops.py recall-stale) can recompute the digest exactly as recalled.
         audit(db, "task", args.task_id, "context_recalled",
@@ -1678,6 +1891,7 @@ def recall(args):
                "dep_context": getattr(args, "dep_context", 0),
                 "related_sessions": getattr(args, "related_sessions", 0),
                "related_facts": getattr(args, "related_facts", 0),
+               "related_semantic": getattr(args, "related_semantic", 0),
                "sections": _bundle_sections(bundle)})
     json_out(bundle)
 
@@ -1706,7 +1920,8 @@ def recall_verify(args):
                                       rel_handoffs=getattr(args, "related_handoffs", 0),
                                       dep_context=getattr(args, "dep_context", 0),
                                       rel_sessions=getattr(args, "related_sessions", 0),
-                                      rel_facts=getattr(args, "related_facts", 0))
+                                      rel_facts=getattr(args, "related_facts", 0),
+                                      rel_semantic=getattr(args, "related_semantic", 0))
     json_out({"ok": True, "task_id": args.task_id,
               "fresh": bundle["digest"] == digest,
               "recalled_digest": digest, "current_digest": bundle["digest"]})
@@ -1760,6 +1975,7 @@ def recall_diff(args):
         # digest exactly.
         rel_sess_n = payload.get("related_sessions") or 0
         rel_facts_n = payload.get("related_facts") or 0
+        rel_sema_n = payload.get("related_semantic") or 0
         rerank = bool(payload.get("rerank"))
         half_life = payload.get("recency_half_life_hours")
         boost = payload.get("pinned_boost")
@@ -1775,7 +1991,8 @@ def recall_diff(args):
                                       rel_handoffs=rel_handoffs,
                                       dep_context=dep_ctx_n,
                                       rel_sessions=rel_sess_n,
-                                      rel_facts=rel_facts_n)
+                                      rel_facts=rel_facts_n,
+                                      rel_semantic=rel_sema_n)
         fresh = bundle["digest"] == digest
         out["current_digest"] = bundle["digest"]
         out["fresh"] = fresh
@@ -1848,7 +2065,8 @@ def resume(args):
                                       rel_handoffs=getattr(args, "related_handoffs", 0),
                                       dep_context=getattr(args, "dep_context", 0),
                                       rel_sessions=getattr(args, "related_sessions", 0),
-                                      rel_facts=getattr(args, "related_facts", 0))
+                                      rel_facts=getattr(args, "related_facts", 0),
+                                      rel_semantic=getattr(args, "related_semantic", 0))
         # session_resumed doubles as recall provenance: the digest is recorded
         # with its bundle parameters so a handoff citing a resume digest passes
         # the handoff-check lint and fleet sweeps can recompute it exactly.
@@ -1864,6 +2082,7 @@ def resume(args):
                "dep_context": getattr(args, "dep_context", 0),
                 "related_sessions": getattr(args, "related_sessions", 0),
                "related_facts": getattr(args, "related_facts", 0),
+               "related_semantic": getattr(args, "related_semantic", 0),
                "sections": _bundle_sections(bundle)})
     json_out({"ok": True, "task_id": args.task_id, "action": action, **bundle})
 
@@ -2596,6 +2815,239 @@ def _related_session_candidates(db, task_id: str, text: str, limit: int, scope: 
         rows.append(d)
     return rows
 
+# ---------------------------------------------------------------------------
+# Semantic memory: the local, non-model fact-retrieval engine.
+#
+# This replaces the former Hindsight adapter (an out-of-band bank.jsonl plus a
+# provider HTTP service). Memories now live in the `memories` table of the
+# control-plane database and are retrieved by SQLite FTS5 -- deterministic
+# token matching, no embeddings, no model, no network call, nothing outside
+# this process. That removes an entire class of failure the file/service
+# design invited: cross-context bleed from a shared external bank, torn JSONL
+# lines, retains that landed on disk but not in the audit chain, and sealed
+# pack digests silently invalidated by an out-of-band file edit.
+#
+# Recall is strictly read-only and ordered (created_at DESC, id ASC) so pack
+# digests are exactly recomputable, and -- like related facts and handoffs --
+# it deliberately emits no relevance score: BM25 drifts whenever any row joins
+# the index, which would falsely stale sealed digests.
+# ---------------------------------------------------------------------------
+MEMORY_ENGINE_TAG = "memory-fts-v1"
+
+# Memory kinds that must never be consolidation candidates. Consolidation
+# merges a cluster on the premise that it is one fact restated several ways
+# and that collapsing it loses nothing. Git-derived memories break that
+# premise: two PRs merged the same afternoon with near-identical titles are
+# two events, not one fact, and merging them deletes an event that a build log
+# is supposed to report. Measured on the live store, 14 of 25 clusters at
+# threshold 0.92 were pure commit/PR groups -- e.g. PRs #220, #221 and #224,
+# three distinct releases, clustered as though they were one. Excluded by
+# default; `--include-git` opts back in for a deliberate cleanup.
+CONSOLIDATE_UNMERGEABLE_KINDS = ("commit", "pull_request")
+
+# ---------------------------------------------------------------------------
+# Optional semantic layer (embeddings)
+#
+# FTS5 above is the *retrieval* engine and stays that way: it is deterministic,
+# in-process, sub-millisecond, and digest-stable, which is what a sealed
+# context pack requires. Embeddings answer a different question -- "what is
+# about the same thing", where FTS can only answer "what shares these words" --
+# and they answer it at a cost that forbids them from the same path: loading
+# the model takes ~6 seconds, against a ~95 ms end-to-end `recall`.
+#
+# So the layer is strictly additive and strictly off the critical path.
+# `related_semantic` in a pack is still FTS5, byte-identical to before. The
+# embedding surfaces (`memory-embed`, `memory-search`) are separate commands
+# for callers that already live inside a long-running session -- the
+# consolidation cron, the writer agent -- where six seconds is free.
+#
+# Availability is a note, never a problem. On a machine with no worker,
+# `memory-search` reports `available: false` with a reason and exits clean;
+# nothing that depends on autopilot's core loop can be broken by the absence of
+# an optional model. Nothing here installs, downloads, or reaches the network:
+# the worker forces HF_HUB_OFFLINE, and a missing model cache surfaces as
+# `model_unavailable` rather than a silent multi-hundred-megabyte fetch.
+# ---------------------------------------------------------------------------
+EMBED_MODEL = os.environ.get("AUTOPILOT_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+EMBED_WORKER = Path(__file__).resolve().parent / "embed_worker.py"
+EMBED_DIM = 384
+# Model load dominates; a cold first call on a busy machine can take tens of
+# seconds, while a hung worker must never wedge a cron job forever.
+EMBED_TIMEOUT = int(os.environ.get("AUTOPILOT_EMBED_TIMEOUT", "180"))
+EMBED_BATCH = 256
+
+class EmbedUnavailable(Exception):
+    """The optional embedding worker could not run. Callers degrade, not fail."""
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(reason)
+        self.reason, self.detail = reason, detail
+
+def _embed_python() -> str:
+    """Interpreter that can import sentence-transformers, or "" if none.
+
+    Explicit override first, then the virtualenv the retired Hindsight service
+    left behind -- reusing it is deliberate: it already carries the exact torch
+    and model cache this needs, so enabling semantic memory installs nothing.
+    Last resort is the current interpreter, which covers a machine where the
+    dependency happens to be importable directly.
+    """
+    override = os.environ.get("AUTOPILOT_EMBED_PYTHON", "").strip()
+    if override:
+        return override if Path(override).exists() else ""
+    venv = Path.home() / ".hermes" / "hindsight" / ".venv" / "bin" / "python"
+    if venv.exists():
+        return str(venv)
+    try:
+        import sentence_transformers  # noqa: F401
+        return sys.executable
+    except Exception:
+        return ""
+
+def _embed_call(payload: dict) -> dict:
+    """One request/response round trip with the out-of-process worker.
+
+    Every failure mode -- no interpreter, no worker file, crash, timeout,
+    unparseable output, {"ok": false} -- converges on EmbedUnavailable with a
+    machine-readable reason, so callers have exactly one thing to handle.
+    """
+    py = _embed_python()
+    if not py:
+        raise EmbedUnavailable("no_interpreter",
+                               "set AUTOPILOT_EMBED_PYTHON to a python with "
+                               "sentence-transformers installed")
+    if not EMBED_WORKER.exists():
+        raise EmbedUnavailable("no_worker", str(EMBED_WORKER))
+    env = os.environ.copy()
+    env["HF_HUB_OFFLINE"] = "1"          # belt and braces: the worker sets these
+    env["TRANSFORMERS_OFFLINE"] = "1"    # too, but never trust one layer alone
+    try:
+        proc = subprocess.run([py, str(EMBED_WORKER)],
+                              input=json.dumps({"model": EMBED_MODEL, **payload}),
+                              text=True, capture_output=True,
+                              timeout=EMBED_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        raise EmbedUnavailable("timeout", f"worker exceeded {EMBED_TIMEOUT}s")
+    except OSError as exc:
+        raise EmbedUnavailable("spawn_failed", str(exc))
+    if proc.returncode != 0:
+        raise EmbedUnavailable("worker_failed",
+                               (proc.stderr or proc.stdout or "").strip()[:500])
+    try:
+        out = json.loads(proc.stdout or "{}")
+    except ValueError:
+        raise EmbedUnavailable("bad_output", (proc.stdout or "")[:500])
+    if not out.get("ok"):
+        raise EmbedUnavailable(out.get("reason") or "unknown",
+                               out.get("detail") or "")
+    return out
+
+def _embed_texts(texts: list) -> list:
+    """Embed texts to L2-normalised float32 blobs, in worker-sized batches.
+
+    Batching bounds the pipe payload and the worker's resident memory; the
+    model is loaded once per batch, which is why the batch is large.
+    """
+    blobs = []
+    for start in range(0, len(texts), EMBED_BATCH):
+        chunk = texts[start:start + EMBED_BATCH]
+        out = _embed_call({"mode": "embed", "texts": chunk})
+        vecs = out.get("vectors") or []
+        if len(vecs) != len(chunk):
+            raise EmbedUnavailable("short_response",
+                                   f"asked {len(chunk)}, got {len(vecs)}")
+        blobs.extend(base64.b64decode(v) for v in vecs)
+    return blobs
+
+def _embed_probe() -> dict:
+    """Availability as data: never raises, so status surfaces stay green."""
+    py = _embed_python()
+    try:
+        out = _embed_call({"mode": "probe"})
+    except EmbedUnavailable as exc:
+        return {"available": False, "reason": exc.reason, "detail": exc.detail,
+                "python": py, "model": EMBED_MODEL}
+    return {"available": True, "python": py, "model": EMBED_MODEL,
+            "dim": int(out.get("dim") or 0)}
+MEMORY_SNIPPET_CHARS = 400
+MEMORY_KINDS = ("decision", "fact", "constraint", "memory")
+
+def _memory_id(text: str, project: str) -> str:
+    """Content-addressed memory id: identical text in a project is one memory.
+
+    The former engine hashed timestamp+text, so two retains in the same second
+    collided while the same fact retained twice a day apart forked into
+    duplicates. Addressing by content makes re-retain idempotent instead.
+    """
+    return "mem-" + hashlib.sha256(
+        f"{project}\x00{text}".encode()).hexdigest()[:16]
+
+def _memory_snippet(text: str) -> str:
+    return (text[:MEMORY_SNIPPET_CHARS - 1] + "\u2026"
+            if len(text) > MEMORY_SNIPPET_CHARS else text)
+
+def _memory_tags(raw) -> list:
+    """Tags are stored as a JSON array; a malformed value degrades to []."""
+    if isinstance(raw, list):
+        return sorted(str(t) for t in raw if str(t))
+    try:
+        parsed = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    return sorted(str(t) for t in parsed if str(t)) if isinstance(parsed, list) else []
+
+def _memory_candidates(db, task_id: str, text: str, limit: int, scope: str) -> list:
+    """Semantic memories matching this task's text, newest first.
+
+    Same shape discipline as the session/fact collectors: empty when the flag
+    is unset or the task text carries no usable tokens (the graceful-empty
+    path -- never an error). Superseded memories are never candidates: a pack
+    must carry what is believed *now*.
+
+    Scope is enforced, not merely attempted. The former engine fell back to
+    unscoped results whenever the project filter matched nothing, which is
+    precisely how another project's context leaked into a pack; here a
+    project-scoped recall that matches nothing returns nothing.
+    """
+    if limit <= 0 or not text.strip():
+        return []
+    toks = _search_tokens(text, fold_case=True, min_len=2, drop_stopwords=True)
+    if not toks:
+        return []
+    cols = ("SELECT m.id,m.text,m.kind,m.project,m.source,m.tags,m.created_at")
+    where, vals = [], []
+    if _memories_fts_ready(db):
+        src = (" FROM memories_fts x JOIN memories m ON m.rowid=x.rowid "
+               "WHERE memories_fts MATCH ?")
+        vals.append(" OR ".join('"%s"' % t for t in toks))
+    else:
+        src = " FROM memories m WHERE (" + " OR ".join(
+            "(m.text LIKE ? OR m.kind LIKE ? OR m.project LIKE ? OR m.tags LIKE ?)"
+            for _ in toks) + ")"
+        vals.extend(v for t in toks for v in ("%" + t + "%",) * 4)
+    where.append("m.superseded_by=''")
+    if scope != "global":
+        try:
+            row = db.execute("SELECT project FROM tasks WHERE id=?",
+                             (task_id,)).fetchone()
+        except sqlite3.Error:
+            row = None
+        proj = row["project"] if row else ""
+        where.append("(m.project='' OR m.project=?)")
+        vals.append(proj)
+    sql = (cols + src + " AND " + " AND ".join(where)
+           + " ORDER BY m.created_at DESC, m.id ASC LIMIT ?")
+    vals.append(limit)
+    out = []
+    for r in db.execute(sql, vals).fetchall():
+        out.append({"id": r["id"],
+                    "engine": MEMORY_ENGINE_TAG,
+                    "kind": r["kind"] or "memory",
+                    "project": r["project"] or "",
+                    "at": r["created_at"] or "",
+                    "tags": _memory_tags(r["tags"]),
+                    "content": _memory_snippet(r["text"] or "")})
+    return out
+
 def release(args):
     """Voluntarily give up a live lease without consuming retry budget."""
     with conn() as db:
@@ -2792,6 +3244,252 @@ def _seam_message(conflicts: list) -> str:
     detail = "; ".join(f"{c['task_id']} holds {c['seam']} {c['value']!r} (owner {c['owner']})"
                        for c in conflicts)
     return f"seam conflict: {detail}; complete/release the holder first or pass --force"
+
+# Autonomy vocabulary: L0 observe/report, L1 bounded execute under human
+# seams, L2 unattended continuation. An empty level means a legacy task with
+# no autonomy semantics — every guard is inert for it.
+AUTONOMY_LEVELS = {"L0": 0, "L1": 1, "L2": 2}
+_MODEL_BINDING_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
+
+# Self-improvement loop vocabularies: closed sets, validated fail-closed so
+# every harness writes the same shapes and no free-text state can drift.
+FAILURE_CAUSES = {"transient", "infra", "defect"}
+PROGRESS_STATES = {"working", "blocked", "waiting_human", "done"}
+RUN_OUTCOMES = {"ran", "passed", "failed"}
+RUNNER_SCHEMA_VERSION = "runner/v1"
+MAX_CORRECTION_ATTEMPTS = 3
+
+def _valid_failure_cause(cause: str) -> str:
+    c = (cause or "").strip().lower()
+    if not c:
+        return ""
+    if c not in FAILURE_CAUSES:
+        raise SystemExit(f"invalid failure cause: {cause!r} (one of {sorted(FAILURE_CAUSES)})")
+    return c
+
+def _parse_stall_deadline(value: str) -> str:
+    """Absolute ISO deadline or relative +Nm/+Nh from now."""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    m = re.fullmatch(r"\+(\d+)([mh])", v)
+    if m:
+        n = int(m.group(1))
+        if n <= 0:
+            raise SystemExit("--stall-deadline relative offset must be > 0")
+        delta = timedelta(minutes=n) if m.group(2) == "m" else timedelta(hours=n)
+        return (datetime.now(timezone.utc) + delta).replace(microsecond=0).isoformat()
+    try:
+        dt = datetime.fromisoformat(v)
+    except ValueError:
+        raise SystemExit(f"invalid stall deadline: {value!r} (ISO timestamp or +N m/h)")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+def _correction_root_fact(db, task_id: str):
+    row = db.execute(
+        "SELECT object FROM facts WHERE task_id=? AND predicate='correction-root' "
+        "AND valid_until='' ORDER BY created_at DESC LIMIT 1", (task_id,)).fetchone()
+    return row["object"] if row else ""
+
+def _correction_attempts(db, root_id: str) -> int:
+    """Attempts consumed by a correction family: the original failure counts as 1,
+    every spawned child adds one."""
+    own = db.execute(
+        "SELECT COUNT(*) n FROM facts WHERE predicate='correction-root' AND object=?",
+        (root_id,)).fetchone()["n"]
+    return 1 + own
+
+def _mirror_autonomy_grants(db, parent_id: str, child_id: str) -> list:
+    """Copy the parent's currently-live grant facts onto the child's subject.
+
+    Copy, never mint: source stays the named human granter and the validity
+    window is byte-identical, so the child can claim only while Leo's original
+    window for this work is still open. Returns the mirrored fact ids.
+    """
+    t = now()
+    grants = db.execute(
+        "SELECT * FROM facts WHERE subject=? AND predicate='level-granted' AND "
+        + _fact_live_sql() + " ORDER BY created_at", (_autonomy_grant_subject(parent_id), t)).fetchall()
+    mirrored = []
+    for g in grants:
+        fid = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO facts(id,subject,predicate,object,source,task_id,valid_from,valid_until,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (fid, _autonomy_grant_subject(child_id), "level-granted", g["object"],
+             g["source"], "", g["valid_from"], g["valid_until"], t))
+        audit(db, "fact", fid, "autonomy_grant_inherited",
+              {"parent_task_id": parent_id, "child_task_id": child_id,
+               "level": g["object"], "source_fact_id": g["id"],
+               "granted_by": g["source"], "valid_until": g["valid_until"]})
+        mirrored.append(fid)
+    return mirrored
+
+def _create_correction_child(db, parent_row, reason: str, owner: str, run_receipts: list) -> dict:
+    """Bounded next-safe-correction planning from durable evidence.
+
+    The child carries the whole failure story in data — reason, attempt count,
+    prior recap, run receipts — plus lineage facts (`correction-of`,
+    `correction-root`) so any harness can reconstruct the chain. Refuses past
+    MAX_CORRECTION_ATTEMPTS per family with an audited refusal instead of
+    recursing forever. Grant inheritance is copy-not-mint (see
+    _mirror_autonomy_grants); without a live parent grant the child simply
+    waits at the existing dispatch seam.
+    """
+    parent_id = parent_row["id"]
+    root = _correction_root_fact(db, parent_id) or parent_id
+    attempts = _correction_attempts(db, root)
+    if attempts >= MAX_CORRECTION_ATTEMPTS:
+        audit(db, "task", parent_id, "correction_refused_max_attempts",
+              {"owner": owner, "reason": reason, "family_root": root,
+               "attempts_used": attempts, "max_attempts": MAX_CORRECTION_ATTEMPTS})
+        return {"spawned": False, "refused": "max_attempts",
+                "family_root": root, "attempts_used": attempts}
+    seq = db.execute(
+        "SELECT COUNT(*) n FROM facts WHERE predicate='correction-of' AND object=?",
+        (parent_id,)).fetchone()["n"] + 1
+    child_id = f"correct-{parent_id}-{seq}"
+    tags = sorted(set(_task_tags(parent_row)) | {"correction"})
+    t = now()
+    desc = (
+        f"Correction {attempts} of {MAX_CORRECTION_ATTEMPTS - 1} for failed task {parent_id}: "
+        f"{parent_row['title']}\n"
+        f"failure_reason: {reason}\n"
+        f"failure_cause: defect\n"
+        f"prior_attempts: {attempts}\n"
+        f"run_receipts: {json.dumps(run_receipts)}\n"
+        + (f"parent_recap: {parent_row['recap']}\n" if parent_row["recap"] else "")
+        + (f"parent_next_action: {parent_row['next_action']}\n" if parent_row["next_action"] else ""))
+    db.execute(
+        "INSERT INTO tasks(id,project,title,description,owner,status,priority,tags,"
+        "requires_receipts,autonomy_level,model_binding,failure_cause,created_at,updated_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (child_id, parent_row["project"], f"Correction {attempts}: {parent_row['title']}",
+         desc, parent_row["owner"] or owner, "queued", parent_row["priority"],
+         json.dumps(tags), parent_row["requires_receipts"], parent_row["autonomy_level"],
+         parent_row["model_binding"], "defect", t, t))
+    for kind, obj in (("correction-of", parent_id), ("correction-root", root)):
+        fid = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO facts(id,subject,predicate,object,source,task_id,valid_from,valid_until,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (fid, f"task:{child_id}", kind, obj, "self-improvement-loop", child_id, t, "", t))
+        audit(db, "fact", fid, "correction_lineage",
+              {"child_task_id": child_id, "predicate": kind, "object": obj})
+    mirrored = []
+    if parent_row["autonomy_level"]:
+        mirrored = _mirror_autonomy_grants(db, parent_id, child_id)
+    audit(db, "task", parent_id, "correction_spawned",
+          {"owner": owner, "child_task_id": child_id, "attempt": attempts,
+           "reason": reason, "run_receipts": run_receipts,
+           "inherited_grant_fact_ids": mirrored})
+    return {"spawned": True, "child_task_id": child_id, "attempt": attempts,
+            "family_root": root, "inherited_grants": len(mirrored)}
+
+
+def _autonomy_rank(level: str) -> int:
+    return AUTONOMY_LEVELS.get(level, -1)
+
+def _valid_model_binding(value: str) -> str:
+    """Validate a model binding: provider/model token, no whitespace or quotes."""
+    v = (value or "").strip()
+    if not _MODEL_BINDING_RE.fullmatch(v):
+        raise SystemExit(f"invalid model binding: {value!r} (provider/model token, max 128 chars)")
+    return v
+
+def _autonomy_grant_subject(task_id: str) -> str:
+    return f"autonomy:{task_id}"
+
+def _live_autonomy_grant(db, task_id: str):
+    """The strongest currently-live grant fact for a task, or None.
+
+    Grants are temporal facts (`level-granted`) with validity windows, so an
+    expired grant simply stops being live — expiry is enforced by the same
+    liveness rule as every other fact, never by a sweep.
+    """
+    t = now()
+    rows = db.execute(
+        "SELECT * FROM facts WHERE subject=? AND predicate='level-granted' AND "
+        + _fact_live_sql() + " ORDER BY created_at", (_autonomy_grant_subject(task_id), t)).fetchall()
+    best = None
+    for r in rows:
+        if _autonomy_rank(r["object"]) < 0:
+            continue
+        if best is None or _autonomy_rank(r["object"]) >= _autonomy_rank(best["object"]):
+            best = r
+    return best
+
+def _check_autonomy_grant(db, row, owner: str, force: bool) -> dict:
+    """Claim-time autonomy gate. Returns an override record when --force
+    bypasses a failed check; raises SystemExit (after auditing the refusal
+    on its own connection) otherwise."""
+    if not row["autonomy_level"]:
+        return {}
+    grant = _live_autonomy_grant(db, row["id"])
+    reason = ""
+    if grant is None:
+        reason = "no_live_grant"
+    elif _autonomy_rank(grant["object"]) < _autonomy_rank(row["autonomy_level"]):
+        reason = "grant_below_declared_level"
+    if not reason:
+        return {}
+    detail = {"reason": reason, "declared_level": row["autonomy_level"],
+              **({"grant_level": grant["object"], "grant_fact_id": grant["id"]} if grant else {})}
+    if force:
+        return {"autonomy_override": detail}
+    _audit_claim_refusal(row["id"], owner, "claim_refused_autonomy", detail)
+    if reason == "no_live_grant":
+        raise SystemExit(
+            f"task declares autonomy {row['autonomy_level']} but no live autonomy "
+            f"grant exists; have a human re-run `declare` or pass --force")
+    raise SystemExit(
+        f"task declares autonomy {row['autonomy_level']} but the live grant is only "
+        f"{grant['object']}; re-declare at the granted level or pass --force")
+
+def declare(args):
+    """Stamp autonomy metadata on a task: level, exact model binding, grant fact.
+
+    Leo's grant is data, not chat: `--granted-by` names the human who explicitly
+    authorized this autonomy level for this task, and the authorization lives as
+    a temporal fact with a validity window (`--grant-hours`, default 24), so it
+    expires by itself and claim-time enforcement refuses work whose grant lapsed.
+    Re-declaring inserts a fresh windowed grant row; history is never rewritten.
+    Audited once as `autonomy_declared`.
+    """
+    level = args.autonomy_level
+    model = _valid_model_binding(args.model)
+    granter = (args.granted_by or "").strip()
+    if not granter:
+        raise SystemExit("--granted-by is required: autonomy is granted by a named human")
+    hours = getattr(args, "grant_hours", 24)
+    if hours <= 0:
+        raise SystemExit("--grant-hours must be > 0")
+    t = now()
+    valid_until = _expires_at(_ttl_hours(hours))
+    with conn() as db:
+        row = task_row(db, args.id)
+        if row["status"] in TERMINAL_STATUSES:
+            raise SystemExit(f"cannot declare autonomy on terminal task: {row['status']}")
+        fid = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO facts(id,subject,predicate,object,source,task_id,valid_from,valid_until,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (fid, _autonomy_grant_subject(args.id), "level-granted", level, granter,
+             "", t, valid_until, t))
+        audit(db, "fact", fid, "autonomy_granted",
+              {"task_id": args.id, "level": level, "granted_by": granter,
+               "model_binding": model, "valid_until": valid_until})
+        db.execute("UPDATE tasks SET autonomy_level=?,model_binding=?,updated_at=? WHERE id=?",
+                   (level, model, t, args.id))
+        audit(db, "task", args.id, "autonomy_declared",
+              {"autonomy_level": level, "model_binding": model, "granted_by": granter,
+               "grant_fact_id": fid, "grant_valid_until": valid_until})
+        out = _task_view(task_row(db, args.id))
+    out["grant"] = {"fact_id": fid, "level": level, "granted_by": granter,
+                    "valid_until": valid_until}
+    json_out(out)
 
 def _audit_claim_refusal(task_id: str, owner: str, action: str, detail: dict) -> None:
     """Record a claim refusal in the audit chain on its own connection.
@@ -3016,13 +3714,20 @@ def complete(args):
                 "definition of done unmet: missing required receipt kind(s): "
                 + ", ".join(missing_evidence))
         t = now()
+        # Recap metadata: durable "where this leaves off" prose stamped beside
+        # the completion's evidence (bounded; never a substitute for receipts).
+        recap = (getattr(args, "recap", "") or "").strip()
+        if len(recap) > 2000:
+            raise SystemExit("--recap must be at most 2000 characters")
         # Guarded mutation: the completion only lands while the lease is exactly
         # as checked above. A lease that expired and was re-acquired (or
         # transferred) between the row read and this write must not be clobbered
         # by a stale holder — the rowcount guard turns that race into a refusal.
         cur = db.execute(
-            "UPDATE tasks SET status='completed',lease_owner='',lease_expires_at='',blocked_reason='',updated_at=? "
-            "WHERE id=? AND lease_owner=? AND lease_expires_at>?", (t, args.id, args.owner, t))
+            "UPDATE tasks SET status='completed',lease_owner='',lease_expires_at='',blocked_reason='',"
+            + ("recap=?," if recap else "") + "updated_at=? "
+            "WHERE id=? AND lease_owner=? AND lease_expires_at>?",
+            (([recap] if recap else []) + [t, args.id, args.owner, t]))
         if cur.rowcount != 1:
             raise SystemExit("lease changed since check; reclaim before completing")
         # Downstream feedback: which queued dependents just became dispatchable.
@@ -3031,6 +3736,7 @@ def complete(args):
         audit(db, "task", args.id, "completed", {"owner": args.owner, "note": args.note,
                                                  "recall_digest": recall_digest or None,
                                                  "newly_unblocked": newly,
+                                                 **({"recap": recap} if recap else {}),
                                                  **({"evidence_receipts": evidence} if evidence else {})})
         out = _task_view(task_row(db, args.id))
         out["newly_unblocked"] = newly
@@ -3079,6 +3785,16 @@ def fail(args):
       `failed` with the reason preserved in blocked_reason, and direct queued
       dependents are reported as dependents_stranded so the operator sees what
       the permanent failure froze.
+    - With the budget exhausted (or --no-retry) the task goes terminally
+      `failed` with the reason preserved in blocked_reason, and direct queued
+      dependents are reported as dependents_stranded so the operator sees what
+      the permanent failure froze.
+    - `--cause` classifies the failure (transient | infra | defect; default
+      empty = legacy) and selects the continuation strategy deterministically:
+      transient keeps the standard backoff; infra doubles the backoff base
+      (the environment is broken — back off harder); defect plans one bounded
+      correction child on the terminal path when the task's autonomy grant
+      permits it (see _create_correction_child).
     - Audited as `task_failed` (retry scheduled) or `task_failed_terminal`;
       metrics reports failures_retried_total / failures_terminal_total.
     """
@@ -3086,6 +3802,10 @@ def fail(args):
         raise SystemExit("--max-retries must be >= 0")
     if args.backoff_cap < args.backoff_base:
         raise SystemExit("--backoff-cap must be >= --backoff-base")
+    cause = _valid_failure_cause(getattr(args, "cause", ""))
+    if cause == "infra" and args.backoff_base > 0:
+        args.backoff_base *= 2
+        args.backoff_cap = max(args.backoff_cap, args.backoff_base)
     with conn() as db:
         row = task_row(db, args.id)
         if row["status"] in TERMINAL_STATUSES:
@@ -3099,14 +3819,15 @@ def fail(args):
             ra = _backoff_deadline(new_retry, args.backoff_base, args.backoff_cap)
             cur = db.execute(
                 "UPDATE tasks SET status='queued',lease_owner='',lease_expires_at='',"
-                "blocked_reason=?,retry_count=?,recover_after=?,updated_at=? "
+                "blocked_reason=?,retry_count=?,recover_after=?,failure_cause=?,updated_at=? "
                 "WHERE id=? AND lease_owner=? AND lease_expires_at>?",
-                (reason, new_retry, ra, t, args.id, args.owner, t))
+                (reason, new_retry, ra, cause, t, args.id, args.owner, t))
             if cur.rowcount != 1:
                 raise SystemExit("lease changed since check; reclaim before failing")
             audit(db, "task", args.id, "task_failed",
                   {"owner": args.owner, "reason": reason, "retry_count": new_retry,
-                   "recover_after": ra or None, "max_retries": args.max_retries})
+                   "recover_after": ra or None, "max_retries": args.max_retries,
+                   **({"cause": cause} if cause else {})})
             out = _task_view(task_row(db, args.id))
             out["outcome"] = "retry_scheduled"
             out["recover_after"] = ra
@@ -3116,17 +3837,29 @@ def fail(args):
                               if d["status"] not in TERMINAL_STATUSES)
             cur = db.execute(
                 "UPDATE tasks SET status='failed',lease_owner='',lease_expires_at='',"
-                "blocked_reason=?,retry_count=?,recover_after='',updated_at=? "
+                "blocked_reason=?,retry_count=?,recover_after='',failure_cause=?,updated_at=? "
                 "WHERE id=? AND lease_owner=? AND lease_expires_at>?",
-                (reason, new_retry, t, args.id, args.owner, t))
+                (reason, new_retry, cause, t, args.id, args.owner, t))
             if cur.rowcount != 1:
                 raise SystemExit("lease changed since check; reclaim before failing")
             audit(db, "task", args.id, "task_failed_terminal",
                   {"owner": args.owner, "reason": reason, "retry_count": new_retry,
-                   "no_retry": bool(args.no_retry), "dependents_stranded": stranded})
+                   "no_retry": bool(args.no_retry), "dependents_stranded": stranded,
+                   **({"cause": cause} if cause else {})})
             out = _task_view(task_row(db, args.id))
             out["outcome"] = "failed_terminal"
             out["dependents_stranded"] = stranded
+            if cause == "defect" and \
+                    _autonomy_rank(task_row(db, args.id)["autonomy_level"] or "") >= _autonomy_rank("L1"):
+                # Correction planning is an autonomy feature: only tasks whose
+                # human explicitly declared L1+ continue themselves. A lapsed
+                # grant still plans the child, but the child inherits nothing
+                # live and waits at the existing dispatch seam.
+                run_rids = [r["id"] for r in db.execute(
+                    "SELECT id FROM receipts WHERE task_id=? AND kind='run' ORDER BY created_at",
+                    (args.id,)).fetchall()]
+                out["correction"] = _create_correction_child(
+                    db, task_row(db, args.id), reason, args.owner, run_rids)
         json_out(out)
 
 def block(args):
@@ -3536,6 +4269,10 @@ def claim(args):
                     raise SystemExit(
                         f"project policy caps owner '{args.owner}' at {cap} live leases in "
                         f"{row['project']} (held: {', '.join(held)}); complete/release first or pass --force")
+        # Autonomy gate: a task with a declared autonomy level executes only
+        # under a live human grant of at least that level. --force is the
+        # deliberate override; the override is recorded in the claimed event.
+        autonomy_override = _check_autonomy_grant(db, row, args.owner, getattr(args, "force", False))
         # Atomic acquire: the WHERE guard makes the lease check-and-set a single
         # statement so concurrent claimers cannot both win the same lease.
         acquired, exp, epoch = _acquire(db, args.id, args.owner, args.minutes, resolve_max_active(args))
@@ -3543,7 +4280,8 @@ def claim(args):
             raise SystemExit(_explain_acquire_failure(db, args.id, args.owner, resolve_max_active(args)))
         db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"claimed",now(),"lease claimed"))
         audit(db, "task", args.id, "claimed", {"owner": args.owner, "lease_expires_at": exp, "lease_epoch": epoch,
-                                               **({"policy_overrides": overrides} if overrides else {})})
+                                               **({"policy_overrides": overrides} if overrides else {}),
+                                               **(autonomy_override or {})})
         out = _task_view(task_row(db, args.id))
         json_out(out)
 
@@ -3563,6 +4301,128 @@ def remove_dep(args):
             raise SystemExit(f"no such dependency: {args.id} does not depend on {args.depends_on}")
         audit(db, "task", args.id, "dependency_removed", {"depends_on": args.depends_on})
     json_out({"ok": True, "task_id": args.id, "removed": args.depends_on})
+
+def _dispatch_candidates(db, args, t_now):
+    """Stage 1 — candidates: queued tasks in scope (project/tag), due-ordered."""
+    q = "SELECT * FROM tasks WHERE status='queued'"
+    vals = []
+    if args.project:
+        q += " AND project=?"; vals.append(args.project)
+    if getattr(args, "tag", ""):
+        # Tag-scoped dispatch: an agent constrained to a capability (e.g.
+        # --tag autopilot-safe) only ever sees work marked for it. The
+        # LIKE filter is exact because tags are validated against a
+        # charset that cannot contain quotes.
+        q += " AND tags LIKE ?"; vals.append('%"' + _valid_tag(args.tag) + '"%')
+    q += _due_order()
+    return db.execute(q, vals).fetchall()
+
+def _filter_candidate(db, r, args, t_now, explain, skipped, pol_cache, inherited,
+                      t_dt=None):
+    """Stage 2 — filter: one candidate's admissibility gates, in order.
+
+    Returns (eligible_tuple | None). Refusals append an explain record to
+    `skipped` when `explain` is set: deferred_until, unsatisfied_dependencies,
+    recovery_backoff, policy_missing_tag, policy_wip_cap, seam_conflict.
+    """
+    t_dt = t_dt or datetime.now(timezone.utc)
+    if r["not_before"] and r["not_before"] > t_now:
+        if explain:
+            skipped.append({"task_id": r["id"], "reason": "deferred_until",
+                            "not_before": r["not_before"]})
+        return None
+    pending = unsatisfied_deps(db, r["id"])
+    if pending:
+        if explain:
+            skipped.append({"task_id": r["id"], "reason": "unsatisfied_dependencies",
+                            "blocked_by": [d["id"] for d in pending]})
+        return None
+    if r["recover_after"] and r["recover_after"] > t_now:
+        if explain:
+            skipped.append({"task_id": r["id"], "reason": "recovery_backoff",
+                            "recover_after": r["recover_after"]})
+        return None
+    # Project dispatch policy: cache per project so a fleet-wide
+    # sweep reads each policy file once.
+    pol = pol_cache.get(r["project"])
+    if pol is None:
+        pol = pol_cache[r["project"]] = _project_policy(r["project"])
+    required_tag = _dispatch_required_tag(pol)
+    if required_tag and required_tag not in _task_tags(r):
+        if explain:
+            skipped.append({"task_id": r["id"], "reason": "policy_missing_tag",
+                            "required_tag": required_tag})
+        return None
+    if args.claim:
+        cap = _wip_cap(pol)
+        if cap:
+            held = _owner_project_leases(db, args.owner, r["project"], r["id"])
+            if len(held) >= cap:
+                if explain:
+                    skipped.append({"task_id": r["id"], "reason": "policy_wip_cap",
+                                    "cap": cap, "held": held})
+                return None
+    if args.claim:
+        # Dispatch must not hand out work whose seam (worktree/branch)
+        # is already held by another live lease — the claim would
+        # collide physically. Skip rather than fail after picking.
+        conflicts = _seam_conflicts(db, r["id"], r["worktree"], r["branch"], r["project"])
+        if conflicts:
+            if explain:
+                skipped.append({"task_id": r["id"], "reason": "seam_conflict",
+                                "conflicts": conflicts})
+            return None
+        # Autonomy gate mirrors `claim`: work whose declared level has no
+        # live >= grant is skipped with a reason, never dispatched blind.
+        if r["autonomy_level"]:
+            grant = _live_autonomy_grant(db, r["id"])
+            if grant is None or _autonomy_rank(grant["object"]) < _autonomy_rank(r["autonomy_level"]):
+                if explain:
+                    skipped.append({"task_id": r["id"],
+                                    "reason": "autonomy_grant_missing" if grant is None
+                                    else "autonomy_grant_below_level",
+                                    "declared_level": r["autonomy_level"]})
+                return None
+    eff, boost = _effective_priority(r, t_dt, getattr(args, "aging_minutes", 360),
+                                     getattr(args, "aging_boost", 2))
+    inh = inherited.get(r["id"])
+    via = None
+    if inh is not None and _prio_rank(inh[0]) < _prio_rank(eff):
+        eff, via = inh[0], inh[1]
+    return (eff, boost, r, via, unblock_count(db, r["id"]))
+
+def _rank_candidates(eligible, prefer_unblocking):
+    """Stage 3 — rank: order the eligible candidates and return the pick.
+
+    Effective priority first, then earliest deadline (undated last),
+    then oldest-created first: within one effective tier the
+    longest-waiting task wins, which is what makes aging fair.
+    With --prefer-unblocking, the count of queued direct dependents
+    breaks ties before age: between equally urgent, equally due
+    candidates, finishing the hub frees more of the graph than
+    finishing a leaf (critical-path scheduling as a tie-break — it
+    never overrides priority or deadlines).
+    """
+    if not eligible:
+        return None
+    eligible = sorted(eligible, key=lambda e: (
+        _prio_rank(e[0]), e[2]["due_at"] == "", e[2]["due_at"],
+        (-e[4] if prefer_unblocking else 0), e[2]["created_at"]))
+    return eligible[0]
+
+def _claim_pick(db, picked, args):
+    """Stage 4 — claim: acquire the lease for the picked candidate.
+
+    Mirrors `claim` exactly: fenced acquire, heartbeat row, audited
+    claimed event with via=next. Returns (expires_at, epoch).
+    """
+    cap = resolve_max_active(args)
+    acquired, exp, epoch = _acquire(db, picked["id"], args.owner, args.minutes, cap)
+    if not acquired:
+        raise SystemExit(_explain_acquire_failure(db, picked["id"], args.owner, cap))
+    db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (picked["id"],args.owner,"claimed",now(),"claimed via next"))
+    audit(db, "task", picked["id"], "claimed", {"owner": args.owner, "lease_expires_at": exp, "lease_epoch": epoch, "via": "next"})
+    return exp, epoch
 
 def next_task(args):
     """Dispatch: highest-priority queued task whose dependencies are all completed.
@@ -3615,126 +4475,47 @@ def next_task(args):
     was taken against, instead of a follow-up `recall` round trip. The agent
     defaults to the claiming --owner; --budget/--related/--related-scope tune
     the bundle exactly like `recall`.
+
+    The pipeline is staged for independent testability: `_dispatch_candidates`
+    selects, `_filter_candidate` gates each row, `_rank_candidates` orders and
+    picks, and `_claim_pick` acquires the lease.
     """
     explain = bool(getattr(args, "explain", False))
     if getattr(args, "recall", False) and not args.claim:
         raise SystemExit("--recall requires --claim: the bundle seals the context of the task you claimed")
     t_now = now()
     t_dt = datetime.now(timezone.utc)
-    aging_minutes = getattr(args, "aging_minutes", 360)
-    aging_boost = getattr(args, "aging_boost", 2)
     with conn() as db:
         inherited = _inherit_priorities(db)
-        q = "SELECT * FROM tasks WHERE status='queued'"
-        vals = []
-        if args.project:
-            q += " AND project=?"; vals.append(args.project)
-        if getattr(args, "tag", ""):
-            # Tag-scoped dispatch: an agent constrained to a capability (e.g.
-            # --tag autopilot-safe) only ever sees work marked for it. The
-            # LIKE filter is exact because tags are validated against a
-            # charset that cannot contain quotes.
-            q += " AND tags LIKE ?"; vals.append('%"' + _valid_tag(args.tag) + '"%')
-        q += _due_order()
-        rows = db.execute(q, vals).fetchall()
+        rows = _dispatch_candidates(db, args, t_now)
         eligible = []
         skipped = []
         pol_cache = {}
         for r in rows:
-            if r["not_before"] and r["not_before"] > t_now:
-                if explain:
-                    skipped.append({"task_id": r["id"], "reason": "deferred_until",
-                                    "not_before": r["not_before"]})
-                continue
-            pending = unsatisfied_deps(db, r["id"])
-            if pending:
-                if explain:
-                    skipped.append({"task_id": r["id"], "reason": "unsatisfied_dependencies",
-                                    "blocked_by": [d["id"] for d in pending]})
-                continue
-            if r["recover_after"] and r["recover_after"] > t_now:
-                if explain:
-                    skipped.append({"task_id": r["id"], "reason": "recovery_backoff",
-                                    "recover_after": r["recover_after"]})
-                continue
-            # Project dispatch policy: cache per project so a fleet-wide
-            # sweep reads each policy file once.
-            pol = pol_cache.get(r["project"])
-            if pol is None:
-                pol = pol_cache[r["project"]] = _project_policy(r["project"])
-            required_tag = _dispatch_required_tag(pol)
-            if required_tag and required_tag not in _task_tags(r):
-                if explain:
-                    skipped.append({"task_id": r["id"], "reason": "policy_missing_tag",
-                                    "required_tag": required_tag})
-                continue
-            if args.claim:
-                cap = _wip_cap(pol)
-                if cap:
-                    held = _owner_project_leases(db, args.owner, r["project"], r["id"])
-                    if len(held) >= cap:
-                        if explain:
-                            skipped.append({"task_id": r["id"], "reason": "policy_wip_cap",
-                                            "cap": cap, "held": held})
-                        continue
-            if args.claim:
-                # Dispatch must not hand out work whose seam (worktree/branch)
-                # is already held by another live lease — the claim would
-                # collide physically. Skip rather than fail after picking.
-                conflicts = _seam_conflicts(db, r["id"], r["worktree"], r["branch"], r["project"])
-                if conflicts:
-                    if explain:
-                        skipped.append({"task_id": r["id"], "reason": "seam_conflict",
-                                        "conflicts": conflicts})
-                    continue
-            eff, boost = _effective_priority(r, t_dt, aging_minutes, aging_boost)
-            inh = inherited.get(r["id"])
-            via = None
-            if inh is not None and _prio_rank(inh[0]) < _prio_rank(eff):
-                eff, via = inh[0], inh[1]
-            eligible.append((eff, boost, r, via, unblock_count(db, r["id"])))
-        picked = None
-        picked_eff = None
-        picked_boost = 0
-        picked_via = None
-        picked_unblocks = 0
+            got = _filter_candidate(db, r, args, t_now, explain, skipped, pol_cache, inherited)
+            if got is not None:
+                eligible.append(got)
         prefer_unblocking = bool(getattr(args, "prefer_unblocking", False))
-        if eligible:
-            # Effective priority first, then earliest deadline (undated last),
-            # then oldest-created first: within one effective tier the
-            # longest-waiting task wins, which is what makes aging fair.
-            # With --prefer-unblocking, the count of queued direct dependents
-            # breaks ties before age: between equally urgent, equally due
-            # candidates, finishing the hub frees more of the graph than
-            # finishing a leaf (critical-path scheduling as a tie-break — it
-            # never overrides priority or deadlines).
-            eligible.sort(key=lambda e: (
-                _prio_rank(e[0]), e[2]["due_at"] == "", e[2]["due_at"],
-                (-e[4] if prefer_unblocking else 0), e[2]["created_at"]))
-            picked_eff, picked_boost, picked, picked_via, picked_unblocks = eligible[0]
+        pick = _rank_candidates(eligible, prefer_unblocking)
+        picked = pick[2] if pick else None
         out = {"ok": True, "task": _task_view(picked) if picked else None}
         if picked is not None:
-            out["unblocks"] = picked_unblocks
+            out["unblocks"] = pick[4]
         if explain:
             out["considered"] = len(rows)
             out["skipped"] = skipped
             if picked is not None:
-                out["effective_priority"] = picked_eff
-                out["priority_boost"] = picked_boost
-                if picked_via:
-                    out["inherited_via"] = picked_via
+                out["effective_priority"] = pick[0]
+                out["priority_boost"] = pick[1]
+                if pick[3]:
+                    out["inherited_via"] = pick[3]
             if prefer_unblocking:
                 out["unblock_scheduling"] = True
         if picked is None:
             json_out(out)
             return
         if args.claim:
-            cap = resolve_max_active(args)
-            acquired, exp, epoch = _acquire(db, picked["id"], args.owner, args.minutes, cap)
-            if not acquired:
-                raise SystemExit(_explain_acquire_failure(db, picked["id"], args.owner, cap))
-            db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (picked["id"],args.owner,"claimed",now(),"claimed via next"))
-            audit(db, "task", picked["id"], "claimed", {"owner": args.owner, "lease_expires_at": exp, "lease_epoch": epoch, "via": "next"})
+            exp, epoch = _claim_pick(db, picked, args)
             out["claimed"] = True
             out["lease_expires_at"] = exp
             out["lease_epoch"] = epoch
@@ -3749,7 +4530,8 @@ def next_task(args):
                                               rel_handoffs=getattr(args, "related_handoffs", 0),
                                       dep_context=getattr(args, "dep_context", 0),
                                       rel_sessions=getattr(args, "related_sessions", 0),
-                                      rel_facts=getattr(args, "related_facts", 0))
+                                      rel_facts=getattr(args, "related_facts", 0),
+                                      rel_semantic=getattr(args, "related_semantic", 0))
                 # Same provenance contract as `recall`: the digest is recorded
                 # with its bundle parameters so handoffs/completions can cite
                 # it and fleet sweeps can recompute it exactly.
@@ -3765,13 +4547,807 @@ def next_task(args):
                        "dep_context": getattr(args, "dep_context", 0),
                 "related_sessions": getattr(args, "related_sessions", 0),
                        "related_facts": getattr(args, "related_facts", 0),
+                       "related_semantic": getattr(args, "related_semantic", 0),
                        "sections": _bundle_sections(bundle),
                        "via": "next"})
                 out["recall"] = bundle
                 out["recall_digest"] = bundle["digest"]
         json_out(out)
 
+
+
+def _handoff_parser_actions():
+    """Introspect the handoff subparser's argument spec (single source of truth)."""
+    import argparse as _argparse
+    parser = _argparse.ArgumentParser(prog="autopilot")
+    sub = parser.add_subparsers(dest="cmd")
+    # Rebuild just the handoff subparser exactly as main() registers it.
+    p = sub.add_parser("handoff")
+    p.add_argument("task_id")
+    p.add_argument("--from-agent", required=True)
+    p.add_argument("--to-agent", default="")
+    p.add_argument("--status", default="")
+    p.add_argument("--objective", default="")
+    p.add_argument("--evidence", action="append", default=[])
+    p.add_argument("--constraint", dest="constraints", action="append", default=[])
+    p.add_argument("--decision", dest="decisions", action="append", default=[])
+    p.add_argument("--file", dest="files", action="append", default=[])
+    p.add_argument("--commit", dest="commit_ref", default="")
+    p.add_argument("--next-action", dest="next_actions", action="append", default=[])
+    p.add_argument("--risk", dest="risks", action="append", default=[])
+    p.add_argument("--recall-digest", dest="recall_digest", default="")
+    return p._actions
+
+_PACK_SECTION_FLAGS = {
+    "related": "--related",
+    "related_handoffs": "--related-handoffs",
+    "dep_context": "--dep-context",
+    "related_sessions": "--related-sessions",
+    "related_facts": "--related-facts",
+    "related_semantic": "--related-semantic",
+}
+
+def _protocol_doc() -> dict:
+    """Build the machine-readable handoff-protocol self-description.
+
+    Generated from the live code wherever possible (the argparse registry,
+    status/priority/kind vocabularies, dispatch skip reasons) so it cannot
+    silently drift from behavior. Sealed with the house digest format:
+    sha256 over the sorted-key JSON body with `created_at` outside.
+    """
+    # Handoff field contract, generated from the parser spec so new flags
+    # appear automatically.
+    handoff_fields = {}
+    for a in _handoff_parser_actions():
+        if a.dest in ('help', 'fn'):
+            continue
+        handoff_fields[a.dest] = {
+            'flags': sorted(a.option_strings),
+            'required': a.required,
+            'repeatable': a.nargs == 0 or isinstance(a, argparse._AppendAction),
+            'default': None if a.default is None else (a.default if isinstance(a.default, (str, int, float, bool, list)) else str(a.default)),
+        }
+    doc = {
+        'format': 'autopilot-protocol-v1',
+        'handoff_field_contract': {
+            'command': 'autopilot.py handoff <task_id> [fields]',
+            'fields': handoff_fields,
+            'supersession': 'writing a new handoff atomically supersedes the previous live one; history stays queryable via handoffs --all and handoff-history',
+            'deduplication': 'an identical payload deduplicates onto the live handoff instead of adding a row',
+        },
+        'recall_ack_receipt_loop': {
+            'recall': {
+                'commands': ['recall', 'resume', 'next --claim --recall'],
+                'proves': 'context_recalled audit event carrying digest + core_digest + bundle parameters',
+                'digest': 'sha256 over the sealed bundle (recalled_at excluded); core_digest additionally excludes the handoff section and used/truncated counters',
+            },
+            'acknowledge': {
+                'command': 'ack <task_id> --agent <recipient>',
+                'proves': 'handoff_acknowledged audit event; idempotent re-ack; supersession resets acceptance',
+            },
+            'receipt': {
+                'command': 'receipt <task_id> --kind <kind> --payload <json>',
+                'proves': 'sealed receipt file whose sha256 is recorded in SQLite; completions may cite evidence receipts; definition-of-done gates on required kinds',
+            },
+            'freshness_sweeps': ['recall-verify', 'recall-diff', 'ops.py recall-stale'],
+            'lint': 'ops.py handoff-check enforces objective/addressing/evidence/provenance/SLA',
+        },
+        'status_machine': {
+            'statuses': sorted(STATUSES),
+            'terminal_statuses': sorted(TERMINAL_STATUSES),
+            'transitions': {
+                'queued': ['claimed', 'blocked', 'cancelled'],
+                'claimed': ['running', 'queued', 'completed', 'failed', 'blocked', 'cancelled'],
+                'running': ['completed', 'failed', 'queued', 'blocked', 'cancelled'],
+                'waiting_for_agent': ['queued', 'cancelled'],
+                'waiting_for_user': ['queued', 'cancelled'],
+                'waiting_for_review': ['queued', 'ready_to_merge', 'cancelled'],
+                'ready_to_merge': ['ready_to_deploy', 'cancelled'],
+                'ready_to_deploy': ['completed', 'cancelled'],
+                'blocked': ['queued', 'cancelled'],
+                'completed': [], 'failed': [], 'cancelled': [],
+            },
+            'lease_rules': {
+                'exclusivity': 'one live lease per task; second owner refused',
+                'fencing': 'each acquisition bumps lease_epoch; stale epochs are refused',
+                'expiry': 'an expired lease requeues the task and consumes retry budget',
+            },
+        },
+        'refusal_vocabulary': {
+            'handoff_lint_reasons': sorted({
+                'unaddressed', 'missing_objective', 'sparse_no_evidence_or_next_actions',
+                'unproven_recall_digest', 'older_than_latest_recall',
+                'terminal_task_handoff', 'stale_unacknowledged'}),
+            'recall_states': sorted({'fresh', 'stale', 'unproven_recall_digest'}),
+            'dispatch_skip_reasons': sorted({
+                'unsatisfied_dependencies', 'recovery_backoff', 'deferred_until',
+                'seam_conflict', 'policy_missing_tag', 'policy_wip_cap'}),
+            'secret_guard_kinds_note': 'credential-shaped content is refused by note/handoff/fact/export paths unless --redact or --allow-secret',
+        },
+        'flag_gated_pack_sections': [
+            {'prefix': s.prefix, 'keys': s.keys,
+             'limit_flag': _PACK_SECTION_FLAGS.get(s.prefix)}
+            for s in _pack_spec()
+        ],
+    }
+    return doc
+
+def protocol(args):
+    """Emit the sealed protocol document (stable across calls)."""
+    doc = _protocol_doc()
+    doc['created_at'] = now()
+    doc['sha256'] = hashlib.sha256(json.dumps(
+        {k: v for k, v in doc.items() if k not in ('sha256', 'created_at')},
+        sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    json_out(doc)
+
+def _memory_insert(db, *, text: str, kind: str, project: str, source: str,
+                   tags: list, task_id: str, created_at: str) -> tuple:
+    """Insert one memory idempotently; returns (memory_id, created).
+
+    Content-addressed and guarded by the (project, content_hash) unique index,
+    so retaining the same fact twice is a no-op rather than a duplicate. The
+    caller is responsible for having run the secret guard first.
+    """
+    ch = hashlib.sha256(text.encode()).hexdigest()
+    mid = _memory_id(text, project)
+    cur = db.execute(
+        "INSERT OR IGNORE INTO memories(id,text,kind,project,source,tags,task_id,"
+        "content_hash,created_at,superseded_by) VALUES(?,?,?,?,?,?,?,?,?,'')",
+        (mid, text, kind, project, source,
+         json.dumps(sorted(tags), sort_keys=True), task_id, ch, created_at))
+    return mid, cur.rowcount == 1
+
+def memory_retain(args):
+    """Retain one fact/decision into local semantic memory.
+
+    Write path behind the same secret guard as notes: credential-shaped
+    content is refused unless --redact or --allow-secret. Unlike the former
+    Hindsight retain -- which appended to a JSONL file outside the
+    transaction, so a failed audit left an orphan line on disk -- the row and
+    its audit event commit together or not at all.
+    """
+    text = (args.text or "").strip()
+    if not text:
+        raise SystemExit("--text is required")
+    kind = (args.kind or "memory").strip() or "memory"
+    with conn() as db:
+        kinds, guarded = _secret_guard(
+            {"content": text}, getattr(args, "redact", False),
+            getattr(args, "allow_secret", False), args.task_id or "memory")
+        if args.task_id:
+            task_row(db, args.task_id)   # provenance must point at a real task
+        mid, created = _memory_insert(
+            db, text=guarded["content"], kind=kind, project=args.project or "",
+            source=args.source or "agent", tags=[x for x in (args.tag or []) if x],
+            task_id=args.task_id or "", created_at=now())
+        audit(db, "task", args.task_id or "", "memory_retained",
+              {"memory_id": mid, "kind": kind, "project": args.project or "",
+               "created": created,
+               **({"secret_kinds": kinds} if kinds else {})})
+        json_out({"ok": True, "memory_id": mid, "created": created,
+                  "engine": MEMORY_ENGINE_TAG,
+                  **({"secret_kinds": kinds} if kinds else {})})
+
+def memory_forget(args):
+    """Retract a memory: it stops being a recall candidate, evidence survives.
+
+    Deletion is deliberately not offered -- retraction is recorded, so the
+    audit chain still explains why a pack that once carried this memory no
+    longer does.
+    """
+    with conn() as db:
+        row = db.execute("SELECT id,superseded_by FROM memories WHERE id=?",
+                         (args.id,)).fetchone()
+        if not row:
+            raise SystemExit(f"no such memory: {args.id}")
+        by = (args.superseded_by or "retracted").strip() or "retracted"
+        if by != "retracted" and not db.execute(
+                "SELECT 1 FROM memories WHERE id=?", (by,)).fetchone():
+            raise SystemExit(f"no such superseding memory: {by}")
+        if row["superseded_by"]:
+            json_out({"ok": True, "memory_id": args.id, "already": True,
+                      "superseded_by": row["superseded_by"]})
+            return
+        db.execute("UPDATE memories SET superseded_by=? WHERE id=? AND superseded_by=''",
+                   (by, args.id))
+        audit(db, "task", "", "memory_forgotten",
+              {"memory_id": args.id, "superseded_by": by})
+        json_out({"ok": True, "memory_id": args.id, "superseded_by": by})
+
+def memory_list(args):
+    """Read-only listing of retained memories (the store's inspection surface).
+
+    Without this the memory store would be opaque to everything except a pack
+    -- the same blind spot that let the old bank drift unnoticed.
+    """
+    with conn() as db:
+        where, vals = ["1=1"], []
+        if not getattr(args, "all", False):
+            where.append("superseded_by=''")
+        if args.project:
+            where.append("project=?")
+            vals.append(args.project)
+        # Enumeration filters, not search. A writer agent asking "what did I
+        # ship last week" wants every commit in a date range, in order --
+        # ranking it by relevance would silently drop the boring commits,
+        # which is exactly how a build log ends up factually incomplete.
+        if getattr(args, "kind", ""):
+            where.append("kind=?")
+            vals.append(args.kind)
+        if getattr(args, "since", ""):
+            where.append("created_at>=?")
+            vals.append(_normalize_iso(args.since, "--since"))
+        toks = _search_tokens(args.query or "", fold_case=True, min_len=2,
+                              drop_stopwords=True)
+        if toks:
+            where.append("(" + " OR ".join("text LIKE ?" for _ in toks) + ")")
+            vals.extend("%" + t + "%" for t in toks)
+        vals.append(max(1, int(args.limit)))
+        rows = db.execute(
+            "SELECT id,text,kind,project,source,tags,task_id,created_at,superseded_by "
+            "FROM memories WHERE " + " AND ".join(where)
+            + " ORDER BY created_at DESC, id ASC LIMIT ?", vals).fetchall()
+        json_out([{"id": r["id"], "kind": r["kind"], "project": r["project"],
+                   "source": r["source"], "task_id": r["task_id"],
+                   "at": r["created_at"], "tags": _memory_tags(r["tags"]),
+                   "superseded_by": r["superseded_by"],
+                   "content": _memory_snippet(r["text"])} for r in rows])
+
+def memory_import(args):
+    """One-shot import of a legacy Hindsight bank.jsonl into local memory.
+
+    The migration path off the retired file-backed engine. The source file is
+    opened read-only and never mutated; malformed lines are counted and
+    skipped rather than failing the import (a torn line was always possible in
+    the append-only bank format); `created_at` is preserved so imported
+    memories keep their place in temporal order. Content-addressing makes a
+    re-run a no-op, so an interrupted import is simply re-run.
+
+    Dry-run by default -- pass --apply to write.
+    """
+    src = Path(args.source_path).expanduser()
+    if not src.is_file():
+        raise SystemExit(f"no such bank file: {src}")
+    parsed, malformed = [], 0
+    with src.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                m = json.loads(line)
+            except ValueError:
+                malformed += 1
+                continue
+            if not isinstance(m, dict) or not str(m.get("text") or "").strip():
+                malformed += 1
+                continue
+            parsed.append(m)
+    findings = sorted({f["kind"] for m in parsed
+                       for f in _secret_findings(str(m.get("text") or ""))})
+    redact = bool(getattr(args, "redact", False))
+    allow = bool(getattr(args, "allow_secret", False))
+    if findings and not (redact or allow):
+        raise SystemExit(
+            f"refusing to import credential-shaped memories ({', '.join(findings)}); "
+            "re-run with --redact or --allow-secret")
+    project_override = args.project or ""
+    prepared, undated = [], 0
+    t_now = now()
+    for m in parsed:
+        text = str(m.get("text") or "").strip()
+        if redact:
+            text = _redact_secrets(text)
+        # A garbage timestamp degrades to import time and is counted, exactly
+        # like a torn line: one bad field in a legacy bank must not abort the
+        # migration of every other memory in it.
+        try:
+            created = _normalize_iso(str(m.get("created_at") or ""), "created-at")
+        except SystemExit:
+            created = ""
+        if not created:
+            undated += 1
+            created = t_now
+        prepared.append({
+            "text": text,
+            "kind": str(m.get("kind") or "memory"),
+            "project": project_override or str(m.get("project") or ""),
+            "tags": [str(t) for t in (m.get("tags") or []) if str(t)],
+            "created_at": created,
+        })
+    if not getattr(args, "apply", False):
+        json_out({"ok": True, "dry_run": True, "source": str(src),
+                  "parsed": len(prepared), "malformed_lines": malformed,
+                  "undated": undated, "secret_kinds": findings,
+                  "note": "pass --apply to import"})
+        return
+    imported = skipped = 0
+    with conn() as db:
+        for m in prepared:
+            _, created = _memory_insert(
+                db, text=m["text"], kind=m["kind"], project=m["project"],
+                source="hindsight-bank-import", tags=m["tags"], task_id="",
+                created_at=m["created_at"])
+            if created:
+                imported += 1
+            else:
+                skipped += 1
+        audit(db, "task", "", "memory_imported",
+              {"source": str(src), "imported": imported,
+               "already_present": skipped, "malformed_lines": malformed,
+               "undated": undated, "secret_kinds": findings, "redacted": redact})
+    json_out({"ok": True, "dry_run": False, "source": str(src),
+              "imported": imported, "already_present": skipped,
+              "malformed_lines": malformed, "undated": undated,
+              "secret_kinds": findings, "engine": MEMORY_ENGINE_TAG})
+
+def _git(repo: Path, *args, timeout: int = 60):
+    """Run one read-only git command. Returns stdout, or None if git is unusable.
+
+    Never a write, never a fetch: this reads history that is already on disk,
+    so an ingest cannot alter the repository it is describing and cannot block
+    on the network in the middle of a cron tick.
+    """
+    try:
+        proc = subprocess.run(["git", "-C", str(repo), *args],
+                              text=True, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+# Commit subjects in this repository run to 2,170 characters. A memory is
+# something an agent reads *many* of to answer one question, so an unbounded
+# commit body would let a single verbose commit crowd out a week of real work.
+GIT_TEXT_LIMIT = 240
+
+def _git_commit_memories(repo: Path, since: str, limit: int) -> list:
+    """Commits on the current branch as bounded, self-describing memories.
+
+    The commit hash is inside the text on purpose. Memories are addressed by
+    the hash of their content, so embedding an identifier that is stable and
+    unique per commit makes re-ingesting permanently idempotent -- the same
+    commit produces the same memory id forever, and the existing uniqueness
+    constraint absorbs it with no bookkeeping of "where did I get to last
+    time". That is why this needs no cursor, no state file, and no lock.
+    """
+    sep, rec = "\x1f", "\x1e"
+    fmt = f"{rec}%H{sep}%h{sep}%aI{sep}%an{sep}%s"
+    out = _git(repo, "log", f"--format={fmt}", "--shortstat",
+               f"--since={since}", f"--max-count={max(1, limit)}", "--no-merges")
+    if out is None:
+        return []
+    memories = []
+    for chunk in out.split(rec):
+        if not chunk.strip():
+            continue
+        head, _, tail = chunk.partition("\n")
+        parts = head.split(sep)
+        if len(parts) < 5:
+            continue
+        full, short, when, author, subject = parts[:5]
+        subject = " ".join(subject.split())
+        if len(subject) > GIT_TEXT_LIMIT:
+            subject = subject[:GIT_TEXT_LIMIT - 1].rstrip() + "\u2026"
+        stat = ""
+        m = re.search(r"(\d+) files? changed(?:, (\d+) insertions?\(\+\))?"
+                      r"(?:, (\d+) deletions?\(-\))?", tail)
+        if m:
+            stat = (f" [{m.group(1)} files +{m.group(2) or 0}"
+                    f"/-{m.group(3) or 0}]")
+        try:
+            created = _normalize_iso(when, "commit-date")
+        except SystemExit:
+            continue
+        memories.append({
+            "text": f"Commit {short} on {created[:10]} by {author}: {subject}{stat}",
+            "kind": "commit", "created_at": created,
+            "tags": ["git", "commit"], "ref": full})
+    return memories
+
+def _git_since_epoch(repo: Path, since: str):
+    """Resolve a git-style date expression ("30 days ago") to a unix epoch.
+
+    Delegated to git rather than reimplemented: `--since` accepts a whole
+    grammar of relative and absolute forms, and a second parser here would
+    inevitably disagree with the one bounding the commit query -- so commits
+    and pull requests would silently cover different windows.
+    """
+    out = _git(repo, "rev-parse", f"--since={since}")
+    m = re.search(r"--max-age=(\d+)", out or "")
+    return int(m.group(1)) if m else None
+
+def _git_pr_memories(repo: Path, since: str, limit: int) -> tuple:
+    """Merged pull requests via the `gh` CLI, or ([], reason) when unavailable.
+
+    Optional by design and reported as a note rather than a failure: a repo
+    with no GitHub remote, no `gh`, or no auth must still ingest its commits.
+
+    `--since` is enforced here as well as on commits. `gh pr list` has no date
+    bound of its own, so without this one repository's entire merged history
+    lands in the store in a single pass -- 213 pull requests from one project,
+    against 285 commits from five -- and the volume alone would bias every
+    later recall toward whichever repo happened to use PRs most.
+    """
+    if not _git(repo, "remote"):
+        return [], "no git remote"
+    cutoff = _git_since_epoch(repo, since)
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "list", "--state", "merged", "--limit", str(max(1, limit)),
+             "--json", "number,title,mergedAt,author,url"],
+            cwd=str(repo), text=True, capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [], f"gh unavailable: {type(exc).__name__}"
+    if proc.returncode != 0:
+        return [], (proc.stderr or "gh failed").strip().splitlines()[0][:200]
+    try:
+        rows = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return [], "gh returned unparseable JSON"
+    memories, dropped = [], 0
+    for r in rows:
+        title = " ".join(str(r.get("title") or "").split())
+        if len(title) > GIT_TEXT_LIMIT:
+            title = title[:GIT_TEXT_LIMIT - 1].rstrip() + "\u2026"
+        try:
+            created = _normalize_iso(str(r.get("mergedAt") or ""), "merged-at")
+        except SystemExit:
+            continue
+        if cutoff is not None:
+            try:
+                if datetime.fromisoformat(created).timestamp() < cutoff:
+                    dropped += 1
+                    continue
+            except ValueError:
+                pass
+        who = (r.get("author") or {}).get("login") or "unknown"
+        num = r.get("number")
+        memories.append({
+            "text": f"PR #{num} merged on {created[:10]} by {who}: {title} "
+                    f"({r.get('url') or ''})".strip(),
+            "kind": "pull_request", "created_at": created,
+            "tags": ["git", "pull-request"], "ref": str(num)})
+    # Reported, never silent: a caller must be able to tell "no PRs in this
+    # window" apart from "the window quietly discarded most of them".
+    return memories, (f"{dropped} merged PRs older than --since were skipped"
+                      if dropped else "")
+
+def memory_ingest_git(args):
+    """Record commits and merged PRs as memories, so sessions can see the work.
+
+    The gap this closes: an agent asked to write about "what I shipped this
+    week" had no source for it. Autopilot knew about tasks, and the audit
+    chain knew about completions, but the actual commits and pull requests
+    lived only in git -- invisible to anything reading memory.
+
+    Deliberately a pull, not a hook. A post-commit hook would put a write to
+    the audit chain on the critical path of every `git commit`, so a locked
+    database or a slow disk would start failing commits; and it would only
+    ever see commits made on this machine, after installation. Reading history
+    that already exists has neither problem, and it backfills.
+
+    Bounded on purpose. `--since` and `--limit` both apply, and text is capped,
+    because memory is read in bulk: one repository with a decade of history
+    must not be able to drown every other thing the store knows.
+
+    Dry-run by default -- pass --apply to write.
+    """
+    repo = Path(getattr(args, "repo", "") or ".").expanduser().resolve()
+    if _git(repo, "rev-parse", "--git-dir") is None:
+        raise SystemExit(f"not a git repository (or git unavailable): {repo}")
+    project = args.project or repo.name
+    limit = max(1, int(args.limit))
+    items = _git_commit_memories(repo, args.since, limit)
+    pr_note = ""
+    if getattr(args, "prs", False):
+        prs, pr_note = _git_pr_memories(repo, args.since, limit)
+        items.extend(prs)
+
+    findings = sorted({f["kind"] for it in items
+                       for f in _secret_findings(it["text"])})
+    redact = bool(getattr(args, "redact", False))
+    allow = bool(getattr(args, "allow_secret", False))
+    if findings and not (redact or allow):
+        # Commit messages are written by hand and do leak keys; the same guard
+        # that protects notes protects this path.
+        raise SystemExit(
+            f"refusing to ingest credential-shaped content ({', '.join(findings)}); "
+            "re-run with --redact or --allow-secret")
+    if redact:
+        for it in items:
+            it["text"] = _redact_secrets(it["text"])
+
+    counts = {"commit": sum(1 for i in items if i["kind"] == "commit"),
+              "pull_request": sum(1 for i in items if i["kind"] == "pull_request")}
+    if not getattr(args, "apply", False):
+        json_out({"ok": True, "dry_run": True, "repo": str(repo),
+                  "project": project, "since": args.since,
+                  "found": len(items), "by_kind": counts,
+                  "secret_kinds": findings,
+                  **({"note": pr_note} if pr_note else {}),
+                  "sample": [i["text"] for i in items[:3]],
+                  "hint": "pass --apply to ingest"})
+        return
+    ingested = already = 0
+    with conn() as db:
+        for it in items:
+            _, created = _memory_insert(
+                db, text=it["text"], kind=it["kind"], project=project,
+                source="git-ingest", tags=it["tags"], task_id="",
+                created_at=it["created_at"])
+            ingested += 1 if created else 0
+            already += 0 if created else 1
+        audit(db, "system", "memory", "memory_git_ingested",
+              {"repo": str(repo), "project": project, "since": args.since,
+               "ingested": ingested, "already_present": already,
+               "by_kind": counts,
+               **({"secret_kinds": findings} if findings else {})})
+    json_out({"ok": True, "dry_run": False, "repo": str(repo),
+              "project": project, "ingested": ingested,
+              "already_present": already, "by_kind": counts,
+              "secret_kinds": findings,
+              **({"note": pr_note} if pr_note else {}),
+              "engine": MEMORY_ENGINE_TAG})
+
+def _memory_embed_backlog(db) -> list:
+    """Live memories with no vector under the current model, oldest first.
+
+    Oldest-first matters for a bounded run: a `--limit`ed pass must make
+    monotonic progress through the backlog rather than re-chewing whichever
+    rows happen to sort first.
+    """
+    return db.execute(
+        "SELECT m.id, m.text, m.content_hash FROM memories m "
+        "LEFT JOIN memory_vectors v ON v.memory_id = m.id AND v.model = ? "
+        "WHERE m.superseded_by = '' AND v.memory_id IS NULL "
+        "ORDER BY m.created_at ASC, m.id ASC", (EMBED_MODEL,)).fetchall()
+
+def memory_embed(args):
+    """Compute embeddings for memories that do not have one yet.
+
+    Dry-run first, like every other write surface here: without --apply it
+    reports the backlog and the worker's availability and touches nothing.
+
+    Vectors are derived data, so this is safe to interrupt and safe to re-run:
+    the backlog query is the state, each batch commits with its own audit
+    event, and a crash halfway simply leaves a smaller backlog. Nothing is
+    ever recomputed for a row that already has a vector under this model.
+    """
+    limit = max(0, int(getattr(args, "limit", 0) or 0))
+    with conn() as db:
+        backlog = _memory_embed_backlog(db)
+        total_backlog = len(backlog)
+        if limit:
+            backlog = backlog[:limit]
+        if not getattr(args, "apply", False):
+            probe = _embed_probe()
+            json_out({"ok": True, "dry_run": True, "model": EMBED_MODEL,
+                      "backlog": total_backlog, "would_embed": len(backlog),
+                      "embedder": probe,
+                      "note": None if probe["available"] else
+                              "semantic search unavailable; FTS recall is unaffected"})
+            return
+        if not backlog:
+            json_out({"ok": True, "dry_run": False, "model": EMBED_MODEL,
+                      "backlog": 0, "embedded": 0})
+            return
+        try:
+            blobs = _embed_texts([r["text"] for r in backlog])
+        except EmbedUnavailable as exc:
+            # Unavailable is a note, not a failure: the caller (a cron tick)
+            # must not go red because an optional model is missing.
+            json_out({"ok": True, "dry_run": False, "model": EMBED_MODEL,
+                      "backlog": total_backlog, "embedded": 0,
+                      "embedder": {"available": False, "reason": exc.reason,
+                                   "detail": exc.detail},
+                      "note": "embedding worker unavailable; nothing written"})
+            return
+        stamp = now()
+        db.execute("BEGIN IMMEDIATE")
+        for row, blob in zip(backlog, blobs):
+            db.execute(
+                "INSERT OR REPLACE INTO memory_vectors"
+                "(memory_id,model,dim,content_hash,vec,created_at) VALUES(?,?,?,?,?,?)",
+                (row["id"], EMBED_MODEL, len(blob) // 4, row["content_hash"],
+                 blob, stamp))
+        # One event per run, not per row: the chain records that derived data
+        # was regenerated, which is all an auditor needs -- the vectors
+        # themselves are reproducible from the memories they came from.
+        audit(db, "system", "memory", "memory_embedded",
+              {"model": EMBED_MODEL, "count": len(backlog),
+               "backlog_remaining": total_backlog - len(backlog)})
+        json_out({"ok": True, "dry_run": False, "model": EMBED_MODEL,
+                  "embedded": len(backlog),
+                  "backlog_remaining": total_backlog - len(backlog)})
+
+def memory_search(args):
+    """Semantic search over retained memories (optional; read-only).
+
+    Deliberately a separate command from `recall`. `recall` is on the pack
+    path, must stay deterministic and sub-100ms, and therefore stays FTS5;
+    this loads a model and is for callers already inside a long session.
+
+    Scope is enforced rather than attempted: --project matching nothing
+    returns nothing. Relaxing an empty project filter to an unscoped result is
+    exactly how the retired engine leaked another project's context.
+    """
+    query = (args.query or "").strip()
+    if not query:
+        raise SystemExit("--query is required")
+    ensure()
+    try:
+        out = _embed_call({"mode": "search", "db": str(DB), "query": query,
+                           "limit": max(1, int(args.limit)),
+                           "project": args.project or None,
+                           "min_score": float(args.min_score),
+                           "include_superseded": bool(getattr(args, "all", False))})
+    except EmbedUnavailable as exc:
+        json_out({"ok": True, "available": False, "reason": exc.reason,
+                  "detail": exc.detail, "hits": [],
+                  "note": "semantic search unavailable; "
+                          "`memory-list --query` offers keyword search instead"})
+        return
+    hits = out.get("hits") or []
+    with conn() as db:
+        rows = {}
+        for h in hits:
+            r = db.execute(
+                "SELECT id,text,kind,project,source,tags,task_id,created_at,"
+                "superseded_by FROM memories WHERE id=?", (h["memory_id"],)).fetchone()
+            if r:
+                rows[h["memory_id"]] = r
+    json_out({"ok": True, "available": True, "model": EMBED_MODEL,
+              "query": query, "searched": out.get("searched", 0),
+              "hits": [{"id": h["memory_id"], "score": h["score"],
+                        "kind": rows[h["memory_id"]]["kind"],
+                        "project": rows[h["memory_id"]]["project"],
+                        "source": rows[h["memory_id"]]["source"],
+                        "task_id": rows[h["memory_id"]]["task_id"],
+                        "at": rows[h["memory_id"]]["created_at"],
+                        "tags": _memory_tags(rows[h["memory_id"]]["tags"]),
+                        "content": _memory_snippet(rows[h["memory_id"]]["text"])}
+                       for h in hits if h["memory_id"] in rows]})
+
+def memory_status(args):
+    """Coverage and health of the memory store, including the optional layer.
+
+    Doubles as the monitor surface for the consolidation cron: --digest emits
+    one stable line whose bytes change only when the store meaningfully
+    changes, so an unchanged store suppresses the agent run entirely and costs
+    zero model calls.
+    """
+    with conn() as db:
+        live = db.execute("SELECT COUNT(*) FROM memories WHERE superseded_by=''").fetchone()[0]
+        retracted = db.execute("SELECT COUNT(*) FROM memories WHERE superseded_by<>''").fetchone()[0]
+        vectors = db.execute("SELECT COUNT(*) FROM memory_vectors WHERE model=?",
+                             (EMBED_MODEL,)).fetchone()[0]
+        backlog = len(_memory_embed_backlog(db))
+        newest = db.execute(
+            "SELECT created_at FROM memories WHERE superseded_by='' "
+            "ORDER BY created_at DESC, id ASC LIMIT 1").fetchone()
+        projects = [{"project": r[0], "memories": r[1]} for r in db.execute(
+            "SELECT project, COUNT(*) FROM memories WHERE superseded_by='' "
+            "GROUP BY project ORDER BY 2 DESC, 1 ASC")]
+    if getattr(args, "digest", False):
+        # Exact-bytes monitor line: the cron compares these bytes and skips the
+        # agent run entirely when they are unchanged, so an idle store costs
+        # zero model calls.
+        #
+        # It carries only *content* state. Vector counts and embedding backlog
+        # are deliberately excluded even though they are printed in the JSON
+        # below: they are derived data that the session itself changes, so
+        # including them would make every run's own side effects wake the next
+        # run -- a gate that re-triggers on its own output is not a gate. It
+        # also carries no score or probe result, since those drift on their own.
+        #
+        # Retraction is included, so a consolidation that merges three
+        # memories into one moves the line, the next tick opens once, finds
+        # nothing left to merge, and the gate closes again.
+        print(f"memories={live} retracted={retracted} "
+              f"newest={newest[0] if newest else '-'}")
+        return
+    json_out({"ok": True, "engine": MEMORY_ENGINE_TAG,
+              "memories": live, "retracted": retracted,
+              "newest": newest[0] if newest else None,
+              "projects": projects,
+              "semantic": {"model": EMBED_MODEL, "vectors": vectors,
+                           "backlog": backlog,
+                           "coverage": round(vectors / live, 4) if live else 0.0,
+                           **_embed_probe()}})
+
+def memory_consolidate_brief(args):
+    """Emit the work item for a consolidation session; writes nothing.
+
+    This is the deterministic half of consolidation, and keeping the two
+    halves apart is the whole design. Finding which memories are plausibly the
+    same fact is arithmetic -- cosine over stored vectors -- and doing it here
+    means the partner model never has to read the store to discover
+    redundancy. It receives candidate groups and spends its tokens on the only
+    part that needs judgement: whether two similar-looking facts are one fact,
+    and what the merged wording should be.
+
+    The retired engine got this backwards. It ran an always-on private worker
+    that called a model on ingest, continuously, and in five days logged three
+    retrieval events against hundreds of consolidation calls -- it paid for
+    curation nothing ever read, and paid for it at a cadence that produced
+    1,638 service restarts and 212 billing failures. Here the model is called
+    only when this brief is non-empty, from a session that is gated on the
+    store having actually changed.
+
+    Writes go back through `memory-retain` and `memory-forget`, never by
+    editing rows: a merge must land in the audit chain as a retain plus a
+    retraction that names its successor, so a pack that once cited the old
+    memory can still explain what replaced it.
+    """
+    ensure()
+    try:
+        excluded = ([] if getattr(args, "include_git", False)
+                    else list(CONSOLIDATE_UNMERGEABLE_KINDS))
+        out = _embed_call({"mode": "cluster", "db": str(DB),
+                           "threshold": float(args.threshold),
+                           "project": args.project or None,
+                           "exclude_kinds": excluded,
+                           "max_clusters": max(1, int(args.max_clusters))})
+    except EmbedUnavailable as exc:
+        json_out({"ok": True, "available": False, "reason": exc.reason,
+                  "detail": exc.detail, "clusters": [],
+                  "note": "consolidation needs the embedding layer; "
+                          "run `memory-embed --apply` on a machine that has it"})
+        return
+    clusters = out.get("clusters") or []
+    with conn() as db:
+        rendered = []
+        for group in clusters:
+            members = []
+            for mid in group:
+                r = db.execute(
+                    "SELECT id,text,kind,project,source,tags,task_id,created_at "
+                    "FROM memories WHERE id=?", (mid,)).fetchone()
+                if r:
+                    members.append({"id": r["id"], "kind": r["kind"],
+                                    "project": r["project"], "source": r["source"],
+                                    "task_id": r["task_id"], "at": r["created_at"],
+                                    "tags": _memory_tags(r["tags"]),
+                                    "text": r["text"]})
+            if len(members) > 1:
+                # Oldest first so the model reads a group as a history: the
+                # later entries are usually the refinement of the earlier.
+                members.sort(key=lambda m: (m["at"], m["id"]))
+                rendered.append({"size": len(members), "members": members})
+    json_out({"ok": True, "available": True, "model": EMBED_MODEL,
+              "threshold": float(args.threshold),
+              "project": args.project or None,
+              "excluded_kinds": excluded,
+              "scored": out.get("scored", 0),
+              "cluster_total": out.get("cluster_total", 0),
+              "clusters": rendered,
+              "write_back": {
+                  "merge": "autopilot.py memory-retain --text '<merged fact>' "
+                           "--project <project> --kind <kind> --source consolidation",
+                  "retract": "autopilot.py memory-forget <old-id> "
+                             "--superseded-by <new-id>",
+                  "rule": "never retract a memory without naming its successor; "
+                          "evidence and packs must stay explainable"}})
+
 def heartbeat(args):
+    """Lease renewal plus an optional durable activity report.
+
+    The report is the anti-silence contract: what was last meaningfully done
+    (`--action`), the concrete next intent (`--intent`), a bounded progress
+    state, receipt ids proving the claim (`--evidence`, must exist on this
+    task), and how long silence is healthy (`--stall-deadline`). A passed
+    stall deadline surfaces to the fleet as an `activity_stalled` finding via
+    ops.py sense — long before the lease itself expires. All fields are
+    optional; without them the command is byte-compatible with legacy use.
+    """
+    action = (getattr(args, "action", "") or "").strip()
+    intent = (getattr(args, "intent", "") or "").strip()
+    state = getattr(args, "progress_state", "") or ""
+    if state and state not in PROGRESS_STATES:
+        raise SystemExit(f"invalid progress state: {state!r} (one of {sorted(PROGRESS_STATES)})")
+    deadline = _parse_stall_deadline(getattr(args, "stall_deadline", "") or "")
+    evidence = [r.strip() for r in (getattr(args, "evidence", None) or []) if r.strip()]
     with conn() as db:
         row = task_row(db, args.id)
         _require_epoch(row, getattr(args, "epoch", None), "heartbeat")
@@ -3786,24 +5362,87 @@ def heartbeat(args):
             if row["lease_owner"] and row["lease_owner"] != args.owner:
                 raise SystemExit(f"lease owned by {row['lease_owner']}")
             raise SystemExit("lease expired; reclaim before heartbeat")
-        db.execute("INSERT INTO heartbeats(task_id,owner,state,at,note) VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,at=excluded.at,note=excluded.note", (args.id,args.owner,"alive",now(),args.note))
-        audit(db, "task", args.id, "heartbeat", {"owner": args.owner, "lease_expires_at": exp})
-        json_out({"ok": True, "task_id": args.id, "status": "running", "lease_expires_at": exp,
-                  "lease_epoch": row["lease_epoch"], "heartbeat_at": now()})
+        if evidence:
+            known = {r["id"] for r in db.execute(
+                "SELECT id FROM receipts WHERE task_id=?", (args.id,)).fetchall()}
+            missing = [rid for rid in evidence if rid not in known]
+            if missing:
+                raise SystemExit(f"evidence receipts not found on this task: {missing}")
+        db.execute(
+            "INSERT INTO heartbeats(task_id,owner,state,at,note,last_action,next_intent,"
+            "progress_state,stall_deadline,evidence) VALUES(?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(task_id) DO UPDATE SET owner=excluded.owner,state=excluded.state,"
+            "at=excluded.at,note=excluded.note,last_action=excluded.last_action,"
+            "next_intent=excluded.next_intent,progress_state=excluded.progress_state,"
+            "stall_deadline=excluded.stall_deadline,evidence=excluded.evidence",
+            (args.id, args.owner, "alive", now(), args.note, action, intent,
+             state, deadline, json.dumps(evidence)))
+        audit(db, "task", args.id, "heartbeat",
+              {"owner": args.owner, "lease_expires_at": exp,
+               **({"last_action": action} if action else {}),
+               **({"next_intent": intent} if intent else {}),
+               **({"progress_state": state} if state else {}),
+               **({"stall_deadline": deadline} if deadline else {}),
+               **({"evidence": evidence} if evidence else {})})
+        json_out({"ok": True, "task_id": args.id, "status": "running",
+                  "lease_expires_at": exp, "lease_epoch": row["lease_epoch"],
+                  "heartbeat_at": now(),
+                  "activity": {"last_action": action, "next_intent": intent,
+                               "progress_state": state, "stall_deadline": deadline,
+                               "evidence": evidence}})
 
-def receipt(args):
-    payload = json.loads(args.payload) if args.payload else {}
+def run_receipt(args):
+    """Seal a provider-neutral runner/v1 execution record as a `run` receipt.
+
+    One common schema for every harness (hermes/dsh/opencode/codex/claude-code/
+    ...): harness, exact provider/model binding, session and workspace ids,
+    outcome, optional timeout and capability tags. Fail-closed validation keeps
+    the vocabulary closed; the sealed file/hash path is identical to every
+    other receipt so doctor guards run records like all evidence.
+    """
+    harness = (args.harness or "").strip().lower()
+    if not TAG_RE.fullmatch(harness):
+        raise SystemExit(f"invalid harness: {args.harness!r} (lowercase tag token)")
+    model = _valid_model_binding(args.model)
+    session = (args.session or "").strip()
+    workspace = (args.workspace or "").strip()
+    for name, v in (("session", session), ("workspace", workspace)):
+        if len(v) > 256:
+            raise SystemExit(f"--{name} too long (max 256 chars)")
+    if args.outcome not in RUN_OUTCOMES:
+        raise SystemExit(f"invalid outcome: {args.outcome!r} (one of {sorted(RUN_OUTCOMES)})")
+    timeout = getattr(args, "timeout_seconds", None)
+    if timeout is not None and timeout <= 0:
+        raise SystemExit("--timeout-seconds must be > 0")
+    capabilities = [_valid_tag(c) for c in (args.capability or [])]
+    payload = {"schema": RUNNER_SCHEMA_VERSION, "harness": harness, "model": model,
+               "session": session, "workspace": workspace, "outcome": args.outcome,
+               "capabilities": capabilities}
+    if timeout is not None:
+        payload["timeout_seconds"] = timeout
+    sub = _seal_receipt(args.task_id, "run", payload)
+    with conn() as db:
+        audit(db, "task", args.task_id, "run_receipt",
+              {"receipt_id": sub["receipt_id"], "kind": "run", "harness": harness,
+               "model": model, "outcome": args.outcome})
+    sub["payload"] = payload
+    json_out(sub)
+
+def _seal_receipt(task_id: str, kind: str, payload: dict) -> dict:
+    """Core receipt sealing shared by every receipt producer: hash-chained row,
+    atomic 0600 file whose sha256 is recorded so doctor can detect tampering,
+    last_receipt pointer, audited `receipt` event."""
     rid = uuid.uuid4().hex
     created = now()
-    data = json.dumps({"id":rid,"task_id":args.task_id,"kind":args.kind,"created_at":created,"payload":payload}, indent=2, sort_keys=True)+"\n"
+    data = json.dumps({"id":rid,"task_id":task_id,"kind":kind,"created_at":created,"payload":payload}, indent=2, sort_keys=True)+"\n"
     # Seal the receipt file: the sha256 recorded in SQLite must match the bytes
     # on disk, so doctor can detect silent corruption or tampering later.
     file_hash = hashlib.sha256(data.encode()).hexdigest()
     with conn() as db:
-        task_row(db, args.task_id)
-        db.execute("INSERT INTO receipts(id,task_id,kind,payload_json,created_at,file_hash) VALUES(?,?,?,?,?,?)", (rid,args.task_id,args.kind,json.dumps(payload,sort_keys=True),created,file_hash))
-        db.execute("UPDATE tasks SET last_receipt=?,updated_at=? WHERE id=?", (rid,created,args.task_id))
-        audit(db, "task", args.task_id, "receipt", {"receipt_id": rid, "kind": args.kind})
+        task_row(db, task_id)
+        db.execute("INSERT INTO receipts(id,task_id,kind,payload_json,created_at,file_hash) VALUES(?,?,?,?,?,?)", (rid,task_id,kind,json.dumps(payload,sort_keys=True),created,file_hash))
+        db.execute("UPDATE tasks SET last_receipt=?,updated_at=? WHERE id=?", (rid,created,task_id))
+        audit(db, "task", task_id, "receipt", {"receipt_id": rid, "kind": kind})
     target = RECEIPTS / f"{rid}.json"
     fd, tmp = tempfile.mkstemp(prefix=f".{rid}.", dir=RECEIPTS)
     try:
@@ -3811,7 +5450,11 @@ def receipt(args):
         os.chmod(tmp, 0o600); os.replace(tmp, target)
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
-    json_out({"ok": True, "receipt_id": rid, "task_id": args.task_id, "sha256": file_hash})
+    return {"ok": True, "receipt_id": rid, "task_id": task_id, "sha256": file_hash}
+
+def receipt(args):
+    payload = json.loads(args.payload) if args.payload else {}
+    json_out(_seal_receipt(args.task_id, args.kind, payload))
 
 def show(args):
     with conn() as db:
@@ -4137,9 +5780,10 @@ def main():
     p=sub.add_parser("init"); p.set_defaults(fn=lambda a: (ensure(), json_out({"ok":True,"db":str(DB)})))
     p=sub.add_parser("create"); p.add_argument("--project",required=True); p.add_argument("--title",required=True); p.add_argument("--description",default=""); p.add_argument("--owner",default="hermes"); p.add_argument("--priority",choices=sorted(PRIORITIES),default="P2"); p.add_argument("--next-action",default=""); p.add_argument("--due-at",default=""); p.add_argument("--not-before",dest="not_before",default=""); p.add_argument("--id"); p.add_argument("--depends-on",action="append",default=[]); p.add_argument("--tag",action="append",default=[],help="capability/scope tag (repeatable)"); p.add_argument("--requires-receipt",dest="requires_receipt",action="append",default=[],help="receipt kind required before completion — the definition of done (repeatable)"); p.set_defaults(fn=create)
     p=sub.add_parser("update"); p.add_argument("id"); p.add_argument("--status",choices=sorted(STATUSES)); p.add_argument("--next-action"); p.add_argument("--blocked-reason"); p.add_argument("--worktree"); p.add_argument("--branch"); p.add_argument("--pr-url"); p.add_argument("--owner"); p.add_argument("--due-at"); p.add_argument("--not-before",dest="not_before"); p.add_argument("--title"); p.add_argument("--description"); p.add_argument("--priority",choices=sorted(PRIORITIES)); p.add_argument("--project"); p.add_argument("--approved-by",dest="approved_by",default="",help="user approving a policy-gated readiness transition (recorded in the audit chain)"); p.add_argument("--requires-receipt",dest="requires_receipt",action="append",default=None,help="set required receipt kinds (repeatable); a single empty string clears them"); p.set_defaults(fn=update)
-    p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.add_argument("--receipt",dest="evidence_receipts",action="append",default=[],help="evidence receipt id on this task cited by the completion (repeatable)"); p.set_defaults(fn=complete)
+    p=sub.add_parser("complete"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--recall-digest",dest="recall_digest",default=""); p.add_argument("--receipt",dest="evidence_receipts",action="append",default=[],help="evidence receipt id on this task cited by the completion (repeatable)"); p.add_argument("--recap",default="",help="durable where-this-leaves-off recap stamped into the completed audit event (max 2000 chars)"); p.set_defaults(fn=complete)
+    p=sub.add_parser("declare"); p.add_argument("id"); p.add_argument("--model",required=True,help="exact provider/model binding allowed to execute this task (e.g. opencode/x-preview-f-free)"); p.add_argument("--autonomy-level",dest="autonomy_level",choices=sorted(AUTONOMY_LEVELS),default="L1"); p.add_argument("--granted-by",dest="granted_by",required=True,help="the human explicitly granting this autonomy level"); p.add_argument("--grant-hours",dest="grant_hours",type=float,default=24.0,help="grant validity window in hours (>0; default 24)"); p.set_defaults(fn=declare)
     p=sub.add_parser("cancel"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=cancel)
-    p=sub.add_parser("fail"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.add_argument("--no-retry",dest="no_retry",action="store_true",help="skip the retry budget: fail terminally on the first attempt"); p.add_argument("--max-retries",dest="max_retries",type=int,default=3); p.add_argument("--backoff-base",dest="backoff_base",type=int,default=60); p.add_argument("--backoff-cap",dest="backoff_cap",type=int,default=3600); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=fail)
+    p=sub.add_parser("fail"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.add_argument("--cause",default="",choices=["",*sorted(FAILURE_CAUSES)],help="failure taxonomy: transient (standard backoff), infra (doubled backoff), defect (bounded correction child on terminal failure)"); p.add_argument("--no-retry",dest="no_retry",action="store_true",help="skip the retry budget: fail terminally on the first attempt"); p.add_argument("--max-retries",dest="max_retries",type=int,default=3); p.add_argument("--backoff-base",dest="backoff_base",type=int,default=60); p.add_argument("--backoff-cap",dest="backoff_cap",type=int,default=3600); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=fail)
     p=sub.add_parser("block"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--reason",default=""); p.set_defaults(fn=block)
     p=sub.add_parser("unblock"); p.add_argument("id"); p.add_argument("--owner",required=True); p.set_defaults(fn=unblock)
     p=sub.add_parser("defer"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--until",default=""); p.set_defaults(fn=defer)
@@ -4151,25 +5795,36 @@ def main():
     p=sub.add_parser("verify-chain"); p.add_argument("--checkpoint",default=""); p.set_defaults(fn=verify_chain)
     p=sub.add_parser("events"); p.add_argument("--entity-type"); p.add_argument("--entity-id"); p.add_argument("--action"); p.add_argument("--since",default=""); p.add_argument("--until",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--verify",action="store_true"); p.set_defaults(fn=events)
     p=sub.add_parser("claim"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--force",action="store_true",help="claim even if another live lease holds the same worktree/branch seam"); p.set_defaults(fn=claim)
-    p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=heartbeat)
+    p=sub.add_parser("heartbeat"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--note",default=""); p.add_argument("--epoch",type=int,default=None); p.add_argument("--action",default="",help="last meaningful action (durable activity report)"); p.add_argument("--intent",default="",help="concrete next intent (durable activity report)"); p.add_argument("--progress-state",dest="progress_state",default="",choices=["",*sorted(PROGRESS_STATES)]); p.add_argument("--evidence",action="append",default=[],help="receipt id on this task backing the report (repeatable)"); p.add_argument("--stall-deadline",dest="stall_deadline",default="",help="ISO timestamp or +Nm/+Nh: how long silence is healthy before the fleet flags a stall"); p.set_defaults(fn=heartbeat)
+    p=sub.add_parser("run-receipt"); p.add_argument("task_id"); p.add_argument("--harness",required=True,help="executor harness token (hermes/dsh/opencode/codex/claude-code/...)"); p.add_argument("--model",required=True,help="exact provider/model binding used for the run"); p.add_argument("--session",default="",help="harness session id"); p.add_argument("--workspace",default="",help="workspace/worktree the run executed in"); p.add_argument("--outcome",choices=sorted(RUN_OUTCOMES),required=True); p.add_argument("--timeout-seconds",dest="timeout_seconds",type=int,default=None); p.add_argument("--capability",action="append",default=[],help="capability tag exercised by the run (repeatable)"); p.set_defaults(fn=run_receipt)
     p=sub.add_parser("receipt"); p.add_argument("task_id"); p.add_argument("--kind",required=True); p.add_argument("--payload",default="{}"); p.set_defaults(fn=receipt)
     p=sub.add_parser("list"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--overdue",action="store_true"); p.add_argument("--tag",default=""); p.set_defaults(fn=list_tasks)
     p=sub.add_parser("show"); p.add_argument("id"); p.add_argument("--limit",type=int,default=20); p.set_defaults(fn=show)
     p=sub.add_parser("metrics"); p.set_defaults(fn=metrics)
     p=sub.add_parser("dashboard"); p.set_defaults(fn=dashboard)
+    p=sub.add_parser("protocol"); p.set_defaults(fn=protocol)
+    p=sub.add_parser("memory-retain",help="retain one fact/decision into local semantic memory"); p.add_argument("--text",required=True); p.add_argument("--kind",default="decision"); p.add_argument("--project",default=""); p.add_argument("--source",default="agent"); p.add_argument("--tag",action="append",default=[]); p.add_argument("--task-id",dest="task_id",default=""); p.add_argument("--redact",action="store_true"); p.add_argument("--allow-secret",dest="allow_secret",action="store_true"); p.set_defaults(fn=memory_retain)
+    p=sub.add_parser("memory-forget",help="retract a memory from recall (evidence survives)"); p.add_argument("id"); p.add_argument("--superseded-by",dest="superseded_by",default=""); p.set_defaults(fn=memory_forget)
+    p=sub.add_parser("memory-list",help="read-only listing of retained memories"); p.add_argument("--project",default=""); p.add_argument("--query",default=""); p.add_argument("--limit",type=int,default=20); p.add_argument("--kind",default="",help="filter by kind, e.g. commit / pull_request / decision"); p.add_argument("--since",default="",help="ISO date/time lower bound on created_at"); p.add_argument("--all",action="store_true",help="include retracted memories"); p.set_defaults(fn=memory_list)
+    p=sub.add_parser("memory-import",help="one-shot import of a legacy Hindsight bank.jsonl"); p.add_argument("source_path",metavar="BANK_JSONL"); p.add_argument("--project",default="",help="override the project on every imported memory"); p.add_argument("--apply",action="store_true"); p.add_argument("--redact",action="store_true"); p.add_argument("--allow-secret",dest="allow_secret",action="store_true"); p.set_defaults(fn=memory_import)
+    p=sub.add_parser("memory-embed",help="compute embeddings for memories lacking one (optional layer)"); p.add_argument("--limit",type=int,default=0,help="bound one run; 0 = whole backlog"); p.add_argument("--apply",action="store_true"); p.set_defaults(fn=memory_embed)
+    p=sub.add_parser("memory-search",help="semantic search over memories (optional; off the pack path)"); p.add_argument("--query",required=True); p.add_argument("--project",default=""); p.add_argument("--limit",type=int,default=10); p.add_argument("--min-score",dest="min_score",type=float,default=0.3); p.add_argument("--all",action="store_true",help="include retracted memories"); p.set_defaults(fn=memory_search)
+    p=sub.add_parser("memory-status",help="memory store coverage/health; --digest is the cron monitor line"); p.add_argument("--digest",action="store_true"); p.set_defaults(fn=memory_status)
+    p=sub.add_parser("memory-consolidate-brief",help="candidate near-duplicate clusters for a consolidation session (read-only)"); p.add_argument("--project",default=""); p.add_argument("--threshold",type=float,default=0.85); p.add_argument("--max-clusters",dest="max_clusters",type=int,default=25); p.add_argument("--include-git",dest="include_git",action="store_true",help="also cluster commit/PR memories (default: excluded -- they are events, not restatements)"); p.set_defaults(fn=memory_consolidate_brief)
+    p=sub.add_parser("memory-ingest-git",help="record commits and merged PRs as memories (read-only pull)"); p.add_argument("--repo",default="."); p.add_argument("--project",default="",help="defaults to the repo directory name"); p.add_argument("--since",default="30 days ago"); p.add_argument("--limit",type=int,default=500); p.add_argument("--prs",action="store_true",help="also ingest merged pull requests via the gh CLI"); p.add_argument("--apply",action="store_true"); p.add_argument("--redact",action="store_true"); p.add_argument("--allow-secret",dest="allow_secret",action="store_true"); p.set_defaults(fn=memory_ingest_git)
     p=sub.add_parser("dep"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=add_dep)
     p=sub.add_parser("tag"); p.add_argument("id"); p.add_argument("--tag",action="append",required=True,help="capability/scope tag (repeatable)"); p.set_defaults(fn=tag_task)
     p=sub.add_parser("untag"); p.add_argument("id"); p.add_argument("--tag",required=True); p.set_defaults(fn=untag_task)
     p=sub.add_parser("dep-remove"); p.add_argument("id"); p.add_argument("depends_on"); p.set_defaults(fn=remove_dep)
-    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); p.add_argument("--prefer-unblocking",dest="prefer_unblocking",action="store_true",help="tie-break equal-priority candidates by queued dependents freed (critical-path scheduling)"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
+    p=sub.add_parser("next"); p.add_argument("--project"); p.add_argument("--claim",action="store_true"); p.add_argument("--owner",default="hermes"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--max-active",type=int,default=None); p.add_argument("--explain",action="store_true"); p.add_argument("--aging-minutes",dest="aging_minutes",type=int,default=360); p.add_argument("--aging-boost",dest="aging_boost",type=int,default=2); p.add_argument("--recall",action="store_true"); p.add_argument("--agent",default=""); p.add_argument("--budget",dest="recall_budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N locally-retained semantic memories matching this task"); p.add_argument("--related-scope",dest="related_scope",choices=["project","global"],default="project"); p.add_argument("--tag",default="",help="only dispatch tasks carrying this tag"); p.add_argument("--prefer-unblocking",dest="prefer_unblocking",action="store_true",help="tie-break equal-priority candidates by queued dependents freed (critical-path scheduling)"); _add_rerank_flags(p); p.set_defaults(fn=next_task)
     p=sub.add_parser("search"); p.add_argument("query"); p.add_argument("--status"); p.add_argument("--project"); p.add_argument("--priority"); p.add_argument("--rank",action="store_true"); p.add_argument("--tag",default=""); p.set_defaults(fn=search_tasks)
     p=sub.add_parser("note"); p.add_argument("task_id"); p.add_argument("--kind",default="fact"); p.add_argument("--content",required=True); p.add_argument("--source",default=""); p.add_argument("--pinned",action="store_true"); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=add_note)
     p=sub.add_parser("notes"); p.add_argument("task_id"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=list_notes)
     p=sub.add_parser("supersede-note"); p.add_argument("note_id"); p.add_argument("--content",required=True); p.add_argument("--kind",default=None); p.add_argument("--source",default=""); p.add_argument("--ttl-hours",dest="ttl_hours",type=float,default=None); _add_secret_flags(p); p.set_defaults(fn=supersede_note)
-    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
-    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
-    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
-    p=sub.add_parser("recall-diff"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.set_defaults(fn=recall_diff)
+    p=sub.add_parser("context"); p.add_argument("task_id"); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N locally-retained semantic memories matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=task_context)
+    p=sub.add_parser("recall"); p.add_argument("task_id"); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N locally-retained semantic memories matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall)
+    p=sub.add_parser("recall-verify"); p.add_argument("task_id"); p.add_argument("--digest",required=True); p.add_argument("--agent",default=""); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N locally-retained semantic memories matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); _add_rerank_flags(p); p.set_defaults(fn=recall_verify)
+    p=sub.add_parser("recall-diff"); p.add_argument("task_id"); p.add_argument("--digest",required=True); _add_rerank_flags(p); p.set_defaults(fn=recall_diff)
     p=sub.add_parser("search-notes"); p.add_argument("query"); p.add_argument("--kind"); p.add_argument("--project"); p.add_argument("--status"); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--include-expired",dest="include_expired",action="store_true"); _add_rerank_flags(p); p.set_defaults(fn=search_notes)
     p=sub.add_parser("search-handoffs"); p.add_argument("query"); p.add_argument("--task",default=""); p.add_argument("--from-agent",dest="from_agent",default=""); p.add_argument("--to-agent",dest="to_agent",default=""); p.add_argument("--project",default=""); p.add_argument("--limit",type=int,default=50); p.add_argument("--rank",action="store_true"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=search_handoffs)
     p=sub.add_parser("session-scan"); p.add_argument("--root",required=True,help="directory tree of session transcripts to inventory (read-only)"); p.add_argument("--profile",default=""); p.add_argument("--project",default=""); p.add_argument("--since",default="",help="only files modified at/after this ISO timestamp"); p.add_argument("--max-file-bytes",dest="max_file_bytes",type=int,default=DEFAULT_SESSION_MAX_FILE_BYTES); p.set_defaults(fn=session_scan)
@@ -4190,7 +5845,7 @@ def main():
     p=sub.add_parser("release"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=release)
     p=sub.add_parser("renew"); p.add_argument("id"); p.add_argument("--owner",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=renew)
     p=sub.add_parser("transfer"); p.add_argument("id"); p.add_argument("--from-owner",required=True,dest="from_owner"); p.add_argument("--to-owner",required=True,dest="to_owner"); p.add_argument("--minutes",type=int,default=30); p.add_argument("--epoch",type=int,default=None); p.set_defaults(fn=transfer)
-    p=sub.add_parser("resume"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=resume)
+    p=sub.add_parser("resume"); p.add_argument("task_id"); p.add_argument("--agent",required=True); p.add_argument("--minutes",type=int,default=30); p.add_argument("--budget",type=int,default=4000); p.add_argument("--related",type=int,default=0); p.add_argument("--related-handoffs",dest="related_handoffs",type=int,default=0); p.add_argument("--dep-context",dest="dep_context",type=int,default=0); p.add_argument("--related-sessions",dest="related_sessions",type=int,default=0,help="pack up to N ingested session-message snippets matching this task"); p.add_argument("--related-facts",dest="related_facts",type=int,default=0,help="pack up to N currently-valid temporal facts matching this task"); p.add_argument("--related-semantic",dest="related_semantic",type=int,default=0,help="pack up to N locally-retained semantic memories matching this task"); p.add_argument("--related-scope",choices=["project","global"],default="project"); p.add_argument("--max-active",type=int,default=None); p.set_defaults(fn=resume)
     p=sub.add_parser("leases"); p.add_argument("--owner"); p.add_argument("--all",action="store_true"); p.set_defaults(fn=leases)
     args=ap.parse_args(); args.fn(args)
 

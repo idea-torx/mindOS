@@ -1,11 +1,11 @@
-# MindOS — Autopilot v2
+# MindOS — Autopilot v3
 
-**MindOS is the durable local operating system for Hermes and cooperating AI agents.** It is the v2 evolution of the IdeatorX Autopilot: a shared control plane for execution state, memory, temporal facts, handoffs, receipts, recovery, and agent coordination.
+**MindOS is the durable local operating system for Hermes and cooperating AI agents.** It is a shared control plane for execution state, memory, temporal facts, handoffs, receipts, recovery, and agent coordination.
 
 MindOS brings together:
 
 - **Autopilot execution truth** — tasks, leases, dependencies, approvals, receipts, and audit history.
-- **Shared semantic memory** — Hindsight remains the semantic brain through an explicit, provider-neutral binding.
+- **Local semantic memory** — an in-database `memories` store with an FTS5 index, so retrieval is deterministic, offline, and inside the audit chain. The former external Hindsight binding is retired; legacy banks import through `memory-import`.
 - **Temporal facts** — evolving ownership, priorities, validity windows, superseded decisions, and blockers.
 - **Agent memory and context** — Claude memory archives, session sources, profiles, skills, and cron definitions with provenance.
 - **Recovery and portability** — sealed inventories, dry-run-first migration, rollback, quarantine, integrity checks, and cross-agent handoffs.
@@ -28,26 +28,117 @@ Visual explanations (all render on GitHub):
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system layers & data flow, task/lease/receipt lifecycle, memory/context retrieval path, migration & rollback path, capability matrix, plus a [fact table](ARCHITECTURE.md#fact-table) mapping every claim to source + test.
 - [docs/COMBINATORIAL-ARCHITECTURE.md](docs/COMBINATORIAL-ARCHITECTURE.md) — the dimension → combination → capability derivation and why "just use Git" misses the point.
 
-Core invariants: single SQLite authority (Hindsight bound, never copied), fail
-closed, evidence over claims, dry-run first, source immutability.
+Core invariants: single SQLite authority, fail closed, evidence over claims,
+dry-run first, source immutability.
 
 ## Project identity
 
 ```text
-Project:        MindOS
-Generation:     Autopilot v2
+Project:         MindOS
+Generation:      Autopilot v3
+Release:         v0.5.0
 Primary surface: Hermes Agent
-Execution core: SQLite-backed Autopilot
-Semantic brain: Hindsight shared bank
-Fallback:       preserved prior Autopilot installation
+Execution core:  SQLite-backed Autopilot
+Semantic brain:  local in-database memories store (memory-fts-v1)
+Fallback:        preserved prior Autopilot installation
 ```
 
-The schema names that end in `-v1` elsewhere in this document are **artifact-format versions**, not the project generation. They identify stable JSON/report formats inside MindOS v2.
+The schema names that end in `-v1` elsewhere in this document are **artifact-format versions**, not the project generation.
 
 ## Safety boundary
 
-MindOS is a local coordination and memory system. It does **not** deploy, merge, send external messages, submit applications, or run arbitrary agent commands without an explicitly authorized integration and verified evidence.
+MindOS coordinates durable work and evidence. It does **not** silently deploy,
+merge, send external messages, submit applications, or cross a human approval
+seam. Autonomous continuation is explicit, model-bound, time-limited, and
+receipt-backed.
 
+## Autopilot v3 continuation
+
+Autopilot v3 adds the missing impulse layer for complex work. A bounded nanny
+tick can recover stale leases, detect findings, run capped approved repairs,
+escalate decisions, and emit an audited state report. It is cron-driven rather
+than a resident daemon, so every tick is bounded and independently observable.
+
+Tasks may declare an autonomy level and exact model/provider binding:
+
+```bash
+python3 "$A" declare <task-id> \
+  --model opencode/x-preview-f-free \
+  --autonomy-level L1 \
+  --granted-by leo \
+  --grant-hours 24
+python3 "$O" nanny --dry-run
+python3 "$O" nanny --max-repairs 2
+```
+
+The tick is assembled from three inspectable commands, each usable on its own:
+
+```bash
+python3 "$O" sense           # typed, content-hashed findings across doctor,
+                             # verify-chain, recall-stale, and activity sweeps
+python3 "$O" repair-list     # the tier-0 repair policies eligible to run
+python3 "$O" fts-rebuild --dry-run   # rebuild a drifted full-text index
+```
+
+`sense` is read-only: it reports findings and never mutates state.
+`repair-list` shows which bounded repairs the nanny is permitted to apply, and
+`fts-rebuild` is one of them — dry-run first, like every other write path here.
+
+The nanny reports four compact impulse states:
+
+```text
+all_clear       nothing needs attention
+working         work is active or progressing
+hit_snag        bounded work remains blocked or needs correction
+decision_needed a human approval or breaker decision is required
+```
+
+Persistent findings are carried forward by digest instead of being narrated as
+repeated status spam. A task's model, autonomy grant, recap, receipts, and
+audit events remain tied together for later continuation.
+
+## Managed intra-bot communication
+
+The managed botmail layer adds a provider-neutral envelope for Hermes, DSH,
+OpenCode, Codex, Claude Code, and future harnesses. It validates peer
+allowlists, capability epochs, profile scope, content class, replay budgets,
+and provenance before accepting bot-originated messages. Delivery is
+idempotent and produces accepted, rejected, duplicate, expired, or failed
+receipts. Bot chat remains distinct from user relay, handoffs, and task
+receipts; bounded bot-chat context is profile-scoped and redacted.
+
+The live layer is installed with explicit follow-up gates for Hermes peer-DM
+delivery, gateway roster reconciliation, semantic bot-chat synchronization,
+and the cross-profile end-to-end sentinel.
+
+## Hermes session-start context
+
+When enabled in the Hermes configuration, MindOS supplies one bounded context
+pack on the first turn of a new session. It can include relevant session
+history, temporal facts, handoffs, receipts, and semantic memory with
+provenance. Continuation turns receive no repeated injection.
+
+```yaml
+mindos_bridge:
+  context_pack: true
+  context_pack_max_bytes: 4096
+  context_pack_seconds: 15
+
+hooks:
+  pre_llm_call:
+    - command: $HOME/.hermes/mindos/mindos_gateway_hook.py
+      timeout: 15
+```
+
+The pack is ephemeral and bounded. It does not rewrite the system prompt,
+create synthetic user messages, cross profiles, or bypass redaction. Set
+`HERMES_MINDOS_CONTEXT=off` for an end-to-end opt-out. Use
+`python3 mindos_context_pack.py sentinel --json` to exercise the disposable
+proof path without touching live homes.
+
+## Runtime boundaries
+
+This v3 release is a registry, memory, and continuation layer. It does **not** deploy, merge, send external messages, submit applications, or run arbitrary agent commands.
 ## Commands
 
 ```bash
@@ -307,7 +398,7 @@ digest — so recovery is idempotent, observable, and provably context-fresh.
 ## Shared memory (task notes)
 
 Tasks carry a structured memory of provenance-tagged notes. This is the
-retrieval substrate agents share across Hindsight/SQLite boundaries:
+retrieval substrate agents share across task boundaries:
 
 ```bash
 python3 "$A" note <task-id> --kind fact --content "API rate limit is 60/min" --source hermes
@@ -1460,27 +1551,27 @@ flattening the brain into one authority:
 | --- | --- | --- |
 | `autopilot` (state.db + receipts) | execution truth | integrity verdict, row counts, receipt-file count |
 | `temporal` (temporal.db) | temporal facts | integrity + entity/relation/event counts; `absent` if none |
-| `hindsight` | semantic memory | provider-neutral HTTP binding probe: `/health` + shared-bank presence and count-shaped stats |
+| `memories` (state.db) | semantic memory | engine tag plus live/retracted memory counts; shares the control-plane file, inventoried as its own epistemic source |
 | `claude_sync` (claude-memory-sync.json) | sync metadata | entry count, sha256 |
 | `claude_memory` (~/.claude/projects/*/memory) | human archive | per-file checksums across all projects |
 | `sessions` (raw store + control-plane cache) | session cache | file checksums plus derived row counts |
 | `profiles`, `skills`, `cron` | definitions | checksummed inventories; cron job count parsed from jobs.json |
 
 ```bash
-python3 "$O" brain-inventory --out brain.json                       # defaults: live homes, live Hindsight
+python3 "$O" brain-inventory --out brain.json                       # defaults: live homes
 python3 "$O" brain-inventory-check brain.json                      # verify the seal before trusting it
 ```
 
 Design rules, enforced and tested:
 
 - **Dry-run-first / read-only by construction**: databases open with read-only
-  URIs, Hindsight is probed with GETs only (the shared bank is never written,
-  duplicated, or copied into SQLite as a second authority), and a full-fixture
-  hash comparison proves nothing scanned is ever mutated — including on
-  fail-closed runs.
+  URIs, and a full-fixture hash comparison proves nothing scanned is ever
+  mutated — including on fail-closed runs. Since the Hindsight probe was
+  retired this command makes no outbound network call at all, so an offline
+  machine inventories the full brain with nothing degraded by reachability.
 - **Redaction**: values never enter the manifest. Text files are secret-
-  scanned with findings reported **by kind only**; Hindsight stats are
-  whitelisted to stable counts.
+  scanned with findings reported **by kind only**; every recorded statistic
+  is a stable count, never a timestamp or latency figure.
 - **Sealed & reproducible**: versioned `mindos-brain-inventory-v1` documents,
   sha256-sealed with `created_at` outside the digest, so unchanged sources
   re-seal byte-identically and interrupted installs resume against the same
@@ -1490,10 +1581,8 @@ Design rules, enforced and tested:
   bookkeeping event to it.
 - **Honest degradation**: corruption or ambiguity fails closed naming exact
   blockers (garbage `jobs.json`, a non-SQLite `temporal.db`); an absent
-  optional sidecar and an unreachable Hindsight are recorded as `absent` /
-  `unavailable` without blocking; a healthy service missing
-  `autopilot-shared-context` is `degraded` because the binding itself is
-  broken.
+  optional sidecar and an absent sync file are recorded as `absent` /
+  `unavailable` without blocking.
 - **Bounded & atomic**: file-count caps keep giant trees from stalling the
   sweep (overflow reported, never silent); manifests are written atomically
   with `0600` permissions.
@@ -1503,8 +1592,9 @@ Design rules, enforced and tested:
 `brain-import` consumes only a sealed brain inventory and requires an explicit
 absolute new home. It is a separate layer from `migrate-import`: execution
 truth stays at the existing SQLite migration boundary, while this command
-brings across the non-execution brain surfaces without turning Hindsight into a
-second local semantic authority.
+brings across the non-execution brain surfaces. Semantic memory is not among
+them: it lives in the control-plane database and moves with the execution-truth
+import, so there is never a second semantic authority to reconcile.
 
 ```bash
 python3 "$O" brain-import --inventory brain.json --target /absolute/new/mindos
@@ -1528,12 +1618,12 @@ quarantine records identities, checksums, kinds, and reasons — never values.
 Re-running the same inventory verifies the already-created bytes and is a
 no-op; it never replaces local destination data.
 
-For Hindsight, `brain-import` writes only
-`bindings/hindsight-shared-bank.json`: the provider-neutral endpoint, bank,
-GET-probed health/bound state, count-shaped stats, and inventory seal. It never
-exports, writes, or stores Hindsight semantic content in SQLite. An unavailable
-or degraded bank is faithfully bound as health metadata so recovery can happen
-in place rather than inventing a duplicate authority.
+`brain-import` writes no service binding. The retired Hindsight binding file
+(`bindings/hindsight-shared-bank.json`) is gone along with the service it
+pointed at; the `memories` source is planned as
+`external_execution_import_required`, because semantic memory travels inside
+the control-plane database rather than being copied out as a second
+authority.
 
 ## Migration inventory (installer stage one)
 
@@ -1541,7 +1631,7 @@ Bringing a new machine (or a new Autopilot home) up starts with honest
 discovery, not import. `migrate-inventory` walks an explicit `--root` — it
 never guesses at live homes or touches a source — and classifies the durable
 sources the migration model cares about: Autopilot SQLite databases
-(execution truth), Hindsight banks (shared brain input), Hermes homes
+(execution truth), legacy Hindsight banks (importable via `memory-import`), Hermes homes
 (profiles/skills/cron/ownership), Obsidian vaults (optional human archive),
 and unrecognized SQLite files. Every source is checksummed file-by-file,
 Autopilot databases get a read-only integrity check plus row counts, and all
@@ -1595,8 +1685,7 @@ python3 "$O" migrate-import --inventory inventory.json --source-id src-… --app
 Design rules, enforced and tested:
 
 - **Dry-run first**: without `--apply` nothing is written; the plan reports
-  per-table source/already-present counts, sanitized tasks, quarantined
-  orphan receipts, secret kinds,
+  per-table source/already-present counts, sanitized tasks, secret kinds,
   skipped disposable heartbeats, and whether the target would need
   `--relink-audit`.
 - **Idempotent**: an identical re-run deduplicates to nothing (`deduplicated:
@@ -1607,21 +1696,12 @@ Design rules, enforced and tested:
   `waiting_for_agent`) are reset to `queued` with leases cleared, because the
   prior owner does not exist here; heartbeats are disposable liveness cache
   and are deliberately not carried.
-- **Orphan receipts are quarantined, never attached**: disposable verification
-  receipts routinely outlive their tasks, and a source can carry receipt rows
-  whose `task_id` matches no task in the source tasks table (or this home).
-  Importing one would violate foreign-key integrity; the forbidden
-  alternatives — weakening the key, inventing a task, or re-pointing evidence
-  at a guess — are exactly how broken execution truth gets created. So an
-  orphan is withheld from the import entirely: it appears in the dry-run
-  plan and the sealed result doc with its identity, kind, `file_hash`, and a
-  sha256 of the full row (`orphan_receipts_quarantined`), it is recorded in a
-  digest-only audited `migration_orphan_receipt_quarantined` event so no
-  secret value ever enters the ledger, its bytes stay behind in the immutable
-  source home, the coverage health check excludes it from the receipts
-  expectation, and the rollback journal never contains it (there is nothing
-  to undo). A receipt whose task already exists here imports normally,
-  attached to that task by identity.
+- **FK-orphan refusal**: before either dry-run or apply, the source is checked
+  with `PRAGMA foreign_key_check`. Any dangling receipt, heartbeat, or other
+  foreign-key row is named and refused; the importer never weakens constraints,
+  invents tasks, attaches evidence by guess, or repairs the source in place.
+  Resolve the source separately through an approved remediation path, then
+  re-seal the inventory.
 - **Audit-chain integrity**: a fresh home imports the source chain verbatim;
   a home with genuine history refuses to merge a foreign chain (that would
   break tamper evidence) unless `--relink-audit` explicitly relinks the
@@ -1916,6 +1996,98 @@ concurrency and false-success seams it found:
   documents fail with clean messages; `ops.py policy` resolves policies under
   `HERMES_AUTOPILOT_HOME` instead of a hardcoded live-home path; `ops.py` is
   importable (`__main__`-guarded) for in-process testing.
+
+## Hermes runtime home selection (explicit, reversible)
+
+The runtime resolves its home in a strict precedence order, so the new MindOS
+home can be selected without ever touching `~/.hermes/autopilot`:
+
+1. `HERMES_AUTOPILOT_HOME` env var (unchanged; always wins)
+2. An explicit selector file — `~/.hermes/autopilot-home-selector.json`
+   (override with `AUTOPILOT_HOME_SELECTOR`), written atomically `0600` by
+   `ops.py home-select` and removed by `ops.py home-deselect --apply`
+3. The immutable rollback default `~/.hermes/autopilot`
+
+Nothing writes the selector implicitly: a missing, unreadable, or malformed
+selector degrades silently to the default rather than failing the runtime.
+A selector pointing at a directory that no longer exists is ignored.
+
+```bash
+O=~/.hermes/mindos/ops.py
+python3 "$O" home-doctor --home ~/.hermes/mindos   # read-only health sweep of an explicit home
+python3 "$O" home-show                             # which home is active and why
+python3 "$O" home-select --home ~/.hermes/mindos   # verify-then-select (refuses an unhealthy home)
+python3 "$O" home-deselect                         # read-only dry-run plan
+python3 "$O" home-deselect --apply                 # one-command rollback to ~/.hermes/autopilot
+```
+
+`home-select` refuses to point at the rollback default itself and runs a
+read-only doctor sweep first (audit chain, sealed checkpoints under
+`<home>/backups`, stale leases) — selection fails closed naming every problem,
+so a default switch only ever follows verified health. Deselecting is the
+one-command rollback; the old home's data is never mutated by any of this.
+
+## Semantic recall (local memory engine)
+
+Semantic memory behind the same shape as sessions/facts, and behind the same
+retrieval machinery: the `memories` table in the control-plane database with an
+FTS5 index over it. Retrieval is deterministic token matching — no model, no
+embeddings, no network. Nothing outside the process is consulted.
+
+This replaced an external Hindsight adapter (a `bank.jsonl` file read
+out-of-band, plus a provider HTTP service on port 8888). Moving the store
+in-database removed a class of failure the old design invited: cross-context
+bleed from a shared external bank, torn JSONL lines, retains that landed on
+disk but not in the audit chain, and sealed pack digests silently invalidated
+by an out-of-band file edit. See "Memory engine migration" below for the
+one-shot import path off a legacy bank.
+
+- **Recall (`--related-semantic N`)** on `context`, `recall`, `recall-verify`,
+  `resume`, and `next --claim` packs up to N matching memories under the same
+  budget as other sections, each row carrying its own engine tag
+  (`memory-fts-v1`) so staleness detection covers the semantic section.
+  Ordering is deterministic (`created_at DESC`, then `id ASC`) so digests are
+  exactly recomputable, and — like related facts and handoffs — no relevance
+  score is emitted, because BM25 drifts whenever any row joins the index and
+  would falsely stale sealed digests. Retracted memories never pack.
+- **Scope is enforced, not preferred.** With `--related-scope project` (the
+  default) a pack sees that project's memories plus project-less fleet-wide
+  ones, and nothing else. A scoped recall that matches nothing returns nothing;
+  it does not fall back to unscoped results.
+- **Empty is healthy**: with nothing retained the flag is a no-op and
+  `ops.py doctor` reports `memory_store` as a note (`status: empty`), never a
+  problem.
+- **Retain (`memory-retain`)** writes the row and its audit event in one
+  transaction, behind the same secret guard as notes (`--redact` stores
+  placeholders, `--allow-secret` overrides, both audited). Memory ids are
+  content-addressed per project, so retaining the same fact twice is an
+  idempotent no-op rather than a duplicate.
+- **Retract (`memory-forget <id>`)** stops a memory packing without deleting
+  it, so the audit chain still explains why a pack that once carried it no
+  longer does. `--superseded-by <id>` points at the memory that replaced it.
+- **Inspect (`memory-list`)** is the read-only view of the store: filter by
+  `--project`, `--query`, and `--all` to include retracted rows.
+
+```bash
+python3 "$A" memory-retain --text "auth sessions expire after 30 days" \
+    --kind decision --project Auth --tag auth
+python3 "$A" memory-list --project Auth
+python3 "$A" context <task-id> --related-semantic 5
+python3 "$A" memory-forget mem-18da4972e0ff92c8
+```
+
+### Memory engine migration
+
+A legacy Hindsight `bank.jsonl` imports in one command. The source file is
+opened read-only and never mutated; malformed lines are counted and skipped,
+`created_at` is preserved so imported memories keep their place in temporal
+order, and the same secret guard as `memory-retain` applies. Content
+addressing makes a re-run a no-op, so an interrupted import is simply re-run.
+
+```bash
+python3 "$A" memory-import ~/.hermes/hindsight/bank.jsonl            # dry run
+python3 "$A" memory-import ~/.hermes/hindsight/bank.jsonl --apply
+```
 
 ## Next integration
 

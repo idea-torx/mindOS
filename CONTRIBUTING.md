@@ -30,7 +30,7 @@ after each release. It is **not** OSI open source during the restricted period.
    ```
 
 6. Scan your diff for secrets/PII before committing. Never commit state.db,
-   temporal.db, receipts, session caches, Hindsight exports, Keychain values,
+   temporal.db, receipts, session caches, semantic-memory exports, Keychain values,
    `.env` files, or anything under `installation-reports/`.
 7. Open a pull request describing the behavior, tests added, and risks.
 

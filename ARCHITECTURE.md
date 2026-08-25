@@ -4,7 +4,7 @@ MindOS is a durable local coordination plane ("control tower") for autonomous
 agent fleets. It answers one question continuously: *what is true right now,
 and what evidence proves it?*
 
-This document explains MindOS — Autopilot v2 — before implementation details.
+This document explains MindOS — Autopilot v3 — before implementation details.
 It is grounded in this repository's source and tests: every architectural
 claim in the [fact table](#fact-table) maps to a real source file, command,
 test suite, or verified artifact. Nothing here is aspirational.
@@ -65,8 +65,9 @@ flowchart TB
         TD[("temporal.db<br/>fact sidecar")]
         RF[("receipts/<br/>hash-sealed files")]
         BK[("backups/<br/>snapshots · archives · checkpoints")]
+        SM[("memories + memories_fts<br/>semantic store, same authority")]
     end
-    HS["Hindsight shared bank<br/>(semantic memory — bound,<br/>never copied)"]
+    EW["embed_worker.py<br/>(optional, out-of-process, read-only)"]
     SES["Raw session stores<br/>(read-only transcript adapters)"]
 
     CLI --> G
@@ -79,13 +80,17 @@ flowchart TB
     G --> DB
     F --> DB
     S --> A
-    HS -. "provider-neutral HTTP binding" .-> O
+    A --> SM
+    F --> SM
+    EW -. "optional embeddings, never on the pack path" .-> SM
     SES -. "read-only ingest → disposable cache" .-> A
 ```
 
-Data flows one way into SQLite as execution truth. Hindsight stays an external
-shared bank accessed by GET-only probes; raw transcripts index into a
-rebuildable cache that is never treated as truth.
+Data flows one way into SQLite as execution truth. Semantic memory lives in
+that same database as a `memories` table with an FTS5 index, so a retain and
+its audit event commit in one transaction and retrieval needs no network and
+no model. Raw transcripts index into a rebuildable cache that is never treated
+as truth.
 
 ### 2. Agent / task / lease / receipt lifecycle
 
@@ -152,7 +157,7 @@ flowchart TB
     RB -->|"drifted rows or local dependents"| FC["Fail closed<br/>(--force is explicit + audited)"]
     IMP --> DOC["doctor sweep<br/>integrity · FK · audit chain"]
     subgraph Brain["Brain-level (non-execution surfaces)"]
-        BI["brain-inventory<br/>(9 source kinds, read-only)"] --> BIM["brain-import<br/>(quarantine-first, Hindsight = binding only)"]
+        BI["brain-inventory<br/>(9 source kinds, read-only)"] --> BIM["brain-import<br/>(quarantine-first)"]
     end
 ```
 
@@ -238,21 +243,21 @@ Recovery of stale leases (guarded so mid-sweep claim losses are skipped and
 reported), escalation, doctor health checks (including FTS5 inverted-index
 drift detection via fts5vocab), project policies under `policies/`,
 migration inventory/import/rollback, brain inventory across nine source kinds
-(Autopilot, Hindsight binding, temporal sidecar, Claude memory sync, memory
-archives, sessions, profiles/skills, cron definitions).
+(Autopilot, local semantic memories, temporal sidecar, Claude memory sync,
+memory archives, sessions, profiles/skills, cron definitions).
 
 ### verify.py — end-to-end verification
 
 Self-contained suite that builds disposable fixture homes and exercises every
 command, including failure injection, race injection, interrupted re-runs,
 rollback to zero, source immutability, secret-guard refusal/redaction, FTS
-drift, Hindsight-unavailable degradation, and cross-agent probes. This suite
+drift, absent-optional-source degradation, and cross-agent probes. This suite
 is the primary evidence base for the fact table below.
 
 ## Core invariants
 
-1. **Single authority** — SQLite is the execution authority; Hindsight remains
-   a shared semantic bank and is never copied into SQLite as a second one.
+1. **Single authority** — one SQLite database is the authority for both
+   execution truth and semantic memory, so the two can never disagree.
 2. **Fail closed** — ambiguity/corruption refuses with exact blockers; absent
    optional sources are recorded honestly without blocking.
 3. **Evidence over claims** — completions require sealed receipts; audit
@@ -293,7 +298,8 @@ or the named command itself.
 | Import merges idempotently, quarantines orphan receipts, relinks audit safely | `ops.py migrate-import --apply` | interrupted re-run + quarantine tests in `verify.py` |
 | Rollback removes exactly what an apply inserted; fails closed on drift | `ops.py migrate-rollback` | rollback-to-zero + drifted-row tests in `verify.py` |
 | Brain inventory reads nine source kinds without mutating anything | `ops.py brain-inventory/brain-inventory-check` | nine-source role assertions + no-mutation hashes in `verify.py` |
-| Hindsight is bound, never copied into SQLite | `ops.py brain-import` (`bindings/hindsight-shared-bank.json`) | degraded/unavailable-bank tests in `verify.py` |
+| Semantic memory is local, deterministic, and inside the audit chain | `autopilot.py memory-retain/memory-list` (`memory-fts-v1`) | `memory_semantic_recall` in `verify.py` |
+| The optional embedding layer never blocks a command or the context pack | `autopilot.py memory-embed/memory-search` (`embed_worker.py`) | `memory_embedding_layer_is_optional_and_off_the_pack_path` in `verify.py` |
 | Session ingestion is a redacted, rebuildable cache — never truth | `autopilot.py session-scan/session-ingest/sessions-prune` | cache/rebuild/prune tests in `verify.py` |
 | One-command onboarding runs staged, dry-run-first, doctor-gated | `ops.py onboard` | stage-failure stop tests in `verify.py` |
 

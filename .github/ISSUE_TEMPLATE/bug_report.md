@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: Report a problem with MindOS Autopilot v2
+about: Report a problem with MindOS Autopilot v3
 title: ''
 labels: bug
 assignees: ''

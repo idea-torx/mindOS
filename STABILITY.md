@@ -141,6 +141,13 @@ checkpoint divergence, tampered manifests/result docs, redaction bypass attempts
 
 ## Verification added
 
+- Home selector + health gate: resolution precedence (env > selector >
+  default) proven including malformed-selector and vanished-home degradation
+  to the default; `home-select` refuses an unhealthy home with the exact
+  problem kinds, refuses the rollback default itself, writes the selector
+  atomically `0600`; `home-deselect` is dry-run-first and its apply is the
+  one-command rollback; `home-doctor` detects a tampered audit chain and a
+  corrupted checkpoint on an explicit home without mutating either home.
 - Black-box: policy env resolution, duplicate-id refusal, sealed approval
   receipts + clean doctor, malformed/missing result-doc handling,
   handoffs_fts drift detection + rebuild repair.

@@ -19,7 +19,7 @@ All state lives in a local SQLite home (`$MINDOS_HOME`, default
 | --- | --- |
 | `state.db`, `temporal.db` | live execution truth / temporal facts |
 | `receipts/`, `installation-reports/` | sealed evidence and inventory manifests |
-| `sessions/`, Hindsight exports | session caches and semantic memory |
+| `sessions/`, semantic-memory exports | session caches and semantic memory |
 | `backups/`, `runtime/` | machine-local recovery artifacts |
 | `.env`, key files | credentials |
 | Claude memory contents (`memory/`, sync JSON) | personal agent memory |

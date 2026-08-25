@@ -17,7 +17,7 @@ jobs:
           python-version: "3.11"
 
       - name: Byte-compile all sources (py_compile)
-        run: python3 -m py_compile autopilot.py ops.py verify.py seed_current_state.py
+        run: python3 -m py_compile autopilot.py ops.py verify.py seed_current_state.py embed_worker.py mindos_botmail.py mindos_bridge.py mindos_context_pack.py mindos_gateway_hook.py mindos_sqlite_adapter.py
 
       - name: Secret-safe scan of tracked content
         run: |
@@ -38,6 +38,18 @@ jobs:
           assert not missing, f"commands undocumented in README: {missing}"
           print("docs diff check: OK")
           EOF
+
+      - name: Component test suites
+        run: |
+          for t in tests_botmail.py tests_bridge.py tests_sqlite_adapter.py \
+                   tests_gateway_bridge.py tests_context_injection.py \
+                   tests_context_integration.py; do
+            echo "--- $t"
+            python3 "$t"
+          done
+
+      - name: Context-pack sentinel
+        run: python3 mindos_context_pack.py sentinel --json
 
       - name: Full end-to-end verification suite
         run: python3 verify.py

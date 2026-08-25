@@ -12,6 +12,12 @@ temporal.db-*
 # Receipts and sealed install/evidence artifacts (never publish)
 receipts/
 installation-reports/
+proof/
+
+# Operator-local cron glue: these carry machine-specific repository paths
+memory_ingest.sh
+memory_monitor.sh
+memory_session.sh
 *receipt*.json
 !docs/examples/*receipt*
 

@@ -1,6 +1,6 @@
 ---
 name: Feature request
-about: Propose a capability for MindOS Autopilot v2
+about: Propose a capability for MindOS Autopilot v3
 title: ''
 labels: enhancement
 assignees: ''

@@ -19,7 +19,9 @@ Each dimension alone is just data:
 
 - **Execution truth** is rows in `state.db` (`autopilot.py` schema) — Git can
   store JSON, but it cannot atomically arbitrate two agents claiming one task.
-- **Semantic memory** lives in Hindsight, bound provider-neutrally and never
+- **Semantic memory** lives in the same SQLite authority as a deterministic
+  FTS-indexed `memories` store, retained with its audit event in one
+  transaction and never
   copied (`bindings/hindsight-shared-bank.json` from `ops.py brain-import`).
 - **Temporal facts** are triples with validity windows in `temporal.db`
   (`fact-assert` / `fact-retract`).

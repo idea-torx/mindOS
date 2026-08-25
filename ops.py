@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Autopilot v1.1 safe operations: recovery, approvals, reconciliation, reports."""
 from __future__ import annotations
-import json, os, re, sqlite3, subprocess, sys, tempfile, urllib.request, urllib.parse, hashlib
-import contextlib, io
+import json, os, re, shlex, sqlite3, subprocess, sys, tempfile, urllib.request, urllib.parse, hashlib
+import contextlib, io, uuid
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -828,6 +828,7 @@ def _fts_index_docs(c, fts: str):
 def doctor(args=None):
     """Read-only consistency sweep: orphan deps, receipt index/files, audit chain, stale leases."""
     problems = []
+    notes = []
     with db() as c:
         for r in c.execute(
             "SELECT d.task_id,d.depends_on FROM task_deps d "
@@ -901,10 +902,12 @@ def doctor(args=None):
             "WHERE f.task_id!='' AND t.id IS NULL"):
             problems.append({'kind': 'fact_task_missing', 'fact_id': r['id'], 'task_id': r['task_id']})
         for table, fts in (('notes', 'notes_fts'), ('tasks', 'tasks_fts'), ('handoffs', 'handoffs_fts'),
-                           ('session_messages', 'session_messages_fts'), ('facts', 'facts_fts')):
+                           ('session_messages', 'session_messages_fts'), ('facts', 'facts_fts'),
+                           ('memories', 'memories_fts')):
             ready = (autopilot._handoffs_fts_ready(c) if fts == 'handoffs_fts'
                      else autopilot._sessions_fts_ready(c) if fts == 'session_messages_fts'
                      else autopilot._facts_fts_ready(c) if fts == 'facts_fts'
+                     else autopilot._memories_fts_ready(c) if fts == 'memories_fts'
                      else autopilot._fts_ready(c))
             if not ready:
                 continue
@@ -924,7 +927,26 @@ def doctor(args=None):
                                  'rows': len(src), 'indexed': len(idx),
                                  'missing_from_index': sorted(src - idx)[:20],
                                  'stale_in_index': sorted(idx - src)[:20]})
-    print(json.dumps({'ok': not problems, 'problems': problems, 'count': len(problems)}, sort_keys=True))
+        # Semantic memory: a healthy-with-note report on the local store. An
+        # empty store degrades --related-semantic to a no-op and must never
+        # fail the doctor sweep, so it lands in `notes`, never in `problems`.
+        try:
+            live = c.execute(
+                "SELECT COUNT(*) FROM memories WHERE superseded_by=''").fetchone()[0]
+            retracted = c.execute(
+                "SELECT COUNT(*) FROM memories WHERE superseded_by<>''").fetchone()[0]
+            notes.append({'kind': 'memory_store',
+                          'status': 'available' if live else 'empty',
+                          'engine': autopilot.MEMORY_ENGINE_TAG,
+                          'memories': live, 'retracted': retracted,
+                          'fts': autopilot._memories_fts_ready(c),
+                          **({} if live else
+                             {'note': 'no memories retained; --related-semantic is a no-op'})})
+        except sqlite3.Error as e:
+            notes.append({'kind': 'memory_store_unreadable', 'error': str(e),
+                          'note': '--related-semantic degrades to a no-op'})
+    print(json.dumps({'ok': not problems, 'problems': problems, 'count': len(problems),
+                      'notes': notes}, sort_keys=True))
 
 def handoff_check(args=None):
     """Protocol lint over live handoffs: enforce the handoff contract read-only.
@@ -1064,6 +1086,9 @@ def recall_stale(args=None):
                 # way; absent means the original bundle was built without them.
                 rel_sess_n = payload.get('related_sessions') or 0
                 rel_facts_n = payload.get('related_facts') or 0
+                # --related-semantic is optional the same way; absent means the
+                # original bundle was built without the Hindsight section.
+                rel_sema_n = payload.get('related_semantic') or 0
                 # Rerank parameters are optional (feature added after the
                 # provenance loop); absent keys mean the original bundle was
                 # built without rerank, which is exactly how it must be
@@ -1087,7 +1112,8 @@ def recall_stale(args=None):
                         rel_handoffs=rel_handoffs,
                         dep_context=dep_ctx_n,
                         rel_sessions=rel_sess_n,
-                        rel_facts=rel_facts_n)
+                        rel_facts=rel_facts_n,
+                        rel_semantic=rel_sema_n)
                     item['state'] = ('fresh' if bundle['core_digest'] == payload['core_digest']
                                      else 'stale')
                     item['current_digest'] = bundle['digest']
@@ -1418,8 +1444,9 @@ _MIGRATION_PLAN_STEPS = (
      'back up the source database (snapshot semantics), verify its seal, then '
      'restore or per-task import-task into the target Autopilot home'),
     ('hindsight_bank', 1,
-     'import semantic memories as provenance-tagged notes with temporal '
-     'validity preserved; deduplicate and supersede on merge'),
+     'legacy semantic-memory bank: import with `autopilot.py memory-import '
+     '<bank.jsonl> --apply` into the local in-database memory store '
+     '(content-addressed, so a partial import is simply re-run)'),
     ('hermes_home', 2,
      'register profiles, skills, cron definitions, and ownership contracts '
      'after control-plane initialization'),
@@ -1467,29 +1494,57 @@ def _open_source_sqlite(path: Path):
 def _classify_sqlite(path: Path):
     """Open a candidate database strictly read-only and classify it.
 
-    Returns (status, problems, counts): status is 'ok' for a healthy Autopilot
+    Returns (status, problems, counts, open_mode): status is 'ok' for a healthy Autopilot
     database, 'corrupted' when SQLite cannot read it or integrity fails, and
     'ambiguous' for valid SQLite that is not an Autopilot schema — the caller
     fails closed on anything other than 'ok'.
     """
-    try:
-        c = _open_source_sqlite(path)
-    except sqlite3.Error as e:
-        return 'corrupted', [f'{type(e).__name__}: {e}'], {}
+    # D1 (R7 live-fleet finding): a database touched by any WAL-mode reader
+    # carries -shm/-wal sidecars that a plain mode=ro connection cannot attach
+    # (SQLite must create/write the shm file), so discovery of exactly the
+    # live homes this migrator exists to read failed closed as 'corrupted'.
+    # Note sqlite3.connect is lazy - the open failure surfaces at the first
+    # statement - so each candidate URI is fully exercised (integrity check
+    # included) before falling back. Fallback order, all strictly read-only
+    # against the SOURCE:
+    #   1. mode=ro  - the normal case, WAL-aware when sidecars are writable;
+    #   2. mode=ro&immutable=1 - zero-sidecar snapshot view; only trusted
+    #     after an explicit integrity_check passes on that same connection,
+    #     so a torn/WAL-divergent file is still reported corrupted rather
+    #     than silently read at a possibly stale snapshot. The open mode
+    #     actually used is returned so the sealed inventory can report it
+    #     honestly instead of implying a plain read-only attach.
+    opened, mode_note, open_err = None, '', None
+    for uri in (f'file:{path}?mode=ro', f'file:{path}?mode=ro&immutable=1'):
+        try:
+            c = sqlite3.connect(uri, uri=True, timeout=5)
+            if c.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                raise ValueError('integrity_check failed')   # never trust an unsound snapshot
+            c.close()
+            opened = uri
+            mode_note = 'immutable=1 fallback' if 'immutable' in uri else ''
+            break
+        except (sqlite3.Error, ValueError) as e:
+            open_err = e
+            continue
+    if opened is None:
+        detail = f'{type(open_err).__name__}: {open_err}' if open_err else 'unable to open database file read-only'
+        return 'corrupted', [detail], {}, ''
+    c = sqlite3.connect(opened, uri=True, timeout=5)
     try:
         result = c.execute('PRAGMA integrity_check').fetchone()[0]
         if result != 'ok':
-            return 'corrupted', [f'integrity_check: {result}'], {}
+            return 'corrupted', [f'integrity_check: {result}'], {}, mode_note
         names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if 'tasks' not in names:
-            return 'ambiguous', ['valid sqlite without the Autopilot schema'], {}
+            return 'ambiguous', ['valid sqlite without the Autopilot schema'], {}, mode_note
         counts = {t: c.execute(f'SELECT COUNT(*) AS n FROM "{t}"').fetchone()[0]
                   for t in ('tasks', 'notes', 'handoffs', 'receipts',
                             'heartbeats', 'task_deps', 'audit_events')
                   if t in names}
-        return 'ok', [], counts
+        return 'ok', [], counts, mode_note
     except sqlite3.Error as e:
-        return 'corrupted', [f'{type(e).__name__}: {e}'], {}
+        return 'corrupted', [f'{type(e).__name__}: {e}'], {}, mode_note
     finally:
         c.close()
 
@@ -1596,10 +1651,30 @@ def migrate_inventory(args=None):
     for kind, path in _discover_migration_sources(root):
         status, problems, counts = 'ok', [], {}
         if kind in ('autopilot_sqlite', 'unknown_sqlite'):
-            status, problems, counts = _classify_sqlite(path)
+            status, problems, counts, open_mode = _classify_sqlite(path)
+            # D1 honesty: when discovery needed the immutable=1 fallback, the
+            # sealed inventory says so (and that integrity_check passed on
+            # that view) instead of presenting a plain read-only attach.
+            if status == 'ok' and open_mode:
+                problems = [f'discovery used {open_mode} after mode=ro could not attach; '
+                            'integrity_check passed on the immutable snapshot']
         files, truncated = _scan_source_files(
             path.parent if path.is_file() else path.parent if kind == 'autopilot_sqlite' else path,
             path)
+        # D3 (R7 live-fleet finding): migrate-import restores receipt FILES
+        # from <db_dir>/receipts/, so those bytes are part of the source's
+        # migration surface even though they are not adjacent to state.db.
+        # Include them in the same checksummed, secret-scanned scope so a
+        # missing or drifted receipt file is visible at stage one instead of
+        # surfacing later as doctor receipt_file_missing findings post-import.
+        if kind == 'autopilot_sqlite':
+            receipts_dir = path.parent / 'receipts'
+            if receipts_dir.is_dir():
+                extra, extra_trunc = _scan_source_files(path.parent, receipts_dir)
+                seen = {f['path'] for f in files}
+                files += [f for f in extra if f['path'] not in seen]
+                truncated = truncated or extra_trunc
+                files.sort(key=lambda f: f['path'])
         kinds = sorted({k for f in files for k in f['secret_kinds']})
         if problems or truncated:
             problems = list(problems)
@@ -1779,14 +1854,10 @@ def migrate_import(args=None):
     empty; merging into a live ledger breaks every link and is refused unless
     `--relink-audit` explicitly relinks the whole merged chain.
 
-    Receipt rows whose task_id is absent both from the imported tasks and
-    from this home are orphans — disposable verification receipts routinely
-    outlive their tasks — and importing them would violate foreign-key
-    integrity. They are quarantined rather than attached: never inserted,
-    never invented onto a task, never silently lost. Each one is reported
-    with its identity and content/file hashes and audited (digest-only, so
-    no secret value ever enters the ledger); the original stays untouched in
-    the immutable source home.
+    Any source-side foreign-key violation is refused before planning or
+    mutation, naming the dangling rows. Source remediation is a separate
+    approved operation; this importer never repairs, attaches, or invents
+    execution-truth rows.
 
     Dry-run is the default: nothing is written until `--apply` is passed.
     Everything lands in one transaction (rollback on any failure), receipt
@@ -1821,6 +1892,36 @@ def migrate_import(args=None):
         integrity = src.execute('PRAGMA integrity_check').fetchone()[0]
         if integrity != 'ok':
             raise SystemExit(f'source integrity check failed at import time: {integrity}')
+        # D2 (R7 live-fleet finding): the live fleet carried receipts and a
+        # heartbeat pointing at deleted tasks. The dry-run plan reported them
+        # as importable and --apply died mid-transaction on the FK constraint
+        # (clean rollback, but no migration). Fail closed HERE, in both
+        # dry-run and apply, naming every dangling row — detection and an
+        # explicit refusal is this tool's whole job; live remediation of
+        # orphan rows stays a separate approved operation.
+        fk_violations = []
+        for r in src.execute('PRAGMA foreign_key_check').fetchall():
+            # Column count varies by SQLite build (3 vs 6 columns); normalize.
+            v = {'table': r[0], 'rowid': r[1], 'referred_table': r[2],
+                 'fkid': r[3] if len(r) > 3 else '', 'parent': r[4] if len(r) > 4 else '',
+                 'fk': r[5] if len(r) > 5 else ''}
+            fk_violations.append(v)
+        if fk_violations:
+            raise SystemExit(
+                'source database fails PRAGMA foreign_key_check; refusing to import '
+                '(apply would abort mid-transaction and the dry-run plan would be false):\n  '
+                + '\n  '.join(f"{v['table']} rowid={v['rowid']} -> missing "
+                              f"{v['referred_table']} ({v['parent']})"
+                              for v in sorted(map(dict, fk_violations), key=lambda v: (
+                                  v['table'], v['rowid'])))
+                + '\nResolve orphaned rows in the source first (an approved remediation '
+                  'operation); this tool detects and refuses but never repairs live data.')
+        # D3 companion gate: receipt ROWS whose sealed file does not exist in
+        # the source home would import fine and then fail doctor with
+        # receipt_file_missing forever. Inventory checksums the receipts
+        # directory (above), so absence/drift is visible at stage one; here we
+        # refuse to offer an import that would insert evidence without files.
+        # Every receipt row is covered by the source FK gate above.
         tgt = sqlite3.connect(DB, timeout=10)
         tgt.row_factory = sqlite3.Row
         tgt.execute('PRAGMA foreign_keys=ON')
@@ -1852,38 +1953,29 @@ def migrate_import(args=None):
         hb_count = src.execute('SELECT COUNT(*) FROM heartbeats').fetchone()[0] \
             if 'heartbeats' in {r[0] for r in src.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")} else 0
+        # D3 companion gate: a receipt ROW whose sealed file does not exist in
+        # the source home would import fine and then fail doctor with
+        # receipt_file_missing forever. Inventory checksums the receipts
+        # directory (above), so absence/drift is visible at stage one; here we
+        # refuse to offer an import that would insert evidence without files.
+        # Receipt rows are covered by the source FK and file gates above.
+        src_task_ids = {r['id'] for r in rows['tasks']}
+        missing_receipt_files = sorted(
+            r['id'] for r in rows['receipts']
+            if r.get('task_id') in src_task_ids
+            and not (db_path.parent / 'receipts' / f"{r['id']}.json").exists())
+        if missing_receipt_files:
+            raise SystemExit(
+                'source carries receipt rows without their sealed files '
+                f'(<source>/receipts/): {", ".join(missing_receipt_files)}; importing '
+                'would create unresolvable receipt_file_missing findings. Restore the '
+                'receipt files or quarantine those rows before migrating.')
         sanitized_ids = sorted(r['id'] for r in rows['tasks']
                                if r['status'] in WORKORDER_ACTIVE_STATUSES)
         for r in rows['tasks']:
             if r['status'] in WORKORDER_ACTIVE_STATUSES:
                 r.update(status='queued', lease_owner='', lease_expires_at='',
                          blocked_reason='migrated active lease sanitized')
-        # Orphan-receipt quarantine: a receipt whose task_id is neither in the
-        # imported task set nor already resident here cannot satisfy the
-        # receipts FK, and the alternatives are all forbidden — weakening the
-        # key, inventing a task, or re-pointing evidence at a guess. So the
-        # row is withheld from import entirely and accounted for by digest:
-        # identity + content hash travel into the report and audit ledger,
-        # the bytes stay put in the source home (which is never mutated).
-        known_tasks = {r['id'] for r in rows['tasks']} | \
-            {r[0] for r in tgt.execute('SELECT id FROM tasks')}
-        orphan_receipts = []
-        if 'task_id' in cols['receipts']:
-            orphans_by_id = {}
-            for r in rows['receipts']:
-                if r.get('task_id') and r['task_id'] not in known_tasks \
-                        and r['id'] not in orphans_by_id:
-                    orphans_by_id[r['id']] = {
-                        'id': r['id'], 'task_id': r['task_id'], 'kind': r.get('kind', ''),
-                        'file_hash': r.get('file_hash', ''),
-                        'row_sha256': hashlib.sha256(json.dumps(
-                            [r[c_] for c_ in cols['receipts']], sort_keys=True)
-                            .encode()).hexdigest()}
-            orphan_receipts = [orphans_by_id[k] for k in sorted(orphans_by_id)]
-            if orphan_receipts:
-                orphan_ids = {o['id'] for o in orphan_receipts}
-                rows['receipts'] = [r for r in rows['receipts']
-                                    if r['id'] not in orphan_ids]
         # The fact graph joins the secret guard even though its tokens cannot
         # be credential-shaped by construction: the free-form `source` field
         # is operator text and gets exactly the same boundary as notes.
@@ -1918,7 +2010,6 @@ def migrate_import(args=None):
                 'tables': {t: {'source_rows': len(rows[t]),
                                'already_present': present[t]} for t in _MIGRATION_TABLES},
                 'sanitized_tasks': sanitized_ids, 'secret_kinds': kinds,
-                'orphan_receipts_quarantined': orphan_receipts,
                 **({'receipt_files_withheld': withheld_receipts} if withheld_receipts else {}),
                 'heartbeats_skipped_disposable': hb_count,
                 'audit_events_source': len(src_audit),
@@ -2001,17 +2092,11 @@ def migrate_import(args=None):
                 if cur.rowcount:
                     journal_audit_ids.append(r['id'] + audit_offset)
                 audit_imported += cur.rowcount
-            if orphan_receipts:
-                autopilot.audit(tgt, 'system', sid, 'migration_orphan_receipt_quarantined',
-                                {'source_id': sid, 'source_path': str(db_path),
-                                 'receipts': orphan_receipts})
             autopilot.audit(tgt, 'system', sid, 'migration_import_applied',
                             {'inventory_sha256': inv['sha256'], 'source_id': sid,
                              'source_path': str(db_path), 'inserted': inserted,
                              'skipped_existing': skipped_existing,
                              'sanitized_tasks': sanitized_ids,
-                             **({'orphan_receipts_quarantined': orphan_receipts}
-                                if orphan_receipts else {}),
                              **({'secret_kinds': kinds} if kinds else {}),
                              **({'receipt_files_withheld': withheld_receipts}
                                 if withheld_receipts else {}),
@@ -2066,11 +2151,7 @@ def migrate_import(args=None):
                 if t in src_tables else 0
             t_count = tgt.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
             coverage[t] = {'source': s_count, 'target': t_count}
-            # Quarantined orphans are source rows that must never arrive, so
-            # they are excluded from the receipts coverage expectation rather
-            # than flagged as a shortfall.
-            expected = s_count - (len(orphan_receipts) if t == 'receipts' else 0)
-            if t_count < expected:
+            if t_count < s_count:
                 health_problems.append(f'{t}: target has {t_count} rows, source has {s_count}')
         health_problems += [f'receipt file hash mismatch: {rid}' for rid in hash_mismatches]
         deduplicated = all(v == 0 for v in inserted.values()) and audit_imported == 0
@@ -2080,7 +2161,6 @@ def migrate_import(args=None):
             'inventory_sha256': inv['sha256'],
             'inserted': inserted, 'skipped_existing': skipped_existing,
             'sanitized_tasks': sanitized_ids,
-            'orphan_receipts_quarantined': orphan_receipts,
             **({'secret_kinds': kinds} if kinds else {}),
             'audit_events_imported': audit_imported,
             'audit_relinked': bool(audit_offset and audit_imported),
@@ -2534,7 +2614,7 @@ BRAIN_INVENTORY_FORMAT = 'mindos-brain-inventory-v1'
 # definitions differently instead of flattening them into one authority.
 _BRAIN_ROLES = {
     'autopilot': 'execution_truth',
-    'hindsight': 'semantic_memory',
+    'memories': 'semantic_memory',
     'temporal': 'temporal_facts',
     'claude_sync': 'sync_metadata',
     'claude_memory': 'human_archive',
@@ -2543,66 +2623,6 @@ _BRAIN_ROLES = {
     'skills': 'skill_definitions',
     'cron': 'cron_definitions',
 }
-# Hindsight stats fields safe to seal: counts only — every timestamp and
-# latency figure is volatile and would break manifest reproducibility.
-_HINDSIGHT_STATS_FIELDS = ('total_nodes', 'total_links', 'total_documents',
-                           'pending_operations', 'failed_operations')
-
-def _brain_http_json(url: str, timeout: float):
-    """GET a JSON document; returns (status_code, parsed) or raises OSError."""
-    req = urllib.request.Request(url, method='GET',
-                                 headers={'Accept': 'application/json'})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.status, json.loads(resp.read().decode('utf-8'))
-
-def _brain_hindsight(url: str, bank: str, timeout: float):
-    """Provider-neutral binding probe: health + shared-bank accessibility.
-
-    Read-only by construction (two GETs); the live bank is never duplicated,
-    written, or consolidated — only its count-shaped stats are recorded. A
-    service that is down is `unavailable` (reported, not fatal) so an offline
-    machine can still inventory everything else; a healthy service missing
-    the shared bank is `degraded` because the binding itself is broken.
-    """
-    entry = {'id': 'brain-' + hashlib.sha256(f'hindsight:{bank}'.encode()).hexdigest()[:12],
-             'kind': 'hindsight', 'role': _BRAIN_ROLES['hindsight'],
-             'adapter': 'provider-neutral-http-v1', 'url': url, 'bank': bank,
-             'path': f'{url}/v1/default/banks/{bank}',
-             'files': [], 'secret_kinds': []}
-    try:
-        code, health = _brain_http_json(f'{url}/health', timeout)
-    except Exception as e:
-        return {**entry, 'status': 'unavailable',
-                'problems': [f'health probe failed: {type(e).__name__}: {e}'],
-                'counts': {}, 'bound': False}
-    if code != 200 or health.get('status') != 'healthy':
-        return {**entry, 'status': 'unavailable',
-                'problems': [f"health endpoint reported status={health.get('status')!r}"],
-                'counts': {}, 'bound': False}
-    problems, bound = [], False
-    try:
-        code, banks = _brain_http_json(f'{url}/v1/default/banks', timeout)
-        if code == 200:
-            listed = [b.get('bank_id') for b in banks.get('banks', [])]
-            bound = bank in listed
-            if not bound:
-                problems.append(f'bank {bank!r} not present in service bank list')
-    except Exception as e:
-        problems.append(f'bank list failed: {type(e).__name__}: {e}')
-    stats = {}
-    try:
-        code, doc = _brain_http_json(
-            f'{url}/v1/default/banks/{urllib.parse.quote(bank)}/stats', timeout)
-        if code == 200:
-            stats = {k: doc[k] for k in _HINDSIGHT_STATS_FIELDS if k in doc}
-            fact_count = doc.get('fact_count')
-            if fact_count is not None:
-                stats['fact_count'] = fact_count
-    except Exception as e:
-        problems.append(f'bank stats failed: {type(e).__name__}: {e}')
-    return {**entry, 'status': 'ok' if bound else 'degraded',
-            'problems': problems, 'counts': stats, 'bound': bound}
-
 def _brain_classify_temporal(path: Path):
     """Classify the temporal sidecar strictly read-only (mirror of
     _classify_sqlite for the sidecar's own schema)."""
@@ -2708,8 +2728,7 @@ def brain_inventory(args=None):
     """Dry-run-first end-to-end brain inventory across every durable source.
 
     Strictly read-only: Autopilot execution state, the temporal sidecar, the
-    Hindsight shared-bank binding (health + accessibility via GETs only), the
-    Claude memory-sync metadata, Claude project memory archives, raw session
+    local semantic-memory store, the Claude memory-sync metadata, Claude project memory archives, raw session
     cache, and profile/skill/cron definitions are counted, checksummed, and
     classified without a single byte of mutation. Values never enter the
     manifest — only redacted counts, sha256 checksums, integrity/health
@@ -2720,14 +2739,12 @@ def brain_inventory(args=None):
     digest-only audit event recording that an inventory was taken.
 
     Fail-closed: corrupted or ambiguous local sources block with exact
-    blockers; absent optional sources (temporal sidecar, sync file) and an
-    unreachable Hindsight service are recorded honestly without blocking.
+    blockers; absent optional sources (temporal sidecar, sync file) are
+    recorded honestly without blocking.
     """
     t = utc()
     hermes = Path(getattr(args, 'hermes_home', '') or Path.home() / '.hermes').expanduser()
     claude = Path(getattr(args, 'claude_home', '') or Path.home() / '.claude').expanduser()
-    hs_url = (getattr(args, 'hindsight_url', '') or 'http://127.0.0.1:8888').rstrip('/')
-    bank = getattr(args, 'bank', '') or 'autopilot-shared-context'
     timeout = float(getattr(args, 'timeout', 3) or 3)
     sources, fail_closed = [], False
 
@@ -2741,11 +2758,11 @@ def brain_inventory(args=None):
 
     # Execution truth: the Autopilot control plane database + receipt evidence.
     adb = autopilot.DB
-    status, problems, counts = _classify_sqlite(adb)
+    status, problems, counts, _open_mode = _classify_sqlite(adb)
     # audit_events deliberately re-counted through _brain_ro_counts so the
     # command's own seal events stay outside the sealed manifest (reproducibility).
     counts.update(_brain_ro_counts(adb, ('sessions', 'session_messages', 'facts',
-                                         'audit_events')))
+                                         'memories', 'audit_events')))
     receipts = autopilot.RECEIPTS
     rec_files = sorted(p for p in receipts.glob('*.json') if p.is_file()) if receipts.is_dir() else []
     counts['receipt_files'] = len(rec_files)
@@ -2768,10 +2785,34 @@ def brain_inventory(args=None):
              'kind': 'temporal', 'role': _BRAIN_ROLES['temporal'], 'path': str(tdb),
              'status': 'absent', 'problems': ['temporal sidecar not present'],
              'counts': {}, 'sha256': '', 'files': [], 'secret_kinds': []})
-    # Semantic memory: a shared service, not a file store — verify the binding,
-    # never pretend a local copy exists or copy semantics into SQLite.
-    add(_brain_hindsight(hs_url, bank, timeout))
-    # Claude memory-sync metadata: sync state keyed by memory-file paths.
+    # Semantic memory: local and in-database since the external Hindsight
+    # service was retired. It is inventoried as its own epistemic source even
+    # though it shares the control-plane file, because a migration must still
+    # be able to treat semantic memory differently from execution truth.
+    mem_counts, mem_problems, mem_status = {}, [], 'absent'
+    if adb.is_file():
+        try:
+            mc = _open_source_sqlite(adb)
+            try:
+                mem_counts = {
+                    'memories': mc.execute(
+                        "SELECT COUNT(*) FROM memories WHERE superseded_by=''").fetchone()[0],
+                    'retracted': mc.execute(
+                        "SELECT COUNT(*) FROM memories WHERE superseded_by<>''").fetchone()[0]}
+                mem_status = 'ok'
+            finally:
+                mc.close()
+        except sqlite3.Error as e:
+            mem_status, mem_problems = 'degraded', [f'{type(e).__name__}: {e}']
+    else:
+        mem_problems = ['no control-plane database; memory store not initialized']
+    add({'id': 'brain-' + hashlib.sha256(f'memories:{adb}'.encode()).hexdigest()[:12],
+         'kind': 'memories', 'role': _BRAIN_ROLES['memories'],
+         'engine': autopilot.MEMORY_ENGINE_TAG, 'path': str(adb),
+         'status': mem_status, 'problems': mem_problems, 'counts': mem_counts,
+         'sha256': '', 'files': [], 'secret_kinds': []})
+    # Claude memory-sync metadata: sync state keyed by memory-file paths. The
+    # directory name is a legacy on-disk location, not a live service binding.
     sync_path = hermes / 'hindsight' / 'claude-memory-sync.json'
     doc, problem = _brain_json_doc(sync_path)
     sync_counts = {} if doc is None else (
@@ -2838,7 +2879,7 @@ def brain_inventory(args=None):
     sources.sort(key=lambda s: (rank.get(s['kind'], 99), s['path']))
     body = {'format': BRAIN_INVENTORY_FORMAT, 'created_at': t,
             'hermes_home': str(hermes), 'claude_home': str(claude),
-            'hindsight_url': hs_url, 'bank': bank, 'sources': sources,
+            'sources': sources,
             'fail_closed': fail_closed,
             'summary': {
                 'sources': len(sources),
@@ -2898,7 +2939,6 @@ def brain_inventory_check(args):
         raise SystemExit('manifest integrity check failed; refusing a tampered manifest')
     print(json.dumps({'ok': True, 'path': str(path), 'created_at': body.get('created_at'),
                       'hermes_home': body.get('hermes_home'),
-                      'hindsight_url': body.get('hindsight_url'), 'bank': body.get('bank'),
                       'summary': body.get('summary'),
                       'fail_closed': body.get('fail_closed', False),
                       'sources': [{'kind': s.get('kind'), 'role': s.get('role'),
@@ -2992,11 +3032,11 @@ def _brain_import_plan(inv):
     actions, blockers = [], []
     for src in inv.get('sources', []):
         kind, status = src.get('kind'), src.get('status')
-        if kind == 'hindsight':
-            actions.append({'action': 'bind_hindsight', 'source_id': src.get('id'),
-                            'kind': kind, 'target_rel': 'bindings/hindsight-shared-bank.json',
-                            'status': status, 'bound': bool(src.get('bound')),
-                            'reason': 'GET-only shared-bank binding; bank content is never copied'})
+        if kind == 'memories':
+            actions.append({'action': 'external_execution_import_required',
+                            'source_id': src.get('id'), 'kind': kind, 'status': status,
+                            'reason': 'semantic memory lives in the control-plane '
+                                      'database and moves with the execution-truth import'})
             continue
         if kind == 'autopilot':
             actions.append({'action': 'external_execution_import_required', 'source_id': src.get('id'),
@@ -3045,23 +3085,13 @@ def _brain_import_plan(inv):
             actions.append({'action': 'copy', **row})
     return actions, blockers
 
-def _brain_binding_bytes(inv, src):
-    """Safe binding metadata; deliberately no Hindsight values or export."""
-    body = {'format': 'mindos-hindsight-binding-v1', 'inventory_sha256': inv['sha256'],
-            'adapter': src.get('adapter', 'provider-neutral-http-v1'), 'url': src.get('url', ''),
-            'bank': src.get('bank', ''), 'path': src.get('path', ''),
-            'status': src.get('status'), 'bound': bool(src.get('bound')),
-            'counts': src.get('counts', {}), 'problems': src.get('problems', [])}
-    body['sha256'] = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
-    return json.dumps(body, sort_keys=True).encode()
-
 def brain_import(args=None):
     """Apply a sealed brain inventory into an explicit new MindOS home.
 
     Dry-run is the default. Sources are re-hashed immediately before copying;
     changed sources, incomplete inventories, and pre-existing different target
-    bytes fail closed. Hindsight is represented only by a provider-neutral,
-    GET-probed binding record — never by semantic-memory rows in SQLite.
+    bytes fail closed. Semantic memory is not copied here: it lives in the
+    control-plane database and moves with the execution-truth import.
     Credential-shaped source files are quarantined by default, or copied as a
     redacted text derivative with --redact. Every applied run writes a sealed
     report and source-to-target provenance records; re-running verifies those
@@ -3111,15 +3141,7 @@ def brain_import(args=None):
     for action in actions:
         if action['action'] == 'quarantine_unsupported_file':
             quarantine.append(action)
-    binding = next((s for s in inv.get('sources', []) if s.get('kind') == 'hindsight'), None)
-    binding_data = _brain_binding_bytes(inv, binding) if binding else None
-    binding_target = target / 'bindings/hindsight-shared-bank.json'
-    if binding_data and (binding_target.exists() or binding_target.is_symlink()):
-        if not binding_target.is_file() or binding_target.is_symlink() or \
-                _scan_sha256(binding_target) != hashlib.sha256(binding_data).hexdigest():
-            raise SystemExit(f'target conflict at {binding_target}; refusing to overwrite local binding')
     planned = {'copy': len(materialized), 'quarantine': len(quarantine),
-               'bind_hindsight': bool(binding_data),
                'execution_import_required': any(a['action'] == 'external_execution_import_required'
                                                 for a in actions)}
     if not getattr(args, 'apply', False):
@@ -3156,14 +3178,6 @@ def brain_import(args=None):
                         'target_path': str(destination.relative_to(target)),
                         'target_sha256': hashlib.sha256(data).hexdigest(),
                         'redacted': bool(action.get('redacted')), 'secret_kinds': action.get('secret_kinds', [])})
-    if binding_data:
-        created = _brain_target_write(binding_target, binding_data)
-        (written if created else existing).append(str(binding_target))
-        records.append({'source_id': binding['id'], 'kind': 'hindsight_binding',
-                        'source_path': binding.get('path', ''), 'source_sha256': '',
-                        'target_path': str(binding_target.relative_to(target)),
-                        'target_sha256': hashlib.sha256(binding_data).hexdigest(),
-                        'redacted': False, 'secret_kinds': []})
     provenance = {'format': 'mindos-brain-provenance-v1', 'inventory_sha256': inv['sha256'],
                   'records': records, 'quarantine': [{k: v for k, v in a.items()
                                                        if k not in ('source',)} for a in quarantine]}
@@ -3206,6 +3220,112 @@ def brain_import(args=None):
                       'already_present': [str(Path(p).relative_to(target)) for p in existing],
                       'quarantine': len(quarantine), 'report': str(report_target)}, sort_keys=True))
 
+HOME_SELECTOR_FORMAT = 'mindos-home-selector-v1'
+# Health checks a MindOS home must pass before the selector may point at it.
+# Everything here is read-only: doctor-style consistency sweep plus presence
+# checks for the artifacts a brain-imported home is expected to carry.
+
+def _home_doctor_problems(root: Path):
+    """Read-only health/doctor verification of an Autopilot/MindOS home."""
+    import autopilot as _ap  # local alias; module-level import already exists
+    problems = []
+    if not (root / 'state.db').is_file():
+        return [{'kind': 'state_db_missing', 'home': str(root)}]
+    # Run the full consistency sweep against this home by pointing the
+    # autopilot module at it for the duration (restored afterwards).
+    saved = (_ap.ROOT, _ap.DB, _ap.RECEIPTS, _ap.POLICIES)
+    try:
+        _ap.ROOT, _ap.DB = root, root / 'state.db'
+        _ap.RECEIPTS, _ap.POLICIES = root / 'receipts', root / 'policies'
+        with _ap.conn() as c:
+            problems.extend(_ap.audit_chain_problems(c))
+            stale = c.execute(
+                "SELECT id FROM tasks WHERE lease_expires_at!='' AND lease_expires_at<=? "
+                "AND status IN ('claimed','running','waiting_for_agent')",
+                (_ap.now(),)).fetchall()
+            for r in stale:
+                problems.append({'kind': 'stale_lease', 'task_id': r['id']})
+            # Sealed chain checkpoints pinned under <home>/backups: divergence
+            # proves tail truncation or history rewriting, exactly as doctor.
+            backups = root / 'backups'
+            if backups.exists():
+                for p in sorted(backups.glob('checkpoint-*.json')):
+                    try:
+                        cp = _ap._load_checkpoint(str(p))
+                    except SystemExit:
+                        problems.append({'kind': 'checkpoint_file_invalid', 'path': p.name})
+                        continue
+                    problems.extend(_ap.checkpoint_problems(c, cp))
+    finally:
+        _ap.ROOT, _ap.DB, _ap.RECEIPTS, _ap.POLICIES = saved
+    return problems
+
+
+def home_show(args=None):
+    """Report which home the runtime resolves to and why (read-only)."""
+    print(json.dumps({'root': str(autopilot.ROOT), 'source': autopilot.HOME_SOURCE,
+                      'default_home': str(autopilot.DEFAULT_HOME),
+                      'selector_path': str(autopilot.SELECTOR_PATH),
+                      'selector_present': autopilot.SELECTOR_PATH.exists()}, sort_keys=True))
+
+
+def home_select(args=None):
+    """Point the Hermes runtime at an explicit new MindOS home — reversibly."""
+    target = Path(args.home).expanduser()
+    if not target.is_absolute():
+        raise SystemExit('--home must be an explicit absolute MindOS home')
+    target = target.resolve()
+    if not target.is_dir():
+        raise SystemExit(f'home does not exist: {target}')
+    if target == autopilot.DEFAULT_HOME.resolve():
+        raise SystemExit('refusing to select the rollback default home; deselect instead')
+    problems = _home_doctor_problems(target)
+    if problems:
+        raise SystemExit(f'{target} failed health verification:\n  ' +
+                         '\n  '.join(p['kind'] + ': ' + json.dumps({k: v for k, v in p.items() if k != "kind"}, sort_keys=True)
+                                     for p in problems))
+    body = {'format': HOME_SELECTOR_FORMAT, 'source': 'mindos', 'home': str(target),
+            'selected_at': utc(), 'rollback_home': str(autopilot.DEFAULT_HOME)}
+    path = Path(getattr(args, 'selector', '') or autopilot.SELECTOR_PATH).expanduser()
+    fd, tmp = tempfile.mkstemp(prefix='.selector.', dir=str(path.parent))
+    try:
+        os.write(fd, json.dumps(body, sort_keys=True).encode())
+        os.close(fd); fd = None
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, str(path))
+    except OSError:
+        if fd is not None:
+            os.close(fd)
+        raise
+    print(json.dumps({'ok': True, 'selected': str(target), 'selector': str(path),
+                      'rollback': body['rollback_home'], 'health': 'pass'}, sort_keys=True))
+
+
+def home_deselect(args=None):
+    """Revert to the immutable ~/.hermes/autopilot rollback home."""
+    path = Path(getattr(args, 'selector', '') or autopilot.SELECTOR_PATH).expanduser()
+    if getattr(args, 'apply', False):
+        existed = path.exists() or path.is_symlink()
+        if existed:
+            path.unlink()
+        print(json.dumps({'ok': True, 'removed_selector': existed,
+                          'active_home': str(autopilot.DEFAULT_HOME),
+                          'source': 'default'}, sort_keys=True))
+    else:
+        planned = path.exists() or path.is_symlink()
+        print(json.dumps({'ok': True, 'dry_run': True, 'would_remove_selector': planned,
+                          'active_home': str(autopilot.DEFAULT_HOME)}, sort_keys=True))
+
+
+def home_doctor(args=None):
+    """Read-only health/doctor verification of an explicit home (no selection)."""
+    target = Path(args.home).expanduser().resolve()
+    if not target.is_dir():
+        raise SystemExit(f'home does not exist: {target}')
+    problems = _home_doctor_problems(target)
+    print(json.dumps({'ok': not problems, 'home': str(target), 'count': len(problems),
+                      'problems': problems}, sort_keys=True))
+
 def policy(args):
     # Resolve through autopilot.POLICIES so HERMES_AUTOPILOT_HOME is honored —
     # a hardcoded live-home path would read (or miss) the wrong policies in
@@ -3216,10 +3336,528 @@ def policy(args):
     requires=key in text
     print(json.dumps({'project':args.project,'action':args.action,'allowed':not requires,'requires_user':requires,'policy':str(path)}))
 
+# ---------------------------------------------------------------------------
+# §3 minimum slice: sense → playbook repair → breaker → learning.
+#
+# `sense` is ONE sweep that reuses the existing read-only checks (doctor,
+# verify-chain, recall-stale, unverified-completions) and folds their outputs
+# into typed findings: each carries an id, a severity, the concrete evidence,
+# and the repair kind that can fix it. A finding's identity is a content hash
+# over its kind + evidence, so the same defect recurring produces the same
+# hash — exactly what the repair circuit breaker counts.
+# ---------------------------------------------------------------------------
+
+SEVERITY_BY_PROBLEM_KIND = {
+    'audit_chain_break': 'P0',
+    'receipt_file_hash_mismatch': 'P1',
+    'checkpoint_file_invalid': 'P1',
+    'last_receipt_dangling': 'P1',
+    'stale_lease': 'P1',
+    'receipt_file_missing': 'P2',
+    'receipt_row_missing': 'P2',
+    'fts_index_drift': 'P2',
+    'fact_task_missing': 'P2',
+    'multiple_live_handoffs': 'P2',
+    'supersede_target_missing': 'P3',
+    'handoff_supersede_target_missing': 'P3',
+    'orphan_dependency': 'P3',
+    'orphan_note': 'P3',
+    'orphan_handoff': 'P3',
+}
+
+# Problem kinds that have a shipped playbook (everything else is reported for
+# a human — sense never improvises repairs).
+REPAIR_KIND_BY_PROBLEM_KIND = {
+    'fts_index_drift': 'fts-rebuild',
+    'stale_lease': 'stale-lease-recover',
+}
+
+
+def _make_finding(kind, severity, evidence, repair_kind=''):
+    """Content-hashed finding identity: same defect ⇒ same hash ⇒ recurrence
+    is observable by exact equality instead of fuzzy matching."""
+    body = json.dumps({'kind': kind, 'evidence': evidence}, sort_keys=True)
+    h = hashlib.sha256(body.encode()).hexdigest()[:16]
+    return {'id': f'find-{h}', 'hash': h, 'kind': kind, 'severity': severity,
+            'evidence': evidence,
+            **({'suggested_repair': repair_kind} if repair_kind else {})}
+
+
+def _problem_finding(p):
+    kind = p.get('kind', 'unknown')
+    sev = SEVERITY_BY_PROBLEM_KIND.get(
+        kind, 'P2' if kind == 'audit_chain_break' else 'P3')
+    return _make_finding(f'doctor_{kind}', sev, p,
+                         REPAIR_KIND_BY_PROBLEM_KIND.get(kind, ''))
+
+
+def sense(args=None):
+    """One typed-finding sweep over the fleet's existing consistency checks.
+
+    Read-only. Reuses doctor, verify-chain, recall-stale, and
+    unverified-completions verbatim (in-process, via _capture_json) rather
+    than reimplementing any check, then maps each concrete problem onto a
+    typed finding with a stable content hash. Findings whose kind matches a
+    shipped repair playbook carry `suggested_repair`; everything else is
+    surfaced at its severity for a human.
+    """
+    findings = []
+    doctor_doc = _capture_json(doctor)
+    for p in doctor_doc.get('problems', []):
+        findings.append(_problem_finding(p))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        autopilot.verify_chain(SimpleNamespace(checkpoint=''))
+    chain = json.loads(buf.getvalue())
+    for p in chain.get('problems', []):
+        findings.append(_make_finding('audit_chain_break', 'P0', p))
+    rs = _capture_json(recall_stale)
+    for item in rs.get('items', []):
+        if item.get('state') == 'stale':
+            findings.append(_make_finding('recall_stale', 'P3', item))
+    uv = _capture_json(unverified_completions)
+    for item in uv.get('items', []):
+        findings.append(_make_finding(f"unverified_{item.get('kind')}", 'P2', item))
+    # Stalled activity: a running holder that declared a stall deadline but
+    # stayed silent past it. Read-only — recovery of the lease itself stays
+    # with the guarded recover sweep once it truly expires.
+    stalled = []
+    t = utc()
+    with autopilot.conn() as c:
+        for r in c.execute(
+                "SELECT h.task_id AS task_id,h.last_action AS last_action,"
+                "h.next_intent AS next_intent,h.progress_state AS progress_state,"
+                "h.stall_deadline AS stall_deadline FROM heartbeats h "
+                "JOIN tasks ta ON ta.id=h.task_id WHERE ta.status='running' "
+                "AND h.stall_deadline!='' AND h.stall_deadline<=? ORDER BY h.task_id", (t,)):
+            stalled.append(dict(r))
+    for item in stalled:
+        findings.append(_make_finding('activity_stalled', 'P2', item))
+    counts = {}
+    for f in findings:
+        counts[f['severity']] = counts.get(f['severity'], 0) + 1
+    print(json.dumps({'ok': True, 'generated_at': utc(), 'count': len(findings),
+                      'by_severity': counts, 'findings': findings},
+                     sort_keys=True))
+
+
+def _repairs_dir():
+    # Playbooks ship in-tree next to ops.py; a HERMES_AUTOPILOT_HOME
+    # policies/repairs directory overrides them so isolated/test homes can
+    # inject their own without touching the shipped files.
+    d = autopilot.POLICIES / 'repairs'
+    return d if d.exists() else Path(__file__).parent / 'policies' / 'repairs'
+
+
+def _parse_flat_yaml(text):
+    """Minimal flat `key: value` reader for playbook files (no nested shapes,
+    no dependencies): strips comments, splits on the first ': '."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#') or ':' not in line:
+            continue
+        k, v = line.split(':', 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _load_playbooks():
+    d = _repairs_dir()
+    if not d.exists():
+        return {}
+    return {p.stem: _parse_flat_yaml(p.read_text()) for p in sorted(d.glob('*.yaml'))}
+
+
+def _breaker_fact_id(kind):
+    return f'playbook:{kind}'
+
+
+def _live_breaker(c, kind):
+    t = utc()
+    row = c.execute(
+        "SELECT id FROM facts WHERE subject=? AND predicate='breaker-tripped' "
+        f"AND {autopilot._fact_live_sql()}", (_breaker_fact_id(kind), t)).fetchone()
+    return row['id'] if row else ''
+
+
+def _repair_count(c, finding_hash, window_hours):
+    since = (datetime.now(timezone.utc)
+             - timedelta(hours=window_hours)).replace(microsecond=0).isoformat()
+    return c.execute(
+        "SELECT COUNT(*) n FROM audit_events WHERE action='repair_completed' "
+        "AND payload_json LIKE ? AND created_at>=?",
+        ('%"finding_hash": "' + finding_hash + '"%', since)).fetchone()['n']
+
+
+def _trip_breaker(c, pb_name, finding_hash, window_hours):
+    """A playbook stuck in a repair loop stops being a repair: disable it by
+    recording a live breaker fact with a validity window, open a P0
+    investigate task, and leave an audited trail."""
+    t = utc()
+    fid = uuid.uuid4().hex
+    valid_until = (datetime.now(timezone.utc)
+                   + timedelta(hours=24)).replace(microsecond=0).isoformat()
+    c.execute(
+        "INSERT INTO facts(id,subject,predicate,object,source,task_id,valid_from,valid_until,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
+        (fid, _breaker_fact_id(pb_name), 'breaker-tripped', 'true', 'ops-sense',
+         '', t, valid_until, t))
+    autopilot.audit(c, 'fact', fid, 'circuit_breaker_tripped',
+                    {'playbook': pb_name, 'finding_hash': finding_hash,
+                     'repeat_window_hours': window_hours, 'valid_until': valid_until})
+    task_id = f'investigate-{pb_name}-{finding_hash[:8]}'
+    ct = utc()
+    try:
+        c.execute(
+            "INSERT INTO tasks(id,project,title,description,owner,status,priority,"
+            "next_action,due_at,not_before,tags,requires_receipts,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (task_id, 'Repairs', f'Investigate recurring finding {pb_name}',
+             f'Circuit breaker tripped: playbook {pb_name} repaired finding '
+             f'{finding_hash} repeatedly within the window; root-cause before '
+             're-enabling.', 'ops-sense', 'queued', 'P0',
+             'root-cause the recurring finding', '', '', '[]', '[]', ct, ct))
+    except sqlite3.IntegrityError:
+        cur = c.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        task_id = cur['id'] if cur else task_id
+    autopilot.audit(c, 'task', task_id, 'created',
+                    {'project': 'Repairs', 'owner': 'ops-sense', 'priority': 'P0',
+                     'reason': 'circuit_breaker_tripped'})
+    return {'breaker_fact_id': fid, 'investigate_task': task_id,
+            'valid_until': valid_until}
+
+
+def repair(args):
+    """Execute a playbook repair as a normal leased task.
+
+    The whole lifecycle is the ordinary queue's: create → claim (lease) → run
+    the playbook command → seal a receipt of the playbook's required kind →
+    complete citing that receipt. Gates run before anything mutates:
+
+    - breaker: a live breaker fact for this playbook refuses execution;
+      `--break-after` repeats of the same finding hash within
+      `--window-hours` trip the breaker instead of repairing again;
+    - blast-radius tier policy: a playbook marked requires_user in its
+      policies/repairs file refuses until --approved-by names the human
+      (the same policies-file shape as merge/deploy gates);
+    - idempotence: the deterministic task id makes a double-submit of the
+      same repair attempt a refusal, not a duplicate task.
+    """
+    name = args.playbook
+    pbs = _load_playbooks()
+    if name not in pbs:
+        raise SystemExit(f'unknown repair playbook: {name} '
+                         f'(known: {", ".join(sorted(pbs)) or "none"})')
+    pb = pbs[name]
+    dry = bool(getattr(args, 'dry_run', False))
+    threshold = getattr(args, 'break_after', 3)
+    window_hours = getattr(args, 'window_hours', 24.0)
+    cmd = shlex.split(pb['command'])
+    rollback = shlex.split(pb.get('rollback_command', ''))
+    finding_hash = getattr(args, 'finding_hash', '') or ''
+    plan = {'playbook': name, 'tier': int(pb.get('blast_radius_tier', '0')),
+            'command': cmd, 'rollback_command': rollback,
+            'receipt_kind': pb.get('receipt_kind', '')}
+    if dry:
+        plan.update({'ok': True, 'dry_run': True})
+        print(json.dumps(plan, sort_keys=True))
+        return
+    with db() as c:
+        breaker = _live_breaker(c, name)
+        if breaker:
+            raise SystemExit(f'playbook disabled by circuit breaker (fact {breaker}); '
+                             'investigate before re-enabling')
+        if finding_hash:
+            n = _repair_count(c, finding_hash, window_hours)
+            if n >= threshold:
+                # Trip on its own connection: the refusal below must not roll
+                # the breaker's durable record back with the refused repair.
+                with db() as bc:
+                    trip = _trip_breaker(bc, name, finding_hash, window_hours)
+                raise SystemExit(f'circuit breaker tripped after {n} repeats in the '
+                                 f'window: {json.dumps(trip, sort_keys=True)}')
+        if str(pb.get('requires_user', '')).lower() == 'true':
+            approver = (getattr(args, 'approved_by', '') or '').strip()
+            if not approver:
+                raise SystemExit(f"playbook '{name}' is tier-{plan['tier']} "
+                                 "(requires_user); re-run with --approved-by <name>")
+            plan['approved_by'] = approver
+        seq = _repair_count(c, finding_hash, 24 * 36500) + 1 if finding_hash else 1
+        task_id = (f"repair-{name}-{finding_hash[:8]}-{seq}" if finding_hash
+                   else f"repair-{name}-{uuid.uuid4().hex[:8]}")
+        if c.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone():
+            raise SystemExit(f'repair task already exists: {task_id}')
+        ct = utc()
+        c.execute(
+            "INSERT INTO tasks(id,project,title,description,owner,status,priority,"
+            "next_action,due_at,not_before,tags,requires_receipts,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (task_id, 'Repairs', f'Repair: {name}',
+             f'Playbook repair for finding {finding_hash or "ad-hoc"} '
+             f'(tier {plan["tier"]}): {" ".join(cmd)}',
+             'ops-repair', 'queued', 'P2', ' '.join(cmd), '', '', '[]', '[]', ct, ct))
+        autopilot.audit(c, 'task', task_id, 'created',
+                        {'project': 'Repairs', 'owner': 'ops-repair', 'priority': 'P2',
+                         'playbook': name, 'finding_hash': finding_hash})
+    # Lease + execute outside the schema transaction: the command itself opens
+    # its own connection(s) and must see the claimed state.
+    autopilot.claim(SimpleNamespace(id=task_id, owner='ops-repair', minutes=30,
+                                    max_active=None, force=False))
+    proc = subprocess.run([sys.executable, str(Path(__file__).parent / 'ops.py'), *cmd],
+                          text=True, capture_output=True, timeout=120)
+    if proc.returncode != 0:
+        autopilot.fail(SimpleNamespace(id=task_id, owner='ops-repair',
+                                       reason=f'playbook command failed: {proc.stderr[:400]}',
+                                       no_retry=True, max_retries=0, backoff_base=60,
+                                       backoff_cap=3600, epoch=None))
+        raise SystemExit(f'repair command failed: {proc.stderr.strip()[:400]}')
+    rec = _capture_json(autopilot.receipt, SimpleNamespace(
+        task_id=task_id, kind=pb.get('receipt_kind', 'repair'),
+        payload=json.dumps({'playbook': name, 'finding_hash': finding_hash,
+                            'command': cmd})))
+    autopilot.complete(SimpleNamespace(id=task_id, owner='ops-repair', epoch=None,
+                                       recall_digest='',
+                                       note=f'repair via playbook {name}',
+                                       evidence_receipts=[rec['receipt_id']]))
+    # Learning: a successful repair asserts the finding-hash triple into the
+    # fact graph so later agents can query which playbook fixed which defect.
+    learn = ''
+    if finding_hash:
+        fa = SimpleNamespace(subject=f'finding:{finding_hash}', predicate='repaired-by',
+                             object=name, source='ops-repair', task=task_id,
+                             valid_hours=None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            autopilot.fact_assert(fa)
+        learn = json.loads(buf.getvalue())['id']
+        with db() as c:
+            autopilot.audit(c, 'task', task_id, 'repair_completed',
+                            {'playbook': name, 'finding_hash': finding_hash,
+                             'learning_fact_id': learn})
+    plan.update({'ok': True, 'task_id': task_id, 'receipt_id': rec['receipt_id'],
+                 'learning_fact_id': learn})
+    print(json.dumps(plan, sort_keys=True))
+
+
+def repair_list(args=None):
+    """Inventory shipped playbooks (name + gate fields) for operators."""
+    out = [{'name': k, **v} for k, v in _load_playbooks().items()]
+    print(json.dumps({'ok': True, 'count': len(out), 'playbooks': out}, sort_keys=True))
+
+
+def repair_fts_rebuild(args=None):
+    """Tier-0 repair: rebuild every external-content FTS index from its table.
+
+    The indexes are derived cache — a rebuild cannot lose source rows — but it
+    is still gated behind the playbook so it only ever runs as a leased,
+    receipted task. --dry-run reports current drift without writing.
+    """
+    tables = (('notes', 'notes_fts', autopilot._fts_ready),
+              ('tasks', 'tasks_fts', autopilot._fts_ready),
+              ('handoffs', 'handoffs_fts', autopilot._handoffs_fts_ready),
+              ('session_messages', 'session_messages_fts', autopilot._sessions_fts_ready),
+              ('facts', 'facts_fts', autopilot._facts_fts_ready),
+              ('memories', 'memories_fts', autopilot._memories_fts_ready))
+    rebuilt, skipped, drifted = [], [], []
+    with db() as c:
+        for table, fts, ready in tables:
+            if not ready(c):
+                skipped.append(fts)
+                continue
+            src = {r[0] for r in c.execute(f'SELECT rowid FROM {table}')}
+            try:
+                idx = _fts_index_docs(c, fts)
+            except sqlite3.Error:
+                idx = None
+            n_idx = c.execute(f'SELECT COUNT(*) n FROM {fts}').fetchone()['n']
+            if idx is None:
+                if len(src) != n_idx:
+                    drifted.append({'table': table, 'rows': len(src), 'indexed': n_idx})
+            elif src != idx:
+                drifted.append({'table': table, 'rows': len(src), 'indexed': len(idx)})
+            if not getattr(args, 'dry_run', False):
+                c.execute(f"INSERT INTO {fts}({fts}) VALUES('rebuild')")
+                autopilot.audit(c, 'system', fts, 'fts_rebuilt', {'table': table})
+                rebuilt.append(fts)
+    print(json.dumps({'ok': True, 'dry_run': bool(getattr(args, 'dry_run', False)),
+                      'drift_before': drifted, 'rebuilt': rebuilt,
+                      'skipped_no_fts5': skipped}, sort_keys=True))
+
+# Nanny impulse vocabulary — closed set, deterministic derivation:
+#   all_clear      nothing to do, fleet healthy;
+#   working        this tick took mutation action (recoveries/repairs);
+#   hit_snag       findings remain after the bounded repair budget;
+#   decision_needed a human decision is being asked for (breaker tripped or
+#                  a requires-user playbook suggested).
+NANNY_STATES = ('all_clear', 'working', 'hit_snag', 'decision_needed')
+_NANNY_MAX_DETAIL = 20
+
+
+def _nanny_last_tick(c):
+    row = c.execute(
+        "SELECT payload_json FROM audit_events WHERE action='nanny_tick' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    try:
+        return json.loads(row['payload_json']) if row else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _nanny_capture_repair(playbook, finding_hash):
+    """Run one playbook repair in-process and return its final JSON plan.
+
+    `repair` streams the whole leased-task lifecycle (claim/receipt/complete
+    documents) before its own plan, so the capture must decode every JSON
+    document and keep the last rather than parsing the buffer as one.
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        repair(SimpleNamespace(playbook=playbook, finding_hash=finding_hash,
+                               dry_run=False, break_after=3, window_hours=24.0,
+                               approved_by=''))
+    out = buf.getvalue().strip()
+    dec = json.JSONDecoder()
+    docs, idx = [], 0
+    while idx < len(out):
+        obj, end = dec.raw_decode(out, idx)
+        docs.append(obj)
+        idx = end
+        while idx < len(out) and out[idx] in ' \n\t':
+            idx += 1
+    return docs[-1] if docs else {}
+
+
+def _nanny_playbook_tier(name, pbs):
+    pb = pbs.get(name)
+    if not pb:
+        return None
+    tier = int(pb.get('blast_radius_tier', '0') or 0)
+    requires_user = str(pb.get('requires_user', '')).lower() == 'true'
+    return {'tier': tier, 'requires_user': requires_user}
+
+
+def nanny(args=None):
+    """One bounded self-healing tick over existing primitives — never a daemon.
+
+    Order per tick: recover (guarded stale-lease sweep) → sense (typed
+    content-hashed findings) → at most --max-repairs tier-0 playbook repairs
+    matched to findings (leases, receipts, breakers, and learning all
+    inherited from `repair`) → escalate (overdue SLA sweep). Double-run safe:
+    every stage is a guarded sweep or a deterministically-idempotent leased
+    task, so a concurrent second tick records skips instead of duplicating
+    work. Each real tick audits one `nanny_tick` event carrying its open
+    finding hashes, so the next tick can diff against it (`carried_over`)
+    and spend narrative only on what changed — momentum memory without spam.
+    """
+    dry = bool(getattr(args, 'dry_run', False))
+    max_repairs = getattr(args, 'max_repairs', 2)
+    t = utc()
+    rec = _capture_json(recover, SimpleNamespace(
+        max_retries=3, dry_run=dry, backoff_base=60, backoff_cap=3600))
+    sn = _capture_json(sense)
+    pbs = _load_playbooks()
+    findings = sn.get('findings', [])
+    decisions = []
+    candidates = []
+    for f in findings:
+        kind = f.get('suggested_repair', '')
+        meta = _nanny_playbook_tier(kind, pbs) if kind else None
+        if not meta:
+            continue
+        if meta['requires_user']:
+            decisions.append({'reason': 'requires_user_playbook', 'playbook': kind,
+                              'finding_hash': f.get('hash')})
+            continue
+        if meta['tier'] != 0:
+            continue
+        candidates.append((kind, f))
+    # Deterministic candidate order: playbook name, then finding hash.
+    seen, ordered = set(), []
+    for kind, f in sorted(candidates, key=lambda c: (c[0], c[1].get('hash', ''))):
+        key = (kind, f.get('hash', ''))
+        if key not in seen:
+            seen.add(key)
+            ordered.append({'playbook': kind, 'finding': f})
+    would_repair, repairs, skipped = [], [], []
+    for cand in ordered[:max_repairs if not dry else len(ordered)]:
+        fh = cand['finding'].get('hash', '')
+        if dry:
+            would_repair.append({'playbook': cand['playbook'], 'finding_hash': fh})
+            continue
+        try:
+            out = _nanny_capture_repair(cand['playbook'], fh)
+            repairs.append({'ok': True, 'playbook': cand['playbook'],
+                            'finding_hash': fh, 'task_id': out.get('task_id', '')})
+        except SystemExit as e:
+            msg = str(e)
+            if 'circuit breaker' in msg:
+                decisions.append({'reason': 'circuit_breaker', 'playbook': cand['playbook'],
+                                  'finding_hash': fh, 'detail': msg.split(': ', 1)[-1][:300]})
+            repairs.append({'ok': False, 'playbook': cand['playbook'],
+                            'finding_hash': fh, 'error': msg[:300]})
+        except Exception as e:  # a broken stage must not kill the tick report
+            repairs.append({'ok': False, 'playbook': cand['playbook'],
+                            'finding_hash': fh, 'error': f'{type(e).__name__}: {e}'[:300]})
+    esc = _capture_json(escalate, SimpleNamespace(dry_run=dry)) if not dry else None
+    # Momentum memory: diff this tick's open hashes against the last audited
+    # one; previously-seen findings are reported compactly, never re-narrated.
+    # Findings whose repair succeeded this tick are resolved, not open — a
+    # fixed snag must not read as a lingering one.
+    repaired_hashes = {r['finding_hash'] for r in repairs if r['ok'] and r.get('finding_hash')}
+    remaining = [f for f in findings if f.get('hash') not in repaired_hashes]
+    prev = None if dry else _nanny_last_tick(db())
+    prev_hashes = set((prev or {}).get('open_hashes', []))
+    open_hashes = sorted({f.get('hash', '') for f in remaining if f.get('hash')})
+    carried = [h for h in open_hashes if h in prev_hashes]
+    fresh = [f for f in remaining if f.get('hash') not in prev_hashes]
+    actions = (len(rec.get('recovered', [])) + len(rec.get('failed', []))
+               + sum(1 for r in repairs if r['ok'])
+               + (len(esc.get('escalated', [])) if esc else 0))
+    if decisions:
+        state = 'decision_needed'
+    elif remaining:
+        state = 'hit_snag'
+    elif actions:
+        state = 'working'
+    else:
+        state = 'all_clear'
+    assert state in NANNY_STATES
+    report = {'ok': True, 'generated_at': t, 'state': state, 'dry_run': dry,
+              'recovered': rec.get('recovered', []),
+              'recover_failed': rec.get('failed', []),
+              'recover_skipped': rec.get('skipped', []),
+              'repairs': repairs,
+              'would_repair': would_repair,
+              'escalated': (esc or {}).get('escalated', []) if not dry else [],
+              'new_findings': [
+                  {k: f[k] for k in f if k in ('id', 'hash', 'kind', 'severity',
+                                               'suggested_repair')}
+                  for f in fresh[:_NANNY_MAX_DETAIL]],
+              'carried_over': carried,
+              'open_hashes': open_hashes,
+              'decisions': decisions,
+              'counts': {'findings_open': len(remaining),
+                         'repaired_this_tick': sum(1 for r in repairs if r['ok']),
+                         'repair_budget': max_repairs}}
+    if not dry:
+        with db() as c:
+            autopilot.audit(c, 'system', 'nanny', 'nanny_tick', {
+                'state': state, 'open_hashes': open_hashes,
+                'recovered': len(report['recovered']),
+                'repaired': report['counts']['repaired_this_tick'],
+                'decisions': decisions})
+    print(json.dumps(report, sort_keys=True))
+
+
 import argparse
 p=argparse.ArgumentParser(); s=p.add_subparsers(dest='cmd',required=True)
 for name,fn in [('processes',processes),('github',github),('sentry',sentry),('morning',morning),('doctor',doctor)]:
  x=s.add_parser(name); x.set_defaults(fn=fn)
+x=s.add_parser('home-show'); x.set_defaults(fn=home_show)
+x=s.add_parser('home-select'); x.add_argument('--home',required=True,help='explicit absolute new MindOS home; health-verified before selection'); x.add_argument('--selector',default='',help='selector file path (default ~/.hermes/autopilot-home-selector.json)'); x.set_defaults(fn=home_select)
+x=s.add_parser('home-deselect'); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--selector',default=''); x.set_defaults(fn=home_deselect)
+x=s.add_parser('home-doctor'); x.add_argument('--home',required=True); x.set_defaults(fn=home_doctor)
 x=s.add_parser('handoff-check'); x.add_argument('--task',default=''); x.add_argument('--ack-sla-hours',dest='ack_sla_hours',type=float,default=24); x.set_defaults(fn=handoff_check)
 x=s.add_parser('recall-stale'); x.set_defaults(fn=recall_stale)
 x=s.add_parser('notes-expired'); x.set_defaults(fn=notes_expired)
@@ -3227,6 +3865,11 @@ x=s.add_parser('secret-scan'); x.add_argument('--all',action='store_true'); x.se
 x=s.add_parser('consolidate'); x.add_argument('--task',default=''); x.add_argument('--threshold',type=float,default=None); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=consolidate)
 x=s.add_parser('dup-tasks'); x.add_argument('--threshold',type=float,default=None); x.set_defaults(fn=dup_tasks)
 x=s.add_parser('unverified-completions'); x.set_defaults(fn=unverified_completions)
+x=s.add_parser('sense'); x.set_defaults(fn=sense)
+x=s.add_parser('repair'); x.add_argument('playbook'); x.add_argument('--finding-hash',dest='finding_hash',default=''); x.add_argument('--dry-run',action='store_true'); x.add_argument('--break-after',dest='break_after',type=int,default=3,help='trip the circuit breaker after this many repeats of the same finding hash in the window'); x.add_argument('--window-hours',dest='window_hours',type=float,default=24.0); x.add_argument('--approved-by',dest='approved_by',default='',help='user approving a requires_user (tier-gated) playbook'); x.set_defaults(fn=repair)
+x=s.add_parser('repair-list'); x.set_defaults(fn=repair_list)
+x=s.add_parser('fts-rebuild'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=repair_fts_rebuild)
+x=s.add_parser('nanny'); x.add_argument('--dry-run',action='store_true'); x.add_argument('--max-repairs',dest='max_repairs',type=int,default=2,help='cap playbook repairs executed per tick (bounded mutation budget)'); x.set_defaults(fn=nanny)
 x=s.add_parser('recover'); x.add_argument('--max-retries',type=int,default=3); x.add_argument('--backoff-base',type=int,default=60); x.add_argument('--backoff-cap',type=int,default=3600); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=recover)
 x=s.add_parser('escalate'); x.add_argument('--dry-run',action='store_true'); x.set_defaults(fn=escalate)
 x=s.add_parser('snapshot'); x.add_argument('--out',default=None); x.set_defaults(fn=snapshot)
@@ -3245,7 +3888,7 @@ x=s.add_parser('migrate-inventory'); x.add_argument('--root',required=True); x.a
 x=s.add_parser('migrate-inventory-check'); x.add_argument('path'); x.set_defaults(fn=migrate_inventory_check)
 x=s.add_parser('migrate-import'); x.add_argument('--inventory',required=True); x.add_argument('--source-id',dest='source_id',required=True); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--out',default=None,help='write a sealed autopilot-migration-result-v1 document'); x.add_argument('--redact',action='store_true'); x.add_argument('--allow-secret',action='store_true'); x.add_argument('--relink-audit',dest='relink_audit',action='store_true',help='merge into a non-empty audit ledger and relink the combined chain'); x.set_defaults(fn=migrate_import)
 x=s.add_parser('migrate-rollback'); x.add_argument('result'); x.add_argument('--apply',action='store_true',help='without this flag the command is a read-only dry-run plan'); x.add_argument('--force',action='store_true',help='cascade away drifted rows and local dependents of imported tasks'); x.set_defaults(fn=migrate_rollback)
-x=s.add_parser('brain-inventory'); x.add_argument('--hermes-home',dest='hermes_home',default='',help='Hermes home to inventory (default ~/.hermes; read-only)'); x.add_argument('--claude-home',dest='claude_home',default='',help='Claude home to inventory (default ~/.claude; read-only)'); x.add_argument('--hindsight-url',dest='hindsight_url',default='http://127.0.0.1:8888',help='Hindsight service base URL for the read-only binding probe'); x.add_argument('--bank',default='autopilot-shared-context',help='shared-context bank the binding must expose'); x.add_argument('--timeout',type=float,default=3.0,help='per-request HTTP timeout in seconds'); x.add_argument('--out',default=None,help='write a sealed mindos-brain-inventory-v1 manifest'); x.set_defaults(fn=brain_inventory)
+x=s.add_parser('brain-inventory'); x.add_argument('--hermes-home',dest='hermes_home',default='',help='Hermes home to inventory (default ~/.hermes; read-only)'); x.add_argument('--claude-home',dest='claude_home',default='',help='Claude home to inventory (default ~/.claude; read-only)'); x.add_argument('--timeout',type=float,default=3.0,help='per-request HTTP timeout in seconds'); x.add_argument('--out',default=None,help='write a sealed mindos-brain-inventory-v1 manifest'); x.set_defaults(fn=brain_inventory)
 x=s.add_parser('brain-inventory-check'); x.add_argument('path'); x.set_defaults(fn=brain_inventory_check)
 x=s.add_parser('brain-import'); x.add_argument('--inventory',required=True,help='sealed mindos-brain-inventory-v1 manifest'); x.add_argument('--target',required=True,help='explicit absolute new MindOS home; never the inventoried source home'); x.add_argument('--apply',action='store_true',help='without this flag emit a dry-run plan only'); x.add_argument('--redact',action='store_true',help='copy credential-shaped text only as redacted derivatives; otherwise quarantine'); x.add_argument('--out',default='',help='sealed import report path (default <target>/migrations/)'); x.set_defaults(fn=brain_import)
 x=s.add_parser('onboard'); x.add_argument('--inventory',required=True,help='sealed autopilot-migration-inventory-v1 manifest from migrate-inventory'); x.add_argument('--source-id',dest='source_id',default='',help='autopilot_sqlite source to import; auto-selected when exactly one is healthy'); x.add_argument('--apply',action='store_true',help='without this flag onboarding plans and verifies but does not import'); x.add_argument('--out',default=None,help='write a sealed autopilot-onboarding-v1 report document'); x.add_argument('--redact',action='store_true'); x.add_argument('--allow-secret',action='store_true'); x.add_argument('--relink-audit',dest='relink_audit',action='store_true',help='merge into a non-empty audit ledger and relink the combined chain (forwarded to migrate-import)'); x.add_argument('--probe',action='store_true',help='run the end-to-end cross-agent handoff/recall/ack/complete probe (requires --apply)'); x.set_defaults(fn=onboard)
