@@ -4,7 +4,7 @@ MindOS is a durable local coordination plane ("control tower") for autonomous
 agent fleets. It answers one question continuously: *what is true right now,
 and what evidence proves it?*
 
-This document explains MindOS — Autopilot v3 — before implementation details.
+This document explains MindOS before implementation details.
 It is grounded in this repository's source and tests: every architectural
 claim in the [fact table](#fact-table) maps to a real source file, command,
 test suite, or verified artifact. Nothing here is aspirational.

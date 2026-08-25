@@ -1,16 +1,50 @@
-# MindOS — Autopilot v3
+# MindOS
 
-**MindOS is the durable local operating system for Hermes and cooperating AI agents.** It is a shared control plane for execution state, memory, temporal facts, handoffs, receipts, recovery, and agent coordination.
+**A local-first memory and autopilot enhancer for AI agents.**
 
-MindOS brings together:
+AI agents forget everything between sessions, lose the thread of work they
+started, and keep no honest record of what they actually did. MindOS fixes
+that with one small Python toolkit backed by a single local SQLite database:
 
-- **Autopilot execution truth** — tasks, leases, dependencies, approvals, receipts, and audit history.
-- **Local semantic memory** — an in-database `memories` store with an FTS5 index, so retrieval is deterministic, offline, and inside the audit chain. The former external Hindsight binding is retired; legacy banks import through `memory-import`.
-- **Temporal facts** — evolving ownership, priorities, validity windows, superseded decisions, and blockers.
-- **Agent memory and context** — Claude memory archives, session sources, profiles, skills, and cron definitions with provenance.
-- **Recovery and portability** — sealed inventories, dry-run-first migration, rollback, quarantine, integrity checks, and cross-agent handoffs.
+- **Durable semantic memory** — retain facts and decisions locally, recall
+  them in any later session. FTS5-backed search, fully offline, inside the
+  audit chain — no external memory service.
+- **Autopilot execution truth** — tasks with leases, dependencies, approvals,
+  receipts, and a tamper-evident audit history, so completed work carries
+  evidence instead of claims.
+- **Temporal facts** — what is true *now* versus what was true before:
+  ownership changes, priority shifts, superseded decisions, expiring blockers.
+- **Session-start context packs** — one bounded, digest-sealed pack injected
+  on the first turn of a new session, so an agent resumes instead of
+  restarting.
+- **Cross-agent handoffs** — provider-neutral envelopes with acknowledgment,
+  SLAs, and fleet-wide inbox views for multi-agent work.
+- **Recovery and portability** — sealed inventories, dry-run-first migration,
+  rollback, snapshots, integrity checks, and health doctoring that never
+  mutates what it inspects.
+- **Bounded autonomy** — model-bound, time-limited continuation grants with a
+  cron-driven nanny tick that repairs, escalates, and reports four readable
+  states (`all_clear`, `working`, `hit_snag`, `decision_needed`).
 
-The repository is currently **source-available under FSL-1.1-MIT**. It becomes MIT-licensed after the applicable two-year change date; it is not OSI open source during the FSL restriction period.
+Everything runs locally on the Python standard library — no third-party
+packages, no server to deploy. Source-available under FSL-1.1-MIT and MIT
+after the two-year change date.
+
+## Quick start
+
+```bash
+git clone https://github.com/idea-torx/mindOS.git && cd mindOS
+export MINDOS_HOME="$HOME/.hermes/mindos"   # any writable path works
+python3 autopilot.py init                   # create the home + schema
+python3 ops.py doctor                       # health-check it
+
+python3 autopilot.py create --project demo --title "First task"
+python3 autopilot.py memory-retain --text "We chose SQLite for execution truth"
+```
+
+Point your agent harness at the same home and every new session starts with
+its memory intact. [INSTALL.md](INSTALL.md) covers migration from an
+existing Autopilot installation.
 
 ## Architecture in one screen
 
@@ -35,10 +69,10 @@ dry-run first, source immutability.
 
 ```text
 Project:         MindOS
-Generation:      Autopilot v3
 Release:         v0.5.0
-Primary surface: Hermes Agent
-Execution core:  SQLite-backed Autopilot
+Role:            memory + autopilot enhancer for local AI agents
+Primary surface: Hermes Agent (harness-agnostic by design)
+Execution core:  SQLite-backed autopilot
 Semantic brain:  local in-database memories store (memory-fts-v1)
 Fallback:        preserved prior Autopilot installation
 ```
@@ -52,9 +86,10 @@ merge, send external messages, submit applications, or cross a human approval
 seam. Autonomous continuation is explicit, model-bound, time-limited, and
 receipt-backed.
 
-## Autopilot v3 continuation
+## Bounded autonomy (nanny tick)
 
-Autopilot v3 adds the missing impulse layer for complex work. A bounded nanny
+The autopilot layer adds the missing impulse layer for complex work. A bounded
+nanny
 tick can recover stale leases, detect findings, run capped approved repairs,
 escalate decisions, and emit an audited state report. It is cron-driven rather
 than a resident daemon, so every tick is bounded and independently observable.
@@ -138,7 +173,7 @@ proof path without touching live homes.
 
 ## Runtime boundaries
 
-This v3 release is a registry, memory, and continuation layer. It does **not** deploy, merge, send external messages, submit applications, or run arbitrary agent commands.
+This release is a registry, memory, and continuation layer. It does **not** deploy, merge, send external messages, submit applications, or run arbitrary agent commands.
 ## Commands
 
 ```bash

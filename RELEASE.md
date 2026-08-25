@@ -1,6 +1,6 @@
-# Release policy — MindOS Autopilot v3
+# Release policy — MindOS
 
-**There is no public release yet.** This repository is private and source-available.
+**The repository is public and source-available.**
 
 ## Licensing
 
